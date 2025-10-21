@@ -42,17 +42,6 @@ class Settings(BaseSettings):
     def TORCH_DTYPE(self) -> torch.dtype:
         return torch.bfloat16
 
-    @computed_field
-    @property
-    def TORCH_ATTN_IMPLEMENTATION(self) -> str:
-        if self.TORCH_ATTN is not None:
-            return self.TORCH_ATTN
-
-        if self.TORCH_DEVICE_MODEL == "cuda":
-            return "flash_attention_2"
-        else:
-            return "sdpa"
-
     class Config:
         env_file = find_dotenv("local.env")
         extra = "ignore"

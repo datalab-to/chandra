@@ -1,6 +1,6 @@
 [project]
 name = "chandra-ocr"
-version = "0.1.1"
+version = "0.1.2"
 description = "OCR model that converts documents to markdown, HTML, or JSON."
 readme = "README.md"
 requires-python = ">=3.10"
