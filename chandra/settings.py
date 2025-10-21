@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     MODEL_CHECKPOINT: str = "datalab-to/chandra-0.2.8"
     TORCH_DEVICE: str | None = None
     MAX_OUTPUT_TOKENS: int = 8192
+    TORCH_ATTN: str | None = None
 
     # vLLM server settings
     VLLM_API_KEY: str = "EMPTY"
@@ -44,6 +45,9 @@ class Settings(BaseSettings):
     @computed_field
     @property
     def TORCH_ATTN_IMPLEMENTATION(self) -> str:
+        if self.TORCH_ATTN is not None:
+            return self.TORCH_ATTN
+
         if self.TORCH_DEVICE_MODEL == "cuda":
             return "flash_attention_2"
         else:

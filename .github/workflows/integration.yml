@@ -24,5 +24,6 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           PYTHONPATH: .
+          TORCH_ATTN: "sdpa"
         run: |
           uv run pytest tests/integration
