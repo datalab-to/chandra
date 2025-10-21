@@ -73,7 +73,7 @@ def load_model():
         "dtype": settings.TORCH_DTYPE,
         "device_map": device_map,
     }
-    if settings.TORCH_ATTN:
+    if settings.TORCH_ATTN_IMPLEMENTATION:
         kwargs["attn_implementation"] = settings.TORCH_ATTN_IMPLEMENTATION
 
     model = Qwen3VLForConditionalGeneration.from_pretrained(

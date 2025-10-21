@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     MODEL_CHECKPOINT: str = "datalab-to/chandra"
     TORCH_DEVICE: str | None = None
     MAX_OUTPUT_TOKENS: int = 8192
-    TORCH_ATTN: str | None = None
+    TORCH_ATTN_IMPLEMENTATION: str | None = None
 
     # vLLM server settings
     VLLM_API_KEY: str = "EMPTY"
