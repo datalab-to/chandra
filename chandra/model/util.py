@@ -44,9 +44,10 @@ def scale_to_fit(
 
 def detect_repeat_token(
     predicted_tokens: str,
-    max_repeats: int = 4,
+    base_max_repeats: int = 4,
     window_size: int = 500,
     cut_from_end: int = 0,
+    scaling_factor: float = 3.0,
 ):
     try:
         predicted_tokens = parse_markdown(predicted_tokens)
@@ -57,10 +58,12 @@ def detect_repeat_token(
     if cut_from_end > 0:
         predicted_tokens = predicted_tokens[:-cut_from_end]
 
-    # Try different sequence lengths (1 to window_size//2)
     for seq_len in range(1, window_size // 2 + 1):
         # Extract the potential repeating sequence from the end
         candidate_seq = predicted_tokens[-seq_len:]
+
+        # Inverse scaling: shorter sequences need more repeats
+        max_repeats = int(base_max_repeats * (1 + scaling_factor / seq_len))
 
         # Count how many times this sequence appears consecutively at the end
         repeat_count = 0
@@ -75,7 +78,6 @@ def detect_repeat_token(
             else:
                 break
 
-        # If we found more than max_repeats consecutive occurrences
         if repeat_count > max_repeats:
             return True
 
