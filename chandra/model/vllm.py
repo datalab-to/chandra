@@ -71,7 +71,7 @@ def generate_vllm(
             completion = client.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": content}],
-                max_tokens=settings.MAX_OUTPUT_TOKENS,
+                max_tokens=max_output_tokens,
                 temperature=temperature,
                 top_p=top_p,
             )
