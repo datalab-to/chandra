@@ -9,6 +9,8 @@ from PIL import Image
 from bs4 import BeautifulSoup, NavigableString
 from markdownify import MarkdownConverter, re_whitespace
 
+from chandra.settings import settings
+
 
 @lru_cache
 def _hash_html(html: str):
@@ -25,7 +27,7 @@ def fix_raw(html: str):
         numbers = re.findall(r"\d+", match.group(0))
         return "[" + ",".join(numbers) + "]"
 
-    result = re.sub(r"(?:<BBOX\d+>){4}", replace_group, html)
+    result = re.sub(r"(?:\|BBOX\d+\|){4}", replace_group, html)
     return result
 
 
@@ -232,8 +234,8 @@ def parse_layout(html: str, image: Image.Image):
     soup = BeautifulSoup(html, "html.parser")
     top_level_divs = soup.find_all("div", recursive=False)
     width, height = image.size
-    width_scaler = width / 1024
-    height_scaler = height / 1024
+    width_scaler = width / settings.BBOX_SCALE
+    height_scaler = height / settings.BBOX_SCALE
     layout_blocks = []
     for div in top_level_divs:
         bbox = div.get("data-bbox")
