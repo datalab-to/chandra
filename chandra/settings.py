@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     TORCH_DEVICE: str | None = None
     MAX_OUTPUT_TOKENS: int = 12384
     TORCH_ATTN: str | None = None
-    BBOX_SCALE: int = 1024
+    BBOX_SCALE: int = 1000
 
     # vLLM server settings
     VLLM_API_KEY: str = "EMPTY"

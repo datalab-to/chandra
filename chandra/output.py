@@ -1,5 +1,4 @@
 import hashlib
-import json
 import re
 from dataclasses import dataclass, asdict
 from functools import lru_cache
@@ -241,7 +240,7 @@ def parse_layout(html: str, image: Image.Image):
         bbox = div.get("data-bbox")
 
         try:
-            bbox = json.loads(bbox)
+            bbox = bbox.split(" ")
         except Exception:
             bbox = [0, 0, 1, 1]
 
