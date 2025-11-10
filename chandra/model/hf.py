@@ -5,7 +5,6 @@ from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
 from chandra.model.schema import BatchInputItem, GenerationResult
 from chandra.model.util import scale_to_fit
-from chandra.output import fix_raw
 from chandra.prompts import PROMPT_MAPPING
 from chandra.settings import settings
 
@@ -43,7 +42,7 @@ def generate_hf(
         clean_up_tokenization_spaces=False,
     )
     results = [
-        GenerationResult(raw=fix_raw(out), token_count=len(ids), error=False)
+        GenerationResult(raw=out, token_count=len(ids), error=False)
         for out, ids in zip(output_text, generated_ids_trimmed)
     ]
     return results

@@ -22,15 +22,6 @@ def get_image_name(html: str, div_idx: int):
     return f"{html_hash}_{div_idx}_img.webp"
 
 
-def fix_raw(html: str):
-    def replace_group(match):
-        numbers = re.findall(r"\d+", match.group(0))
-        return "[" + ",".join(numbers) + "]"
-
-    result = re.sub(r"(?:\|BBOX\d+\|){4}", replace_group, html)
-    return result
-
-
 def extract_images(html: str, chunks: dict, image: Image.Image):
     images = {}
     div_idx = 0
@@ -242,8 +233,13 @@ def parse_layout(html: str, image: Image.Image):
 
         try:
             bbox = json.loads(bbox)
+            assert len(bbox) == 4, "Invalid bbox length"
         except Exception:
-            bbox = [0, 0, 1, 1]
+            try:
+                bbox = bbox.split(" ")
+                assert len(bbox) == 4, "Invalid bbox length"
+            except Exception:
+                bbox = [0, 0, 1, 1]
 
         bbox = list(map(int, bbox))
         # Normalize bbox
