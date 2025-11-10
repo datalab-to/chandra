@@ -9,7 +9,6 @@ from openai import OpenAI
 
 from chandra.model.schema import BatchInputItem, GenerationResult
 from chandra.model.util import scale_to_fit, detect_repeat_token
-from chandra.output import fix_raw
 from chandra.prompts import PROMPT_MAPPING
 from chandra.settings import settings
 
@@ -71,12 +70,11 @@ def generate_vllm(
             completion = client.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": content}],
-                max_tokens=settings.MAX_OUTPUT_TOKENS,
+                max_tokens=max_output_tokens,
                 temperature=temperature,
                 top_p=top_p,
             )
             raw = completion.choices[0].message.content
-            raw = fix_raw(raw)
             result = GenerationResult(
                 raw=raw,
                 token_count=completion.usage.completion_tokens,

@@ -9,6 +9,8 @@ from PIL import Image
 from bs4 import BeautifulSoup, NavigableString
 from markdownify import MarkdownConverter, re_whitespace
 
+from chandra.settings import settings
+
 
 @lru_cache
 def _hash_html(html: str):
@@ -18,15 +20,6 @@ def _hash_html(html: str):
 def get_image_name(html: str, div_idx: int):
     html_hash = _hash_html(html)
     return f"{html_hash}_{div_idx}_img.webp"
-
-
-def fix_raw(html: str):
-    def replace_group(match):
-        numbers = re.findall(r"\d+", match.group(0))
-        return "[" + ",".join(numbers) + "]"
-
-    result = re.sub(r"(?:<BBOX\d+>){4}", replace_group, html)
-    return result
 
 
 def extract_images(html: str, chunks: dict, image: Image.Image):
@@ -232,16 +225,21 @@ def parse_layout(html: str, image: Image.Image):
     soup = BeautifulSoup(html, "html.parser")
     top_level_divs = soup.find_all("div", recursive=False)
     width, height = image.size
-    width_scaler = width / 1024
-    height_scaler = height / 1024
+    width_scaler = width / settings.BBOX_SCALE
+    height_scaler = height / settings.BBOX_SCALE
     layout_blocks = []
     for div in top_level_divs:
         bbox = div.get("data-bbox")
 
         try:
             bbox = json.loads(bbox)
+            assert len(bbox) == 4, "Invalid bbox length"
         except Exception:
-            bbox = [0, 0, 1, 1]
+            try:
+                bbox = bbox.split(" ")
+                assert len(bbox) == 4, "Invalid bbox length"
+            except Exception:
+                bbox = [0, 0, 1, 1]
 
         bbox = list(map(int, bbox))
         # Normalize bbox
