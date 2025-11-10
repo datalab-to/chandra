@@ -1,4 +1,5 @@
 import hashlib
+import json
 import re
 from dataclasses import dataclass, asdict
 from functools import lru_cache
@@ -19,15 +20,6 @@ def _hash_html(html: str):
 def get_image_name(html: str, div_idx: int):
     html_hash = _hash_html(html)
     return f"{html_hash}_{div_idx}_img.webp"
-
-
-def fix_raw(html: str):
-    def replace_group(match):
-        numbers = re.findall(r"\d+", match.group(0))
-        return "[" + ",".join(numbers) + "]"
-
-    result = re.sub(r"(?:\|BBOX\d+\|){4}", replace_group, html)
-    return result
 
 
 def extract_images(html: str, chunks: dict, image: Image.Image):
@@ -240,9 +232,14 @@ def parse_layout(html: str, image: Image.Image):
         bbox = div.get("data-bbox")
 
         try:
-            bbox = bbox.split(" ")
+            bbox = json.loads(bbox)
+            assert len(bbox) == 4, "Invalid bbox length"
         except Exception:
-            bbox = [0, 0, 1, 1]
+            try:
+                bbox = bbox.split(" ")
+                assert len(bbox) == 4, "Invalid bbox length"
+            except Exception:
+                bbox = [0, 0, 1, 1]
 
         bbox = list(map(int, bbox))
         # Normalize bbox
