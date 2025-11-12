@@ -29,10 +29,11 @@ def generate_vllm(
     custom_headers: dict | None = None,
     max_failure_retries: int | None = None,
     bbox_scale: int = settings.BBOX_SCALE,
+    vllm_api_base: str = settings.VLLM_API_BASE,
 ) -> List[GenerationResult]:
     client = OpenAI(
         api_key=settings.VLLM_API_KEY,
-        base_url=settings.VLLM_API_BASE,
+        base_url=vllm_api_base,
         default_headers=custom_headers,
     )
     model_name = settings.VLLM_MODEL_NAME
