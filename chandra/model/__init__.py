@@ -27,7 +27,7 @@ class InferenceManager:
             output_kwargs["include_headers_footers"] = kwargs.pop(
                 "include_headers_footers"
             )
-        bbox_scale = kwargs.get("bbox_scale", settings.BBOX_SCALE)
+        bbox_scale = kwargs.pop("bbox_scale", settings.BBOX_SCALE)
 
         if self.method == "vllm":
             results = generate_vllm(
