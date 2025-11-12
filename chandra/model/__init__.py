@@ -28,12 +28,14 @@ class InferenceManager:
                 "include_headers_footers"
             )
         bbox_scale = kwargs.pop("bbox_scale", settings.BBOX_SCALE)
+        vllm_api_base = kwargs.pop("vllm_api_base", settings.VLLM_API_BASE)
 
         if self.method == "vllm":
             results = generate_vllm(
                 batch,
                 max_output_tokens=max_output_tokens,
                 bbox_scale=bbox_scale,
+                vllm_api_base=vllm_api_base,
                 **kwargs,
             )
         else:
