@@ -1,5 +1,6 @@
 import base64
 import io
+import time
 from concurrent.futures import ThreadPoolExecutor
 from itertools import repeat
 from typing import List
@@ -112,6 +113,7 @@ def generate_vllm(
             print(
                 f"Detected vllm error, retrying generation (attempt {retries + 1})..."
             )
+            time.sleep(2 * (retries + 1))  # Sleeping can help under load
             return True
 
         if (
@@ -122,6 +124,7 @@ def generate_vllm(
             print(
                 f"Detected vllm error, retrying generation (attempt {retries + 1})..."
             )
+            time.sleep(2 * (retries + 1))  # Sleeping can help under load
             return True
 
         return False
