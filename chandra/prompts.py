@@ -1,5 +1,3 @@
-from chandra.settings import settings
-
 ALLOWED_TAGS = [
     "math",
     "br",
@@ -67,7 +65,7 @@ Guidelines:
 """.strip()
 
 OCR_LAYOUT_PROMPT = f"""
-OCR this image to HTML, arranged as layout blocks.  Each layout block should be a div with the data-bbox attribute representing the bounding box of the block in [x0, y0, x1, y1] format.  Bboxes are normalized 0-{settings.BBOX_SCALE}. The data-label attribute is the label for the block.
+OCR this image to HTML, arranged as layout blocks.  Each layout block should be a div with the data-bbox attribute representing the bounding box of the block in [x0, y0, x1, y1] format.  Bboxes are normalized 0-{{bbox_scale}}. The data-label attribute is the label for the block.
 
 Use the following labels:
 - Caption
