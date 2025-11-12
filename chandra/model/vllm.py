@@ -28,6 +28,7 @@ def generate_vllm(
     max_workers: int | None = None,
     custom_headers: dict | None = None,
     max_failure_retries: int | None = None,
+    bbox_scale: int = settings.BBOX_SCALE,
 ) -> List[GenerationResult]:
     client = OpenAI(
         api_key=settings.VLLM_API_KEY,
@@ -54,7 +55,9 @@ def generate_vllm(
     ) -> GenerationResult:
         prompt = item.prompt
         if not prompt:
-            prompt = PROMPT_MAPPING[item.prompt_type]
+            prompt = PROMPT_MAPPING[item.prompt_type].replace(
+                "{bbox_scale}", str(bbox_scale)
+            )
 
         content = []
         image = scale_to_fit(item.image)
