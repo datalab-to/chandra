@@ -6,7 +6,7 @@ from functools import lru_cache
 
 import six
 from PIL import Image
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup
 from markdownify import MarkdownConverter, re_whitespace
 
 from chandra.settings import settings
@@ -87,39 +87,6 @@ def parse_html(
         content = str(div.decode_contents())
         out_html += content
     return out_html
-
-
-def escape_dollars(text):
-    return text.replace("$", r"\$")
-
-
-def get_formatted_table_text(element):
-    text = []
-    for content in element.contents:
-        if content is None:
-            continue
-
-        if isinstance(content, NavigableString):
-            stripped = content.strip()
-            if stripped:
-                text.append(escape_dollars(stripped))
-        elif content.name == "br":
-            text.append("<br>")
-        elif content.name == "math":
-            text.append("$" + content.text + "$")
-        else:
-            content_str = escape_dollars(str(content))
-            text.append(content_str)
-
-    full_text = ""
-    for i, t in enumerate(text):
-        if t == "<br>":
-            full_text += t
-        elif i > 0 and text[i - 1] != "<br>":
-            full_text += " " + t
-        else:
-            full_text += t
-    return full_text
 
 
 class Markdownify(MarkdownConverter):
