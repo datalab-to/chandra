@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Union, Optional
 import filetype
 from PIL import Image
 import pypdfium2 as pdfium
@@ -27,19 +27,80 @@ def load_image(
 def load_pdf_images(
     filepath: str,
     page_range: List[int],
-    image_dpi: int = settings.IMAGE_DPI,
-    min_pdf_image_dim: int = settings.MIN_PDF_IMAGE_DIM,
+    image_dpi: Optional[Union[int, List[int]]] = None,
+    min_pdf_image_dim: Optional[Union[int, List[int]]] = None,
 ) -> List[Image.Image]:
+    """
+    Load PDF pages as images with configurable DPI.
+
+    Args:
+        filepath: Path to PDF file
+        page_range: List of page indices to render
+        image_dpi: Target DPI for rendering. Can be:
+            - None: use settings.IMAGE_DPI for all pages (default)
+            - int: use same DPI for all pages
+            - List[int]: per-page DPI (must match length of page_range)
+        min_pdf_image_dim: Minimum image dimension. Can be:
+            - None: use settings.MIN_PDF_IMAGE_DIM for all pages (default)
+            - int: use same value for all pages
+            - List[int]: per-page value (must match length of page_range)
+
+    Returns:
+        List of PIL Images, one per page in page_range
+    """
     doc = pdfium.PdfDocument(filepath)
     doc.init_forms()
 
+    # Determine default values
+    default_image_dpi = image_dpi if isinstance(image_dpi, int) else settings.IMAGE_DPI
+    default_min_pdf_image_dim = min_pdf_image_dim if isinstance(min_pdf_image_dim, int) else settings.MIN_PDF_IMAGE_DIM
+
+    # Handle per-page DPI lists
+    is_per_page_dpi = isinstance(image_dpi, list)
+    if not is_per_page_dpi and image_dpi is not None:
+        # Convert single DPI value to list for all pages
+        image_dpi = [image_dpi] * len(page_range)
+        is_per_page_dpi = True
+
+    is_per_page_min_dim = isinstance(min_pdf_image_dim, list)
+    if not is_per_page_min_dim and min_pdf_image_dim is not None:
+        # Convert single min_dim value to list for all pages
+        min_pdf_image_dim = [min_pdf_image_dim] * len(page_range)
+        is_per_page_min_dim = True
+
+    if is_per_page_dpi and len(image_dpi) != len(page_range):
+        raise ValueError(f"image_dpi list length ({len(image_dpi)}) must match page_range length ({len(page_range)})")
+    if is_per_page_min_dim and len(min_pdf_image_dim) != len(page_range):
+        raise ValueError(f"min_pdf_image_dim list length ({len(min_pdf_image_dim)}) must match page_range length ({len(page_range)})")
+
     images = []
+    page_idx_in_range = 0
+
     for page in range(len(doc)):
         if not page_range or page in page_range:
+            # Get DPI for this specific page
+            if is_per_page_dpi:
+                current_dpi = image_dpi[page_idx_in_range]
+            elif image_dpi is None:
+                current_dpi = settings.IMAGE_DPI
+            else:
+                current_dpi = default_image_dpi
+
+            # Get min_dim for this specific page
+            if is_per_page_min_dim:
+                current_min_dim = min_pdf_image_dim[page_idx_in_range]
+            elif min_pdf_image_dim is None:
+                current_min_dim = settings.MIN_PDF_IMAGE_DIM
+            else:
+                current_min_dim = default_min_pdf_image_dim
+
+            page_idx_in_range += 1
+
             page_obj = doc[page]
             min_page_dim = min(page_obj.get_width(), page_obj.get_height())
-            scale_dpi = (min_pdf_image_dim / min_page_dim) * 72
-            scale_dpi = max(scale_dpi, image_dpi)
+
+            scale_dpi = (current_min_dim / min_page_dim) * 72
+            scale_dpi = max(scale_dpi, current_dpi)
             page_obj = doc[page]
             flatten(page_obj)
             page_obj = doc[page]
