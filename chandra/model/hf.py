@@ -1,7 +1,5 @@
 from typing import List
 
-from qwen_vl_utils import process_vision_info
-
 from chandra.model.schema import BatchInputItem, GenerationResult
 from chandra.model.util import scale_to_fit
 from chandra.prompts import PROMPT_MAPPING
@@ -15,6 +13,8 @@ def generate_hf(
     bbox_scale: int = settings.BBOX_SCALE,
     **kwargs,
 ) -> List[GenerationResult]:
+    from qwen_vl_utils import process_vision_info
+
     if max_output_tokens is None:
         max_output_tokens = settings.MAX_OUTPUT_TOKENS
 
