@@ -1,7 +1,5 @@
 from dotenv import find_dotenv
-from pydantic import computed_field
 from pydantic_settings import BaseSettings
-import torch
 import os
 
 
@@ -23,11 +21,6 @@ class Settings(BaseSettings):
     VLLM_MODEL_NAME: str = "chandra"
     VLLM_GPUS: str = "0"
     MAX_VLLM_RETRIES: int = 6
-
-    @computed_field
-    @property
-    def TORCH_DTYPE(self) -> torch.dtype:
-        return torch.bfloat16
 
     class Config:
         env_file = find_dotenv("local.env")

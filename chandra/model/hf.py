@@ -1,7 +1,6 @@
 from typing import List
 
 from qwen_vl_utils import process_vision_info
-from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
 from chandra.model.schema import BatchInputItem, GenerationResult
 from chandra.model.util import scale_to_fit
@@ -71,12 +70,15 @@ def process_batch_element(item: BatchInputItem, processor, bbox_scale: int):
 
 
 def load_model():
+    import torch
+    from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+
     device_map = "auto"
     if settings.TORCH_DEVICE:
         device_map = {"": settings.TORCH_DEVICE}
 
     kwargs = {
-        "dtype": settings.TORCH_DTYPE,
+        "dtype": torch.bfloat16,
         "device_map": device_map,
     }
     if settings.TORCH_ATTN:
