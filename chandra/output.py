@@ -186,7 +186,29 @@ class LayoutBlock:
     bbox: list[int]
     label: str
     content: str
+    table_row_bboxes: list[list[list[int]]]
 
+def normalize_and_clean_bbox(
+    bbox: list[int], width: int, height: int, width_scaler: float, height_scaler: float
+):
+    return [
+        max(0, int(bbox[0] * width_scaler)),
+        max(0, int(bbox[1] * height_scaler)),
+        min(int(bbox[2] * width_scaler), width),
+        min(int(bbox[3] * height_scaler), height),
+    ]
+
+def parse_bbox(bbox_str: str) -> list[float]:
+    try:
+        bbox = json.loads(bbox_str)
+        assert len(bbox) == 4, "Invalid bbox length"
+    except Exception:
+        try:
+            bbox = bbox_str.split(" ")
+            assert len(bbox) == 4, "Invalid bbox length"
+        except Exception:
+            bbox = [0, 0, 1, 1]
+    return bbox
 
 def parse_layout(html: str, image: Image.Image, bbox_scale=settings.BBOX_SCALE):
     soup = BeautifulSoup(html, "html.parser")
@@ -197,28 +219,34 @@ def parse_layout(html: str, image: Image.Image, bbox_scale=settings.BBOX_SCALE):
     layout_blocks = []
     for div in top_level_divs:
         bbox = div.get("data-bbox")
-
-        try:
-            bbox = json.loads(bbox)
-            assert len(bbox) == 4, "Invalid bbox length"
-        except Exception:
-            try:
-                bbox = bbox.split(" ")
-                assert len(bbox) == 4, "Invalid bbox length"
-            except Exception:
-                bbox = [0, 0, 1, 1]
-
+        bbox = parse_bbox(bbox)
         bbox = list(map(int, bbox))
         # Normalize bbox
-        bbox = [
-            max(0, int(bbox[0] * width_scaler)),
-            max(0, int(bbox[1] * height_scaler)),
-            min(int(bbox[2] * width_scaler), width),
-            min(int(bbox[3] * height_scaler), height),
-        ]
+        bbox = normalize_and_clean_bbox(
+            bbox, width, height, width_scaler, height_scaler
+        )
         label = div.get("data-label", "block")
         content = str(div.decode_contents())
-        layout_blocks.append(LayoutBlock(bbox=bbox, label=label, content=content))
+
+        soup = BeautifulSoup(content, "html.parser")
+        all_table_row_bboxes = []
+        for table in soup.find_all("table"):
+            table_row_bboxes = []
+            for row in table.find_all("tr"):
+                if row_bbox := row.get("data-bbox", None):
+                    row_bbox = parse_bbox(row_bbox)
+                    row_bbox = list(map(int, row_bbox))
+                    row_bbox = normalize_and_clean_bbox(
+                        row_bbox, width, height, width_scaler, height_scaler
+                    )
+                    table_row_bboxes.append(row_bbox)
+            all_table_row_bboxes.append(table_row_bboxes)
+
+        layout_blocks.append(
+            LayoutBlock(
+                bbox=bbox, label=label, content=content, table_row_bboxes=all_table_row_bboxes
+            )
+        )
     return layout_blocks
 
 

@@ -53,10 +53,11 @@ def embed_images_in_markdown(markdown: str, images: dict) -> str:
 def ocr_layout(
     img: Image.Image,
     model=None,
+    prompt_type: str = "ocr_layout",
 ) -> (Image.Image, str):
     batch = BatchInputItem(
         image=img,
-        prompt_type="ocr_layout",
+        prompt_type=prompt_type,
     )
     result = model.generate([batch])[0]
     layout = parse_layout(result.raw, img)
@@ -108,6 +109,14 @@ else:
     pil_image = Image.open(in_file).convert("RGB")
     page_number = None
 
+prompt_type = st.sidebar.selectbox(
+    "Prompt type",
+    [
+        "ocr_layout",
+        "ocr",
+        "ocr_layout_table_row",
+    ],
+)
 run_ocr = st.sidebar.button("Run OCR")
 
 if pil_image is None:
@@ -120,6 +129,7 @@ if run_ocr:
         result, layout_image = ocr_layout(
             pil_image,
             model,
+            prompt_type,
         )
 
         # Embed images as base64 data URLs in the markdown

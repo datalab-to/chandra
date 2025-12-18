@@ -14,4 +14,13 @@ def draw_layout(image: Image.Image, layout_blocks: list[LayoutBlock]):
         draw.rectangle(block.bbox, outline="red", width=2)
         draw.text((block.bbox[0], block.bbox[1]), block.label, fill="blue")
 
+        for table in block.table_row_bboxes:
+            for row_idx, row_bbox in enumerate(table):
+                draw.rectangle(row_bbox, outline="green", width=2)
+                draw.text(
+                    (row_bbox[0], row_bbox[1]),
+                    f"Row {row_idx}",
+                    fill="green",
+                )
+
     return draw_image

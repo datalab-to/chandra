@@ -93,7 +93,34 @@ OCR this image to HTML.
 {PROMPT_ENDING}
 """.strip()
 
+OCR_LAYOUT_TABLE_ROW_PROMPT = f"""
+OCR this image to HTML, arranged as layout blocks.  Each layout block should be a div with the data-bbox attribute representing the bounding box of the block in [x0, y0, x1, y1] format.  Bboxes are normalized 0-{{bbox_scale}}. The data-label attribute is the label for the block.
+
+Use the following labels:
+- Caption
+- Footnote
+- Equation-Block
+- List-Group
+- Page-Header
+- Page-Footer
+- Image
+- Section-Header
+- Table
+- Text
+- Complex-Block
+- Code-Block
+- Form
+- Table-Of-Contents
+- Figure
+
+Additionally, each table row (<tr>) inside Table or Table-Of-Contents should have a data-bbox attribute representing the bounding box of the table row in [x0, y0, x1, y1] format.  Bboxes are normalized 0-1000. The data-label attribute is the label for the table.
+
+{PROMPT_ENDING}
+""".strip()
+
+
 PROMPT_MAPPING = {
     "ocr_layout": OCR_LAYOUT_PROMPT,
     "ocr": OCR_PROMPT,
+    "ocr_layout_table_row": OCR_LAYOUT_TABLE_ROW_PROMPT,
 }
