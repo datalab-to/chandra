@@ -94,7 +94,10 @@ OCR this image to HTML.
 """.strip()
 
 OCR_LAYOUT_TABLE_ROW_PROMPT = f"""
-OCR this image to HTML, arranged as layout blocks.  Each layout block should be a div with the data-bbox attribute representing the bounding box of the block in [x0, y0, x1, y1] format.  Bboxes are normalized 0-{{bbox_scale}}. The data-label attribute is the label for the block.
+OCR this image to HTML, arranged as layout blocks.  Each layout block should be a div with the data-bbox attribute representing the bounding box of the block in [x0, y0, x1, y1] format.  Bboxes are normalized 0-1000. The data-label attribute is the label for the block.
+
+In addition to layout blocks, table rows must also include bounding boxes.  
+Each table row (<tr>) inside a Table or Table-Of-Contents must have its own data-bbox attribute and skipping this is not allowed.
 
 Use the following labels:
 - Caption
@@ -113,10 +116,13 @@ Use the following labels:
 - Table-Of-Contents
 - Figure
 
-Additionally, each table row (<tr>) inside Table or Table-Of-Contents should have a data-bbox attribute representing the bounding box of the table row in [x0, y0, x1, y1] format.  Bboxes are normalized 0-1000. The data-label attribute is the label for the table.
-
 {PROMPT_ENDING}
-""".strip()
+
+Table Row Guidelines:
+* For every Table or Table-Of-Contents, each table row (<tr>) must include a data-bbox attribute in [x0, y0, x1, y1] format.
+* The bounding box must cover the full visual extent of the row.
+* Table rows without a data-bbox attribute are incomplete.
+""".strip() 
 
 
 PROMPT_MAPPING = {
