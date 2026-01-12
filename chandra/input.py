@@ -13,7 +13,23 @@ def flatten(page, flag=pdfium_c.FLAT_NORMALDISPLAY):
         print(f"Failed to flatten annotations / form fields on page {page}.")
 
 
-def load_pdf_images(filepath: str, page_range: List[int]):
+def load_image(
+    filepath: str, min_image_dim: int = settings.MIN_IMAGE_DIM
+) -> Image.Image:
+    image = Image.open(filepath).convert("RGB")
+    if image.width < min_image_dim or image.height < min_image_dim:
+        scale = min_image_dim / min(image.width, image.height)
+        new_size = (int(image.width * scale), int(image.height * scale))
+        image = image.resize(new_size, Image.Resampling.LANCZOS)
+    return image
+
+
+def load_pdf_images(
+    filepath: str,
+    page_range: List[int],
+    image_dpi: int = settings.IMAGE_DPI,
+    min_pdf_image_dim: int = settings.MIN_PDF_IMAGE_DIM,
+) -> List[Image.Image]:
     doc = pdfium.PdfDocument(filepath)
     doc.init_forms()
 
@@ -22,8 +38,8 @@ def load_pdf_images(filepath: str, page_range: List[int]):
         if not page_range or page in page_range:
             page_obj = doc[page]
             min_page_dim = min(page_obj.get_width(), page_obj.get_height())
-            scale_dpi = (settings.MIN_IMAGE_DIM / min_page_dim) * 72
-            scale_dpi = max(scale_dpi, settings.IMAGE_DPI)
+            scale_dpi = (min_pdf_image_dim / min_page_dim) * 72
+            scale_dpi = max(scale_dpi, image_dpi)
             page_obj = doc[page]
             flatten(page_obj)
             page_obj = doc[page]
@@ -56,5 +72,5 @@ def load_file(filepath: str, config: dict):
     if input_type and input_type.extension == "pdf":
         images = load_pdf_images(filepath, page_range)
     else:
-        images = [Image.open(filepath).convert("RGB")]
+        images = [load_image(filepath)]
     return images

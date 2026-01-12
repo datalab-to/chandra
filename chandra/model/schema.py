@@ -27,3 +27,4 @@ class BatchOutputItem:
     page_box: List[int]
     token_count: int
     images: dict
+    error: bool

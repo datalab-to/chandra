@@ -1,8 +1,5 @@
 from typing import List
 
-from qwen_vl_utils import process_vision_info
-from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
-
 from chandra.model.schema import BatchInputItem, GenerationResult
 from chandra.model.util import scale_to_fit
 from chandra.prompts import PROMPT_MAPPING
@@ -10,12 +7,20 @@ from chandra.settings import settings
 
 
 def generate_hf(
-    batch: List[BatchInputItem], model, max_output_tokens=None, **kwargs
+    batch: List[BatchInputItem],
+    model,
+    max_output_tokens=None,
+    bbox_scale: int = settings.BBOX_SCALE,
+    **kwargs,
 ) -> List[GenerationResult]:
+    from qwen_vl_utils import process_vision_info
+
     if max_output_tokens is None:
         max_output_tokens = settings.MAX_OUTPUT_TOKENS
 
-    messages = [process_batch_element(item, model.processor) for item in batch]
+    messages = [
+        process_batch_element(item, model.processor, bbox_scale) for item in batch
+    ]
     text = model.processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
@@ -48,12 +53,12 @@ def generate_hf(
     return results
 
 
-def process_batch_element(item: BatchInputItem, processor):
+def process_batch_element(item: BatchInputItem, processor, bbox_scale: int):
     prompt = item.prompt
     prompt_type = item.prompt_type
 
     if not prompt:
-        prompt = PROMPT_MAPPING[prompt_type]
+        prompt = PROMPT_MAPPING[prompt_type].replace("{bbox_scale}", str(bbox_scale))
 
     content = []
     image = scale_to_fit(item.image)  # Guarantee max size
@@ -65,12 +70,15 @@ def process_batch_element(item: BatchInputItem, processor):
 
 
 def load_model():
+    import torch
+    from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+
     device_map = "auto"
     if settings.TORCH_DEVICE:
         device_map = {"": settings.TORCH_DEVICE}
 
     kwargs = {
-        "dtype": settings.TORCH_DTYPE,
+        "dtype": torch.bfloat16,
         "device_map": device_map,
     }
     if settings.TORCH_ATTN:

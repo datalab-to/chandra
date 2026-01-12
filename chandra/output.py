@@ -6,8 +6,10 @@ from functools import lru_cache
 
 import six
 from PIL import Image
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup
 from markdownify import MarkdownConverter, re_whitespace
+
+from chandra.settings import settings
 
 
 @lru_cache
@@ -30,7 +32,11 @@ def extract_images(html: str, chunks: dict, image: Image.Image):
             if not img:
                 continue
             bbox = chunk["bbox"]
-            block_image = image.crop(bbox)
+            try:
+                block_image = image.crop(bbox)
+            except ValueError:
+                # Happens when bbox coordinates are invalid
+                continue
             img_name = get_image_name(html, div_idx)
             images[img_name] = block_image
     return images
@@ -67,42 +73,20 @@ def parse_html(
             else:
                 img = BeautifulSoup(f"<img src='{img_src}'/>", "html.parser")
                 div.append(img)
+
+        # Wrap text content in <p> tags if no inner HTML tags exist
+        if label in ["Text"] and not re.search(
+            "<.+>", str(div.decode_contents()).strip()
+        ):
+            # Add inner p tags if missing for text blocks
+            text_content = str(div.decode_contents()).strip()
+            text_content = f"<p>{text_content}</p>"
+            div.clear()
+            div.append(BeautifulSoup(text_content, "html.parser"))
+
         content = str(div.decode_contents())
         out_html += content
     return out_html
-
-
-def escape_dollars(text):
-    return text.replace("$", r"\$")
-
-
-def get_formatted_table_text(element):
-    text = []
-    for content in element.contents:
-        if content is None:
-            continue
-
-        if isinstance(content, NavigableString):
-            stripped = content.strip()
-            if stripped:
-                text.append(escape_dollars(stripped))
-        elif content.name == "br":
-            text.append("<br>")
-        elif content.name == "math":
-            text.append("$" + content.text + "$")
-        else:
-            content_str = escape_dollars(str(content))
-            text.append(content_str)
-
-    full_text = ""
-    for i, t in enumerate(text):
-        if t == "<br>":
-            full_text += t
-        elif i > 0 and text[i - 1] != "<br>":
-            full_text += " " + t
-        else:
-            full_text += t
-    return full_text
 
 
 class Markdownify(MarkdownConverter):
@@ -204,19 +188,25 @@ class LayoutBlock:
     content: str
 
 
-def parse_layout(html: str, image: Image.Image):
+def parse_layout(html: str, image: Image.Image, bbox_scale=settings.BBOX_SCALE):
     soup = BeautifulSoup(html, "html.parser")
     top_level_divs = soup.find_all("div", recursive=False)
     width, height = image.size
-    width_scaler = width / 1024
-    height_scaler = height / 1024
+    width_scaler = width / bbox_scale
+    height_scaler = height / bbox_scale
     layout_blocks = []
     for div in top_level_divs:
         bbox = div.get("data-bbox")
+
         try:
             bbox = json.loads(bbox)
+            assert len(bbox) == 4, "Invalid bbox length"
         except Exception:
-            bbox = [0, 0, 1, 1]  # Fallback to a default bbox if parsing fails
+            try:
+                bbox = bbox.split(" ")
+                assert len(bbox) == 4, "Invalid bbox length"
+            except Exception:
+                bbox = [0, 0, 1, 1]
 
         bbox = list(map(int, bbox))
         # Normalize bbox
@@ -232,7 +222,7 @@ def parse_layout(html: str, image: Image.Image):
     return layout_blocks
 
 
-def parse_chunks(html: str, image: Image.Image):
-    layout = parse_layout(html, image)
+def parse_chunks(html: str, image: Image.Image, bbox_scale=settings.BBOX_SCALE):
+    layout = parse_layout(html, image, bbox_scale=bbox_scale)
     chunks = [asdict(block) for block in layout]
     return chunks

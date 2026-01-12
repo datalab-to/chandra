@@ -143,6 +143,7 @@ def process():
                 "image_height": img_height,
                 "blocks": blocks_data,
                 "html": html_with_images,
+                "markdown": result.markdown,
             }
         )
 
