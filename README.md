@@ -187,3 +187,6 @@ Code is Apache 2.0. Model weights use a modified OpenRAIL-M license: free for re
 - [vLLM](https://github.com/vllm-project/vllm)
 - [olmocr](https://github.com/allenai/olmocr)
 - [Qwen3 VL](https://github.com/QwenLM/Qwen3)
+
+## Support Datalab
+If you find this repository helpful, please consider giving it a star ⭐
