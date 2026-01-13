@@ -1,6 +1,17 @@
-# Chandra
+<p align="center">
+  <img src="assets/datalab-logo.png" alt="Datalab Logo" width="150"/>
+</p>
+<h1 align="center">Datalab</h1>
+<p align="center">
+  <strong>State of the Art models for Document Intelligence</strong>
+</p>
+<p align="center">
+  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/Code%20License-Apache_2.0-green.svg" alt="Code License"></a>
+  <a href="https://www.datalab.to/pricing"><img src="https://img.shields.io/badge/Model%20License-OpenRAIL--M-blue.svg" alt="Model License"></a>
+  <a href="https://discord.gg/KuZwXNGnfH"><img src="https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
+</p>
 
-[![Discord](https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/KuZwXNGnfH)
+# Chandra
 
 An OCR model for complex documents — handwriting, tables, math equations, and messy forms.
 
