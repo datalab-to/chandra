@@ -52,7 +52,7 @@ def generate_vllm(
         model_name = models.data[0].id
 
     def _generate(
-        item: BatchInputItem, temperature: float = 0, top_p: float = 0.1
+        item: BatchInputItem, temperature: float = 0.7, top_p: float = 0.9, repetition_penalty: float = 1.2,
     ) -> GenerationResult:
         prompt = item.prompt
         if not prompt:
@@ -77,8 +77,9 @@ def generate_vllm(
                 model=model_name,
                 messages=[{"role": "user", "content": content}],
                 max_tokens=max_output_tokens,
-                temperature=temperature,
+                temperature=temperature,    
                 top_p=top_p,
+                repetition_penalty=repetition_penalty,
             )
             raw = completion.choices[0].message.content
             result = GenerationResult(
@@ -93,12 +94,21 @@ def generate_vllm(
         return result
 
     def process_item(item, max_retries, max_failure_retries=None):
-        result = _generate(item)
+        retry_params = [
+            dict(temperature=0.7, top_p=0.9, repetition_penalty=1.2),
+            dict(temperature=0.9, top_p=0.95, repetition_penalty=1.3),
+            dict(temperature=1.1, top_p=0.95, repetition_penalty=1.4),
+        ]
+
+        result = _generate(item, **retry_params[0])
         retries = 0
 
-        while _should_retry(result, retries, max_retries, max_failure_retries):
-            result = _generate(item, temperature=0.3, top_p=0.95)
+        while True:
+            if not _should_retry(result, retries, max_retries, max_failure_retries):
+                break
             retries += 1
+            idx = min(retries, len(retry_params) - 1)
+            result = _generate(item, **retry_params[idx])
 
         return result
 
