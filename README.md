@@ -29,7 +29,7 @@ A hosted API with additional accuracy improvements is available at [datalab.to](
 
 ## Community
 
-Join [Discord](https://discord.gg//KuZwXNGnfH) to discuss development and get help.
+Join [Discord](https://discord.gg/KuZwXNGnfH) to discuss development and get help.
 
 ## Quick Start
 
@@ -59,7 +59,7 @@ results = manager.generate(images)
 print(results[0].markdown)
 ```
 
-## How it Works.
+## How it Works
 
 - **Two inference modes**: Run locally via HuggingFace Transformers, or deploy a vLLM server for production throughput
 - **Layout-aware output**: Every text block, table, and image comes with bounding box coordinates
