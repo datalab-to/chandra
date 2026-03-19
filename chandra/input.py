@@ -26,7 +26,7 @@ def load_image(
 
 def load_pdf_images(
     filepath: str,
-    page_range: List[int],
+    page_range: List[int] | None = None,
     image_dpi: int = settings.IMAGE_DPI,
     min_pdf_image_dim: int = settings.MIN_PDF_IMAGE_DIM,
 ) -> List[Image.Image]:

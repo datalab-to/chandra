@@ -151,6 +151,29 @@ Each processed file creates a subdirectory with:
 - `<filename>_metadata.json` - Metadata (page info, token count, etc.)
 - Extracted images are saved directly in the output directory
 
+### Python API
+
+Use `BatchInputItem` when calling `InferenceManager.generate`, and omit `page_range` to process every page in a PDF:
+
+```python
+from chandra.input import load_pdf_images
+from chandra.model import BatchInputItem, InferenceManager
+
+manager = InferenceManager(method="hf")
+images = load_pdf_images("document.pdf")
+
+batch = [
+    BatchInputItem(
+        image=image,
+        prompt_type="ocr_layout",
+    )
+    for image in images
+]
+
+results = manager.generate(batch)
+print(results[0].markdown)
+```
+
 ### Streamlit Web App
 
 Launch the interactive demo for single-page processing:
