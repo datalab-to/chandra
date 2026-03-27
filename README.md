@@ -277,6 +277,23 @@ Benchmarked with vLLM on a single NVIDIA H100 80GB GPU using a diverse mix of do
 |---|:---:|:---:|:---:|:---:|
 | vLLM, 96 concurrent sequences | 1.44 | 60s | 156s | 0% |
 
+## Model transparency
+
+### Training data
+
+Chandra OCR 2 is trained on large-scale collections of document images designed to cover math, tables, forms, handwriting, scans, and multilingual content. The goal of the training corpus is to match the distribution of the benchmarks and real‑world documents shown above. We do not list individual datasets or sources here, but as with most OCR systems, the model may inherit patterns, artifacts, and biases that exist in the underlying data.
+
+If we publish more detailed information about the training data composition or preprocessing, we will link it from this section.
+
+### Limitations and risks
+
+- Performance can degrade on extremely low‑resolution scans, heavy blur, or severe compression artifacts.
+- Rare scripts, highly stylized fonts, or unusual page layouts may be misrecognized or reordered.
+- The model may hallucinate or omit text, tables, or symbols, especially in very noisy or partially occluded regions.
+- Outputs can reflect social or cultural biases present in the training data and should not be treated as ground truth for high‑stakes decisions (e.g., legal, medical, or safety‑critical use) without human review.
+
+Users should carefully review outputs before use in production workflows and consider adding domain‑specific validation or post‑processing where appropriate.
+
 # Credits
 
 Thank you to the following open source projects:
