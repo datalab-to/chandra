@@ -23,9 +23,7 @@ def get_image_name(html: str, div_idx: int):
 
 def extract_images(html: str, chunks: dict, image: Image.Image):
     images = {}
-    div_idx = 0
     for idx, chunk in enumerate(chunks):
-        div_idx += 1
         if chunk["label"] in ["Image", "Figure"]:
             img = BeautifulSoup(chunk["content"], "html.parser").find("img")
             if not img:
@@ -36,6 +34,10 @@ def extract_images(html: str, chunks: dict, image: Image.Image):
             except ValueError:
                 # Happens when bbox coordinates are invalid
                 continue
+            # Use the original div index stored by parse_layout so the
+            # filename matches the one written by parse_html (which counts
+            # all divs, including Blank-Page).
+            div_idx = chunk.get("div_idx", idx + 1)
             img_name = get_image_name(html, div_idx)
             images[img_name] = block_image
     return images
@@ -194,6 +196,7 @@ class LayoutBlock:
     bbox: list[int]
     label: str
     content: str
+    div_idx: int = 0
 
 
 def parse_layout(html: str, image: Image.Image, bbox_scale=settings.BBOX_SCALE):
@@ -203,7 +206,7 @@ def parse_layout(html: str, image: Image.Image, bbox_scale=settings.BBOX_SCALE):
     width_scaler = width / bbox_scale
     height_scaler = height / bbox_scale
     layout_blocks = []
-    for div in top_level_divs:
+    for div_idx, div in enumerate(top_level_divs, start=1):
         label = div.get("data-label")
         if label == "Blank-Page":
             continue
@@ -235,7 +238,7 @@ def parse_layout(html: str, image: Image.Image, bbox_scale=settings.BBOX_SCALE):
             del tag["data-bbox"]
         content = str(content_soup)
 
-        layout_blocks.append(LayoutBlock(bbox=bbox, label=label, content=content))
+        layout_blocks.append(LayoutBlock(bbox=bbox, label=label, content=content, div_idx=div_idx))
     return layout_blocks
 
 
