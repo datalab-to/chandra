@@ -130,7 +130,7 @@ if run_ocr:
                 ["HTML", "HTML as text", "Layout Image"]
             )
             with html_tab:
-                st.markdown(markdown_with_images, unsafe_allow_html=True)
+                st.markdown(markdown_with_images)
                 st.download_button(
                     label="Download Markdown",
                     data=result.markdown,
