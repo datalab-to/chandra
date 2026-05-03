@@ -21,6 +21,7 @@ def get_supported_files(input_path: Path) -> List[Path]:
         ".webp",
         ".tiff",
         ".bmp",
+        ".avif",
     }
 
     if input_path.is_file():
