@@ -29,6 +29,7 @@ class InferenceManager:
             )
         bbox_scale = kwargs.pop("bbox_scale", settings.BBOX_SCALE)
         vllm_api_base = kwargs.pop("vllm_api_base", settings.VLLM_API_BASE)
+        vllm_api_key = kwargs.pop("vllm_api_key", settings.VLLM_API_KEY)
 
         if self.method == "vllm":
             results = generate_vllm(
@@ -36,6 +37,7 @@ class InferenceManager:
                 max_output_tokens=max_output_tokens,
                 bbox_scale=bbox_scale,
                 vllm_api_base=vllm_api_base,
+                vllm_api_key=vllm_api_key,
                 **kwargs,
             )
         else:
