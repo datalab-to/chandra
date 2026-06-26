@@ -30,8 +30,11 @@ def scale_to_fit(
         scale = (min_pixels / current_pixels) ** 0.5
 
     # 2. Convert dimensions to integer "grid blocks"
+    # Derive h_blocks from rounded w_blocks to preserve aspect ratio.
+    # Independent rounding of both axes can push them in opposite directions
+    # (e.g. w rounds up, h rounds down), distorting the ratio.
     w_blocks = max(1, round((width * scale) / grid_size))
-    h_blocks = max(1, round((height * scale) / grid_size))
+    h_blocks = max(1, round(w_blocks * (height / width)))
 
     # 3. Refinement Loop: Ensure we are under the max limit
     while (w_blocks * h_blocks * grid_size * grid_size) > max_pixels:
