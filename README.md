@@ -147,7 +147,7 @@ chandra ./documents ./output --method hf
 **CLI Options:**
 - `--method [hf|vllm]`: Inference method (default: vllm)
 - `--page-range TEXT`: Page range for PDFs (e.g., "1-5,7,9-12")
-- `--max-output-tokens INTEGER`: Max tokens per page
+- `--max-output-tokens INTEGER`: Max tokens per page (note that the current chandra input prompt takes up ~2300 tokens)
 - `--max-workers INTEGER`: Parallel workers for vLLM
 - `--include-images/--no-images`: Extract and save images (default: include)
 - `--include-headers-footers/--no-headers-footers`: Include page headers/footers (default: exclude)
