@@ -19,6 +19,7 @@ def get_supported_files(input_path: Path) -> List[Path]:
         ".gif",
         ".webp",
         ".tiff",
+        ".tif",
         ".bmp",
     }
 
