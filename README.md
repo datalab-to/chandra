@@ -62,11 +62,11 @@ chandra_vllm
 chandra input.pdf ./output
 
 # With HuggingFace (requires torch)
-pip install chandra-ocr[hf]
+pip install 'chandra-ocr[hf]'
 chandra input.pdf ./output --method hf
 
 # Interactive streamlit app
-pip install chandra-ocr[app]
+pip install 'chandra-ocr[app]'
 chandra_app
 ```
 
@@ -113,10 +113,10 @@ See full scores [below](#benchmark-table).
 pip install chandra-ocr
 
 # With HuggingFace backend (includes torch, transformers)
-pip install chandra-ocr[hf]
+pip install 'chandra-ocr[hf]'
 
 # With all extras
-pip install chandra-ocr[all]
+pip install 'chandra-ocr[all]'
 ```
 
 If you're using the HuggingFace method, we also recommend installing [flash attention](https://github.com/Dao-AILab/flash-attention) for better performance.
