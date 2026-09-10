@@ -1,3 +1,5 @@
+"""Chandra CLI."""
+
 import json
 from pathlib import Path
 from typing import List
@@ -45,6 +47,7 @@ def save_merged_output(
     results: List,
     save_images: bool = True,
     save_html: bool = True,
+    save_chunks: bool = True,
     paginate_output: bool = False,
 ):
     """Save merged OCR results for all pages to output directory."""
@@ -57,6 +60,7 @@ def save_merged_output(
     all_markdown = []
     all_html = []
     all_metadata = []
+    all_chunks = []
     total_tokens = 0
     total_chunks = 0
     total_images = 0
@@ -90,6 +94,14 @@ def save_merged_output(
         }
         all_metadata.append(page_metadata)
 
+        all_chunks.append(
+            {
+                "page_num": page_num,
+                "page_box": result.page_box,
+                "chunks": result.chunks,
+            }
+        )
+
         # Save extracted images if requested
         if save_images and result.images:
             images_dir = file_output_dir
@@ -122,6 +134,14 @@ def save_merged_output(
     metadata_path = file_output_dir / f"{safe_name}_metadata.json"
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
+
+    # Save the per-page layout chunks (bbox, label, content) beside the
+    # transcript.  They live in their own file so the metadata file stays small
+    # enough to read cheaply.
+    if save_chunks:
+        chunks_path = file_output_dir / f"{safe_name}_chunks.json"
+        with open(chunks_path, "w", encoding="utf-8") as f:
+            json.dump(all_chunks, f, indent=2)
 
     click.echo(f"  Saved: {markdown_path} ({len(results)} page(s))")
 
@@ -175,6 +195,11 @@ def save_merged_output(
     help="Save HTML output files.",
 )
 @click.option(
+    "--save-chunks/--no-chunks",
+    default=True,
+    help="Save per-page layout chunks (bbox, label, content) to <name>_chunks.json.",
+)
+@click.option(
     "--batch-size",
     type=int,
     default=None,
@@ -196,6 +221,7 @@ def main(
     include_images: bool,
     include_headers_footers: bool,
     save_html: bool,
+    save_chunks: bool,
     batch_size: int,
     paginate_output: bool,
 ):
@@ -284,6 +310,7 @@ def main(
                 all_results,
                 save_images=include_images,
                 save_html=save_html,
+                save_chunks=save_chunks,
                 paginate_output=paginate_output,
             )
 
