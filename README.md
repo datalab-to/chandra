@@ -24,11 +24,13 @@ Chandra OCR 2 is a state of the art OCR model that converts images and PDFs into
 
 ## Try Chandra on Datalab
 
-Our managed platform runs an improved Chandra with higher accuracy than the open weights, zero data retention by default, SOC 2 Type 2, and custom BAAs.
+Our managed platform uses an improved Chandra and other models, with higher accuracy than the open weights, opt-in zero data retention, SOC 2 Type 2, and custom BAAs.
 
-If you have high volume workloads, we offer a batch processing service that has processed 200M+ pages per week — we manage the infrastructure so your workloads finish on time.
+If you have high volume workloads, we offer a batch processing service that has processed 1B+ pages in a day at peak — we manage the infrastructure so your workloads finish on time.
 
-Get started with **$5 in free credits** — [sign up](https://www.datalab.to/?utm_source=gh-chandra) — takes under 30 seconds — or try Chandra in our [public playground](https://www.datalab.to/playground?utm_source=gh-chandra).
+The Datalab API turns documents into verifiable knowledge your agents act on. Every result traces back to its page and position, and one API can parse, extract, fill and edit documents.
+
+Get started with **about 5,000 free convert pages every month** (work email) — [sign up](https://www.datalab.to/?utm_source=gh-chandra) — takes under 30 seconds — or try Chandra in our [public playground](https://www.datalab.to/playground?utm_source=gh-chandra).
 
 Commercial self-hosting requires a license — see [Commercial usage](#commercial-usage). For on-prem licensing, [contact us](https://www.datalab.to/contact?utm_source=gh-chandra-onprem).
 
