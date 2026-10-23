@@ -56,9 +56,9 @@ def parse_range_str(range_str: str) -> List[int]:
     for i in range_lst:
         if "-" in i:
             start, end = i.split("-")
-            page_lst += list(range(int(start), int(end) + 1))
+            page_lst += list(range(int(start) - 1, int(end)))
         else:
-            page_lst.append(int(i))
+            page_lst.append(int(i) - 1)
     page_lst = sorted(list(set(page_lst)))  # Deduplicate page numbers and sort in order
     return page_lst
 
