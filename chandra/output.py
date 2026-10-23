@@ -153,7 +153,7 @@ class Markdownify(MarkdownConverter):
         if not el.find_parent(["pre", "code", "kbd", "samp", "math"]):
             text = self.escape(text)
 
-        # remove trailing whitespaces if any of the following condition is true:
+        # remove trailing whitespaces if any of the following conditions are true:
         # - current text node is the last node in li
         # - current text node is followed by an embedded list
         if el.parent.name == "li" and (
