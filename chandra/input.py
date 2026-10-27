@@ -69,8 +69,17 @@ def load_file(filepath: str, config: dict):
         page_range = parse_range_str(page_range)
 
     input_type = filetype.guess(filepath)
+    is_pdf = False
+
+    # Prefer header-based detection but fall back to file extension.
     if input_type and input_type.extension == "pdf":
+        is_pdf = True
+    elif filepath.lower().endswith(".pdf"):
+        is_pdf = True
+
+    if is_pdf:
         images = load_pdf_images(filepath, page_range)
     else:
+        # Non‑PDF inputs are treated as single images.
         images = [load_image(filepath)]
     return images
