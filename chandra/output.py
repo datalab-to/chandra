@@ -93,7 +93,9 @@ def parse_html(
             div.append(BeautifulSoup(text_content, "html.parser"))
 
         content = str(div.decode_contents())
-        out_html += content
+        # Preserve layout block boundaries even when the contents are only inline
+        # markup. Whitespace alone is collapsed during Markdown conversion.
+        out_html += f"<div>{content}</div>"
     return out_html
 
 
