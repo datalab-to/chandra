@@ -7,6 +7,7 @@ import click
 from chandra.input import load_file
 from chandra.model import InferenceManager
 from chandra.model.schema import BatchInputItem
+from chandra.settings import settings
 
 
 def get_supported_files(input_path: Path) -> List[Path]:
@@ -20,6 +21,7 @@ def get_supported_files(input_path: Path) -> List[Path]:
         ".webp",
         ".tiff",
         ".bmp",
+        ".avif",
     }
 
     if input_path.is_file():
@@ -160,6 +162,18 @@ def save_merged_output(
     help="Maximum number of retries for vLLM inference.",
 )
 @click.option(
+    "--vllm-api-base",
+    type=str,
+    default=settings.VLLM_API_BASE,
+    help=f"default: {settings.VLLM_API_BASE!r}",
+)
+@click.option(
+    "--vllm-api-key",
+    type=str,
+    default=settings.VLLM_API_KEY,
+    help=f"default: {settings.VLLM_API_KEY!r}",
+)
+@click.option(
     "--include-images/--no-images",
     default=True,
     help="Include images in output.",
@@ -193,6 +207,8 @@ def main(
     max_output_tokens: int,
     max_workers: int,
     max_retries: int,
+    vllm_api_base: str,
+    vllm_api_key: str,
     include_images: bool,
     include_headers_footers: bool,
     save_html: bool,
@@ -273,6 +289,10 @@ def main(
                         generate_kwargs["max_workers"] = max_workers
                     if max_retries is not None:
                         generate_kwargs["max_retries"] = max_retries
+                    if vllm_api_base is not None:
+                        generate_kwargs["vllm_api_base"] = vllm_api_base
+                    if vllm_api_key is not None:
+                        generate_kwargs["vllm_api_key"] = vllm_api_key
 
                 results = model.generate(batch, **generate_kwargs)
                 all_results.extend(results)

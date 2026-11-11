@@ -4,6 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from itertools import repeat
 from typing import List
+import logging
 
 from PIL import Image
 from openai import OpenAI
@@ -12,6 +13,9 @@ from chandra.model.schema import BatchInputItem, GenerationResult
 from chandra.model.util import scale_to_fit, detect_repeat_token
 from chandra.prompts import PROMPT_MAPPING
 from chandra.settings import settings
+
+
+logger = logging.getLogger(__name__)
 
 
 def image_to_base64(image: Image.Image) -> str:
@@ -30,11 +34,16 @@ def generate_vllm(
     max_failure_retries: int | None = None,
     bbox_scale: int = settings.BBOX_SCALE,
     vllm_api_base: str = settings.VLLM_API_BASE,
+    vllm_api_key: str = settings.VLLM_API_KEY,
     temperature: float = 0.0,
     top_p: float = 0.1,
 ) -> List[GenerationResult]:
+    if not vllm_api_base.endswith("/v1"):
+        # this can fail with
+        # Exception: Unexpected endpoint or method. (POST /chat/completions)
+        logger.warning(f"vllm_api_base does not end with '/v1': {vllm_api_base!r}")
     client = OpenAI(
-        api_key=settings.VLLM_API_KEY,
+        api_key=vllm_api_key,
         base_url=vllm_api_base,
         default_headers=custom_headers,
     )
@@ -78,6 +87,8 @@ def generate_vllm(
                 temperature=temperature,
                 top_p=top_p,
             )
+            if hasattr(completion, "error"):
+                raise Exception(completion.error)
             raw = completion.choices[0].message.content
             result = GenerationResult(
                 raw=raw,
