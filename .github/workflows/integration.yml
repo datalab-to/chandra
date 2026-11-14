@@ -26,4 +26,4 @@ jobs:
           PYTHONPATH: .
           TORCH_ATTN: "sdpa"
         run: |
-          uv run pytest tests/integration
+          uv run pytest tests/unit tests/integration

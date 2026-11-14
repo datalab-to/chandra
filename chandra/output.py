@@ -1,14 +1,42 @@
+from dataclasses import asdict, dataclass
+from functools import lru_cache
 import hashlib
 import re
-from dataclasses import dataclass, asdict
-from functools import lru_cache
 
-import six
 from PIL import Image
 from bs4 import BeautifulSoup
 from markdownify import MarkdownConverter, re_whitespace
 
 from chandra.settings import settings
+
+_DANGEROUS_CONTAINER_RE = re.compile(
+    r"<\s*(script|style|iframe|object|embed|applet)\b[^>]*>[\s\S]*?<\s*/\s*\1\s*>",
+    re.IGNORECASE,
+)
+_DANGEROUS_TAGS_RE = re.compile(
+    r"<\s*/?\s*(?:script|iframe|object|embed|applet|meta|link|base|form|style)\b[^>]*>",
+    re.IGNORECASE,
+)
+_EVENT_ATTR_RE = re.compile(
+    r"""\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""",
+    re.IGNORECASE,
+)
+_JS_URL_RE = re.compile(
+    r"""(href|src)\s*=\s*(['"]?)\s*(?:(?:javascript|vbscript)\s*:|data\s*:\s*text/html\b)[^'">\s]*\2""",
+    re.IGNORECASE,
+)
+_LEADING_OL_NUM_RE = re.compile(r"^\s*\d+[\.\)]\s+")
+
+
+def sanitize_html(text: str) -> str:
+    """Strip unsafe tags, event handler attributes, and javascript:/data:text/html URLs."""
+    if not text:
+        return ""
+    cleaned = _DANGEROUS_CONTAINER_RE.sub("", text)
+    cleaned = _DANGEROUS_TAGS_RE.sub("", cleaned)
+    cleaned = _EVENT_ATTR_RE.sub("", cleaned)
+    cleaned = _JS_URL_RE.sub(r'\1="#"', cleaned)
+    return cleaned
 
 
 @lru_cache
@@ -21,20 +49,21 @@ def get_image_name(html: str, div_idx: int):
     return f"{html_hash}_{div_idx}_img.webp"
 
 
-def extract_images(html: str, chunks: dict, image: Image.Image):
+def extract_images(html: str, chunks: list[dict], image: Image.Image):
     images = {}
-    div_idx = 0
-    for idx, chunk in enumerate(chunks):
-        div_idx += 1
-        if chunk["label"] in ["Image", "Figure"]:
-            img = BeautifulSoup(chunk["content"], "html.parser").find("img")
-            if not img:
-                continue
+    for div_idx, chunk in enumerate(chunks, start=1):
+        if (chunk.get("label") or "").lower() in ("image", "figure"):
             bbox = chunk["bbox"]
+            if (
+                not isinstance(bbox, (list, tuple))
+                or len(bbox) != 4
+                or bbox[2] <= bbox[0]
+                or bbox[3] <= bbox[1]
+            ):
+                continue
             try:
                 block_image = image.crop(bbox)
             except ValueError:
-                # Happens when bbox coordinates are invalid
                 continue
             img_name = get_image_name(html, div_idx)
             images[img_name] = block_image
@@ -44,27 +73,28 @@ def extract_images(html: str, chunks: dict, image: Image.Image):
 def parse_html(
     html: str, include_headers_footers: bool = False, include_images: bool = True
 ):
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(sanitize_html(html), "html.parser")
     top_level_divs = soup.find_all("div", recursive=False)
-    out_html = ""
+    out_blocks = []
     image_idx = 0
     div_idx = 0
     for div in top_level_divs:
         div_idx += 1
         label = div.get("data-label")
+        label_lower = (label or "").lower()
 
-        if label == "Blank-Page":
+        if label_lower == "blank-page":
             continue
 
         # Skip headers and footers if not included
-        if label and not include_headers_footers:
-            if label in ["Page-Header", "Page-Footer"]:
+        if label_lower and not include_headers_footers:
+            if label_lower in ("page-header", "page-footer"):
                 continue
-        if label and not include_images:
-            if label in ["Image", "Figure"]:
+        if label_lower and not include_images:
+            if label_lower in ("image", "figure"):
                 continue
 
-        if label in ["Image", "Figure"]:
+        if label_lower in ("image", "figure"):
             img = div.find("img")
             img_src = get_image_name(html, div_idx)
 
@@ -77,24 +107,29 @@ def parse_html(
                 div.append(img)
 
         # Strip img tags without src in non-image blocks (model hallucinations)
-        if label not in ["Image", "Figure"]:
+        if label_lower not in ("image", "figure"):
             for img_tag in div.find_all("img"):
                 if not img_tag.get("src"):
                     img_tag.decompose()
 
         # Wrap text content in <p> tags if no inner HTML tags exist
-        if label in ["Text"] and not re.search(
+        if label_lower == "text" and not re.search(
             "<.+>", str(div.decode_contents()).strip()
         ):
-            # Add inner p tags if missing for text blocks
             text_content = str(div.decode_contents()).strip()
             text_content = f"<p>{text_content}</p>"
             div.clear()
             div.append(BeautifulSoup(text_content, "html.parser"))
 
         content = str(div.decode_contents())
-        out_html += content
-    return out_html
+        # Preserve layout block boundaries even when the contents are only inline
+        # markup so adjacent headers, footers, and headings never glue together.
+        out_blocks.append(f"<div>{content}</div>")
+
+    if not top_level_divs and html.strip():
+        return sanitize_html(html)
+
+    return "".join(out_blocks)
 
 
 class Markdownify(MarkdownConverter):
@@ -127,8 +162,18 @@ class Markdownify(MarkdownConverter):
                 + " "
             )
 
+    def convert_div(self, el, text, parent_tags):
+        stripped = text.strip()
+        return f"\n\n{stripped}\n\n" if stripped else ""
+
     def convert_table(self, el, text, parent_tags):
         return "\n\n" + str(el) + "\n\n"
+
+    def convert_li(self, el, text, parent_tags):
+        parent = el.parent
+        if parent and parent.name == "ol" and text:
+            text = _LEADING_OL_NUM_RE.sub("", text, count=1)
+        return super().convert_li(el, text, parent_tags)
 
     def convert_a(self, el, text, parent_tags):
         text = self.escape(text)
@@ -143,7 +188,7 @@ class Markdownify(MarkdownConverter):
         return text
 
     def process_text(self, el, parent_tags=None):
-        text = six.text_type(el) or ""
+        text = str(el) or ""
 
         # normalize whitespace if we're not inside a preformatted element
         if not el.find_parent("pre"):
@@ -153,11 +198,11 @@ class Markdownify(MarkdownConverter):
         if not el.find_parent(["pre", "code", "kbd", "samp", "math"]):
             text = self.escape(text)
 
-        # remove trailing whitespaces if any of the following condition is true:
+        # remove trailing whitespaces if any of the following conditions are true:
         # - current text node is the last node in li
         # - current text node is followed by an embedded list
-        if el.parent.name == "li" and (
-            not el.next_sibling or el.next_sibling.name in ["ul", "ol"]
+        if el.parent and el.parent.name == "li" and (
+            not el.next_sibling or getattr(el.next_sibling, "name", None) in ["ul", "ol"]
         ):
             text = text.rstrip()
 
@@ -196,8 +241,17 @@ class LayoutBlock:
     content: str
 
 
+def _parse_raw_bbox(raw_bbox: str | None) -> list[float]:
+    if not raw_bbox or not isinstance(raw_bbox, str):
+        raise ValueError("Missing data-bbox")
+    nums = re.findall(r"-?\d+(?:\.\d+)?", raw_bbox)
+    if len(nums) != 4:
+        raise ValueError(f"Expected 4 numbers in bbox, got {raw_bbox!r}")
+    return [float(n) for n in nums]
+
+
 def parse_layout(html: str, image: Image.Image, bbox_scale=settings.BBOX_SCALE):
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(sanitize_html(html), "html.parser")
     top_level_divs = soup.find_all("div", recursive=False)
     width, height = image.size
     width_scaler = width / bbox_scale
@@ -208,23 +262,19 @@ def parse_layout(html: str, image: Image.Image, bbox_scale=settings.BBOX_SCALE):
         if label == "Blank-Page":
             continue
 
-        bbox = div.get("data-bbox")
-
+        raw_bbox = div.get("data-bbox")
         try:
-            bbox = bbox.split(" ")
-            bbox = list(map(int, bbox))
-            assert len(bbox) == 4, "Invalid bbox length"
+            coords = _parse_raw_bbox(raw_bbox)
         except Exception:
-            print(f"Invalid bbox format: {bbox}, defaulting to full image")
-            bbox = [0, 0, 1, 1]
+            print(f"Invalid bbox format: {raw_bbox}, defaulting to full image")
+            coords = [0.0, 0.0, float(bbox_scale), float(bbox_scale)]
 
-        # Normalize bbox
-        bbox = [
-            max(0, int(bbox[0] * width_scaler)),
-            max(0, int(bbox[1] * height_scaler)),
-            min(int(bbox[2] * width_scaler), width),
-            min(int(bbox[3] * height_scaler), height),
-        ]
+        x0 = max(0, min(width, int(coords[0] * width_scaler)))
+        y0 = max(0, min(height, int(coords[1] * height_scaler)))
+        x1 = max(x0, min(width, int(coords[2] * width_scaler)))
+        y1 = max(y0, min(height, int(coords[3] * height_scaler)))
+        bbox = [x0, y0, x1, y1]
+
         if not label:
             label = "block"
         content = str(div.decode_contents())

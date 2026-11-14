@@ -1,7 +1,10 @@
+import pytest
+
 from chandra.model import InferenceManager, BatchInputItem
 
 
 def test_inference_image(simple_text_image):
+    pytest.importorskip("torch")
     manager = InferenceManager(method="hf")
     batch = [
         BatchInputItem(

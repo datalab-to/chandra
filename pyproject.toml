@@ -1,6 +1,6 @@
 [project]
 name = "chandra-ocr"
-version = "0.2.0"
+version = "0.3.0"
 description = "OCR model that converts documents to markdown, HTML, or JSON."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,14 +13,13 @@ dependencies = [
     "beautifulsoup4>=4.14.2",
     "click>=8.0.0",
     "filetype>=1.2.0",
-    "markdownify==1.1.0",
+    "markdownify>=1.1.0,<2",
     "openai>=2.2.0",
     "pillow>=10.2.0",
     "pydantic>=2.12.0",
     "pydantic-settings>=2.11.0",
     "pypdfium2>=4.30.0",
     "python-dotenv>=1.1.1",
-    "six>=1.17.0",
 ]
 
 [project.optional-dependencies]
@@ -30,30 +29,29 @@ hf = [
     "transformers>=5.2.0",
     "accelerate>=1.11.0",
 ]
-app = [
-    "streamlit>=1.50.0",
-]
+app = []
 all = [
-    "chandra-ocr[hf,app]",
+    "chandra-ocr[hf]",
 ]
 
 [build-system]
-requires = ["setuptools>=61"]  # or "setuptools>=61", "flit-core", etc.
+requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project.scripts]
 chandra = "chandra.scripts.cli:main"
-chandra_app = "chandra.scripts.run_app:main"
-chandra_screenshot = "chandra.scripts.screenshot_app:main"
+chandra_app = "chandra.scripts.viewer:main"
 chandra_vllm = "chandra.scripts.vllm:main"
 
 [tool.setuptools.packages.find]
 include = ["chandra*"]
 
+[tool.setuptools.package-data]
+"chandra.skills" = ["SKILL.md"]
+
 [dependency-groups]
 dev = [
     "chandra-ocr[all]",
-    "flask>=3.0.0",
     "pre-commit>=4.3.0",
     "pytest>=8.4.2",
 ]

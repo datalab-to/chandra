@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List
+from typing import Dict, List
 
 from PIL import Image
 
@@ -15,16 +15,16 @@ class GenerationResult:
 class BatchInputItem:
     image: Image.Image
     prompt: str | None = None
-    prompt_type: str | None = None
+    prompt_type: str | None = "ocr_layout"
 
 
 @dataclass
 class BatchOutputItem:
     markdown: str
     html: str
-    chunks: dict
+    chunks: List[Dict]
     raw: str
     page_box: List[int]
     token_count: int
-    images: dict
+    images: Dict[str, Image.Image]
     error: bool

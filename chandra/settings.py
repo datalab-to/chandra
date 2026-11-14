@@ -1,10 +1,11 @@
-from dotenv import find_dotenv
-from pydantic_settings import BaseSettings
 import os
+
+from dotenv import find_dotenv
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    # Paths
+    # Paths & rendering
     BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     IMAGE_DPI: int = 192
     MIN_PDF_IMAGE_DIM: int = 1024
@@ -22,9 +23,10 @@ class Settings(BaseSettings):
     VLLM_GPUS: str = "0"
     MAX_VLLM_RETRIES: int = 6
 
-    class Config:
-        env_file = find_dotenv("local.env")
-        extra = "ignore"
+    model_config = SettingsConfigDict(
+        env_file=find_dotenv("local.env"),
+        extra="ignore",
+    )
 
 
 settings = Settings()

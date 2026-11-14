@@ -30,8 +30,11 @@ def scale_to_fit(
         scale = (min_pixels / current_pixels) ** 0.5
 
     # 2. Convert dimensions to integer "grid blocks"
+    # Derive h_blocks from rounded w_blocks to preserve aspect ratio.
+    # Independent rounding of both axes can push them in opposite directions
+    # (e.g. w rounds up, h rounds down), distorting the ratio.
     w_blocks = max(1, round((width * scale) / grid_size))
-    h_blocks = max(1, round((height * scale) / grid_size))
+    h_blocks = max(1, round(w_blocks * (height / width)))
 
     # 3. Refinement Loop: Ensure we are under the max limit
     while (w_blocks * h_blocks * grid_size * grid_size) > max_pixels:
@@ -72,8 +75,14 @@ def detect_repeat_token(
     cut_from_end: int = 0,
     scaling_factor: float = 3.0,
 ):
+    if not predicted_tokens:
+        return False
+
     if cut_from_end > 0:
         predicted_tokens = predicted_tokens[:-cut_from_end]
+
+    if not predicted_tokens:
+        return False
 
     for seq_len in range(1, window_size // 2 + 1):
         # Extract the potential repeating sequence from the end

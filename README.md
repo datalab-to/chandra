@@ -63,12 +63,14 @@ pip install chandra-ocr
 chandra_vllm
 chandra input.pdf ./output
 
-# With HuggingFace (requires torch)
-pip install chandra-ocr[hf]
+# Print Markdown directly to stdout
+chandra input.pdf --stdout
+
+# With HuggingFace (requires torch + transformers)
+pip install "chandra-ocr[hf]"
 chandra input.pdf ./output --method hf
 
-# Interactive streamlit app
-pip install chandra-ocr[app]
+# Interactive Web Viewer (zero extra dependencies)
 chandra_app
 ```
 
@@ -111,14 +113,14 @@ See full scores [below](#benchmark-table).
 ### Package
 
 ```bash
-# Base install (for vLLM backend)
+# Base install (for vLLM backend + interactive web viewer)
 pip install chandra-ocr
 
 # With HuggingFace backend (includes torch, transformers)
-pip install chandra-ocr[hf]
+pip install "chandra-ocr[hf]"
 
 # With all extras
-pip install chandra-ocr[all]
+pip install "chandra-ocr[all]"
 ```
 
 If you're using the HuggingFace method, we also recommend installing [flash attention](https://github.com/Dao-AILab/flash-attention) for better performance.
@@ -142,18 +144,32 @@ Process single files or entire directories:
 # Single file, with vllm server (see below for how to launch vllm)
 chandra input.pdf ./output --method vllm
 
-# Process all files in a directory with local model
-chandra ./documents ./output --method hf
+# Print Markdown directly to stdout
+chandra input.pdf --stdout
+
+# Process all files in a directory (recursively) with local model
+chandra ./documents ./output --method hf --recursive
+
+# Install bundled AI agent skill for Claude Code, Cursor, Codex, or Antigravity
+chandra --install-skill
 ```
 
 **CLI Options:**
-- `--method [hf|vllm]`: Inference method (default: vllm)
-- `--page-range TEXT`: Page range for PDFs (e.g., "1-5,7,9-12")
+- `--method [hf|vllm]`: Inference method (default: `vllm`)
+- `--page-range TEXT`: Page range for PDFs (e.g., `"1-5,7,9-12"`)
 - `--max-output-tokens INTEGER`: Max tokens per page
 - `--max-workers INTEGER`: Parallel workers for vLLM
 - `--include-images/--no-images`: Extract and save images (default: include)
 - `--include-headers-footers/--no-headers-footers`: Include page headers/footers (default: exclude)
+- `--save-chunks/--no-chunks`: Save layout block chunks sidecar `<stem>_chunks.json` (default: save)
+- `--paginate-output`: Insert `---` page separators between pages
+- `--recursive`, `-r`: Recursively search subdirectories when input is a directory
+- `--stdout`: Write Markdown output directly to stdout
+- `--vllm-api-base TEXT`: Override `VLLM_API_BASE` URL
+- `--vllm-api-key TEXT`: Override `VLLM_API_KEY`
+- `--vllm-model-name TEXT`: Override `VLLM_MODEL_NAME`
 - `--batch-size INTEGER`: Pages per batch (default: 28 for vllm, 1 for hf)
+- `--skill` / `--install-skill`: Print or install the bundled Chandra AI agent skill
 
 **Output Structure:**
 
@@ -161,14 +177,32 @@ Each processed file creates a subdirectory with:
 - `<filename>.md` - Markdown output
 - `<filename>.html` - HTML output
 - `<filename>_metadata.json` - Metadata (page info, token count, etc.)
+- `<filename>_chunks.json` - Layout block chunks with bounding boxes and labels
 - Extracted images are saved directly in the output directory
 
-### Streamlit Web App
+### Python SDK
 
-Launch the interactive demo for single-page processing:
+```python
+from chandra import InferenceManager, BatchInputItem, load_file
+
+images = load_file("document.pdf", {"page_range": "1-3"})
+manager = InferenceManager(method="vllm")  # or "hf"
+results = manager.generate([
+    BatchInputItem(image=img, prompt_type="ocr_layout")
+    for img in images
+])
+
+for page_idx, res in enumerate(results, 1):
+    print(f"--- Page {page_idx} ---")
+    print(res.markdown)
+```
+
+### Interactive Web Viewer
+
+Launch the self-contained interactive web viewer (zero extra dependencies) with SVG bounding-box overlays, live backend switching (`vllm` / `hf`), and `Preview`, `Markdown`, `HTML`, `Layout Blocks`, `Raw Tokens`, and `JSON` inspection tabs:
 
 ```bash
-chandra_app
+chandra_app --host 127.0.0.1 --port 8000
 ```
 
 ### vLLM Server (Optional)
@@ -179,9 +213,10 @@ For production deployments or batch processing, use the vLLM server:
 chandra_vllm
 ```
 
-This launches a Docker container with optimized inference settings. Configure via environment variables:
+This launches a Docker/Podman container bound to `127.0.0.1:8000` with GPU-aware inference settings (`H100`, `H200`, `B200`, `GH200`, `A100`, `L40S`, `RTX 4090/5090`, etc.). Configure via CLI flags (`--host`, `--port`, `--gpus`, `--runtime`, `--sudo`) or environment variables:
 
 - `VLLM_API_BASE`: Server URL (default: `http://localhost:8000/v1`)
+- `VLLM_API_KEY`: API key for remote vLLM/OpenAI servers (default: `EMPTY`)
 - `VLLM_MODEL_NAME`: Model name for the server (default: `chandra`)
 - `VLLM_GPUS`: GPU device IDs (default: `0`)
 

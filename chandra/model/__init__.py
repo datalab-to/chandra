@@ -1,15 +1,16 @@
 from typing import List
 
-from chandra.model.hf import load_model, generate_hf
-from chandra.model.schema import BatchInputItem, BatchOutputItem
+from chandra.model.hf import generate_hf, load_model
+from chandra.model.schema import BatchInputItem, BatchOutputItem, GenerationResult
 from chandra.model.vllm import generate_vllm
-from chandra.output import parse_markdown, parse_html, parse_chunks, extract_images
+from chandra.output import extract_images, parse_chunks, parse_html, parse_markdown
 from chandra.settings import settings
 
 
 class InferenceManager:
     def __init__(self, method: str = "vllm"):
-        assert method in ("vllm", "hf"), "method must be 'vllm' or 'hf'"
+        if method not in ("vllm", "hf"):
+            raise ValueError(f"method must be 'vllm' or 'hf', got {method!r}")
         self.method = method
 
         if method == "hf":
@@ -20,6 +21,9 @@ class InferenceManager:
     def generate(
         self, batch: List[BatchInputItem], max_output_tokens=None, **kwargs
     ) -> List[BatchOutputItem]:
+        if not batch:
+            return []
+
         output_kwargs = {}
         if "include_images" in kwargs:
             output_kwargs["include_images"] = kwargs.pop("include_images")
@@ -29,6 +33,8 @@ class InferenceManager:
             )
         bbox_scale = kwargs.pop("bbox_scale", settings.BBOX_SCALE)
         vllm_api_base = kwargs.pop("vllm_api_base", settings.VLLM_API_BASE)
+        vllm_api_key = kwargs.pop("vllm_api_key", settings.VLLM_API_KEY)
+        vllm_model_name = kwargs.pop("vllm_model_name", settings.VLLM_MODEL_NAME)
 
         if self.method == "vllm":
             results = generate_vllm(
@@ -36,6 +42,8 @@ class InferenceManager:
                 max_output_tokens=max_output_tokens,
                 bbox_scale=bbox_scale,
                 vllm_api_base=vllm_api_base,
+                vllm_api_key=vllm_api_key,
+                vllm_model_name=vllm_model_name,
                 **kwargs,
             )
         else:
@@ -63,3 +71,11 @@ class InferenceManager:
                 )
             )
         return output
+
+
+__all__ = [
+    "BatchInputItem",
+    "BatchOutputItem",
+    "GenerationResult",
+    "InferenceManager",
+]
