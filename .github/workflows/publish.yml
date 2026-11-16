@@ -3,36 +3,41 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install uv
         uses: astral-sh/setup-uv@v7
       - name: Set up Python 3.12
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Extract and verify version
         id: version
         run: |
-          # Get the tag name (e.g., v1.2.3)
-          TAG_VERSION="${GITHUB_REF#refs/tags/}"
-          echo "Tag version: $TAG_VERSION"
-          
-          # Extract version from pyproject.toml (e.g., 1.2.3)
           PYPROJECT_VERSION=$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
           echo "pyproject.toml version: $PYPROJECT_VERSION"
-          
-          # Compare versions (tag should be v{pyproject_version})
-          if [ "$TAG_VERSION" != "v$PYPROJECT_VERSION" ]; then
-            echo "Error: Tag version ($TAG_VERSION) does not match pyproject.toml version (v$PYPROJECT_VERSION)"
-            exit 1
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG_VERSION="${GITHUB_REF#refs/tags/}"
+            echo "Tag version: $TAG_VERSION"
+            if [ "$TAG_VERSION" != "v$PYPROJECT_VERSION" ]; then
+              echo "Error: Tag version ($TAG_VERSION) does not match pyproject.toml version (v$PYPROJECT_VERSION)"
+              exit 1
+            fi
           fi
-          
           echo "Version verification passed!"
-          echo "version=$TAG_VERSION" >> $GITHUB_OUTPUT
+          echo "version=v$PYPROJECT_VERSION" >> $GITHUB_OUTPUT
       - name: Build package
         run: |
           uv build
@@ -40,4 +45,8 @@ jobs:
         env:
           PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
         run: |
-          uv publish --token "$PYPI_TOKEN"
+          if [ -n "$PYPI_TOKEN" ]; then
+            uv publish --token "$PYPI_TOKEN"
+          else
+            uv publish
+          fi
