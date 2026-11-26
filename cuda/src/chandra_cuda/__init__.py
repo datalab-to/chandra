@@ -11,7 +11,7 @@ import torch
 from . import _core
 
 __all__ = ["pack_weight", "pack_weight_fp8", "DecodeLinear", "DecodeLinearFP8", "LMHead", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul",
-           "qk_norm_rope_kv"]
+           "qk_norm_rope_kv", "vit_attn"]
 
 
 def gdn_decode(
@@ -345,3 +345,20 @@ class DecodeLinearFP8(DecodeLinear):
             torch.cuda.current_stream(self.device).cuda_stream,
         )
         return out
+
+
+def vit_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens: torch.Tensor, max_len: int,
+             out: torch.Tensor | None = None) -> torch.Tensor:
+    """Non-causal attention of the vision tower over packed images: q, k, v [N, 16, 64] BF16 views
+    sharing a row stride (e.g. the thirds of the fused qkv GEMM output), cu_seqlens [n + 1] int32.
+    Returns [N, 16, 64] BF16 (scale 1/8)."""
+    n = q.shape[0]
+    if q.shape[1:] != (16, 64) or k.shape != q.shape or v.shape != q.shape:
+        raise ValueError("q, k, v must be [N, 16, 64]")
+    if not (q.stride(0) == k.stride(0) == v.stride(0)) or q.stride(1) != 64 or q.stride(2) != 1:
+        raise ValueError("q, k, v must share a row stride with contiguous heads")
+    if out is None:
+        out = torch.empty(n, 16, 64, dtype=torch.bfloat16, device=q.device)
+    _core.vit_attn(q.data_ptr(), k.data_ptr(), v.data_ptr(), q.stride(0), out.data_ptr(), out.stride(0),
+                   cu_seqlens.data_ptr(), cu_seqlens.shape[0] - 1, int(max_len), _stream(q))
+    return out

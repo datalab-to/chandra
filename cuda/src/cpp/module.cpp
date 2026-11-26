@@ -7,6 +7,7 @@
 #include "decode_gemm.h"
 #include "gdn_decode.h"
 #include "small_ops.h"
+#include "vit_attn.h"
 
 namespace nb = nanobind;
 
@@ -135,6 +136,20 @@ NB_MODULE(_core, m) {
         check(chandra::gdn_decode(g, reinterpret_cast<cudaStream_t>(stream)));
       });
 
+  m.def("vit_attn", [](uintptr_t q, uintptr_t k, uintptr_t v, int64_t qkv_stride, uintptr_t out,
+                       int64_t out_stride, uintptr_t cu_seqlens, int n_seq, int max_len, uintptr_t stream) {
+    chandra::VitAttnArgs a{};
+    a.q = reinterpret_cast<const void*>(q);
+    a.k = reinterpret_cast<const void*>(k);
+    a.v = reinterpret_cast<const void*>(v);
+    a.qkv_stride = qkv_stride;
+    a.out = reinterpret_cast<void*>(out);
+    a.out_stride = out_stride;
+    a.cu_seqlens = reinterpret_cast<const int*>(cu_seqlens);
+    a.n_seq = n_seq;
+    a.max_len = max_len;
+    check(chandra::vit_attn(a, reinterpret_cast<cudaStream_t>(stream)));
+  });
   m.def("rmsnorm_add", [](uintptr_t x, uintptr_t res, uintptr_t res_out, uintptr_t out, uintptr_t w, int M,
                           uintptr_t stream) {
     check(chandra::rmsnorm_add(reinterpret_cast<const void*>(x), reinterpret_cast<const void*>(res),
