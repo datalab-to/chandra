@@ -1,0 +1,151 @@
+"""The engine's speculative path on a small random checkpoint (real layer shapes, 4 layers, a
+4,096-token vocabulary): verify + accept with any drafts gives plain greedy decoding's tokens."""
+
+import json
+
+import pytest
+import torch
+
+chandra_cuda = pytest.importorskip("chandra_cuda")
+if not torch.cuda.is_available():
+    pytest.skip("needs a CUDA GPU", allow_module_level=True)
+from chandra_cuda.engine import Decoder  # noqa: E402
+
+VOCAB, H = 4096, 2560
+LAYERS = ["linear_attention", "full_attention", "linear_attention", "full_attention"]
+
+
+def _lin(g, n, k):
+    return (torch.randn(n, k, device="cuda", generator=g) * k**-0.5).to(torch.bfloat16)
+
+
+def _norm(g, n, base=0.0):
+    return (base + 0.1 * torch.randn(n, device="cuda", generator=g)).to(torch.bfloat16)
+
+
+def _attn(g, p, w):
+    a = p + "self_attn."
+    w[a + "q_proj.weight"] = _lin(g, 8192, H)
+    w[a + "k_proj.weight"] = _lin(g, 1024, H)
+    w[a + "v_proj.weight"] = _lin(g, 1024, H)
+    w[a + "o_proj.weight"] = _lin(g, H, 4096)
+    w[a + "q_norm.weight"] = _norm(g, 256)
+    w[a + "k_norm.weight"] = _norm(g, 256)
+
+
+def _common(g, p, w):
+    w[p + "input_layernorm.weight"] = _norm(g, H)
+    w[p + "post_attention_layernorm.weight"] = _norm(g, H)
+    w[p + "mlp.gate_proj.weight"] = _lin(g, 9216, H)
+    w[p + "mlp.up_proj.weight"] = _lin(g, 9216, H)
+    w[p + "mlp.down_proj.weight"] = _lin(g, H, 9216)
+
+
+@pytest.fixture(scope="module")
+def ckpt(tmp_path_factory):
+    from safetensors.torch import save_file
+
+    g = torch.Generator(device="cuda").manual_seed(0)
+    w = {}
+    P = "model.language_model."
+    w[P + "embed_tokens.weight"] = (torch.randn(VOCAB, H, device="cuda", generator=g)).to(torch.bfloat16)
+    w[P + "norm.weight"] = _norm(g, H)
+    w["lm_head.weight"] = _lin(g, VOCAB, H)
+    for i, t in enumerate(LAYERS):
+        p = f"{P}layers.{i}."
+        _common(g, p, w)
+        if t == "full_attention":
+            _attn(g, p, w)
+        else:
+            a = p + "linear_attn."
+            w[a + "in_proj_qkv.weight"] = _lin(g, 8192, H)
+            w[a + "in_proj_z.weight"] = _lin(g, 4096, H)
+            w[a + "in_proj_b.weight"] = _lin(g, 32, H)
+            w[a + "in_proj_a.weight"] = _lin(g, 32, H)
+            w[a + "out_proj.weight"] = _lin(g, H, 4096)
+            w[a + "conv1d.weight"] = (0.4 * torch.randn(8192, 1, 4, device="cuda", generator=g)).to(torch.bfloat16)
+            w[a + "A_log"] = 0.5 * torch.randn(32, device="cuda", generator=g)
+            w[a + "dt_bias"] = (0.5 * torch.randn(32, device="cuda", generator=g)).to(torch.bfloat16)
+            w[a + "norm.weight"] = _norm(g, 128, base=1.0)
+    _common(g, "mtp.layers.0.", w)
+    _attn(g, "mtp.layers.0.", w)
+    w["mtp.fc.weight"] = _lin(g, H, 2 * H)
+    for n in ("norm", "pre_fc_norm_embedding", "pre_fc_norm_hidden"):
+        w[f"mtp.{n}.weight"] = _norm(g, H)
+    d = tmp_path_factory.mktemp("ckpt")
+    save_file({k: v.cpu().contiguous() for k, v in w.items()}, str(d / "model.safetensors"))
+    json.dump({"text_config": {"layer_types": LAYERS, "rope_parameters": {"rope_theta": 1e7}}},
+              open(d / "config.json", "w"))
+    return str(d)
+
+
+def _reset(dec):
+    for L in dec.layers + [dec.mtp]:
+        for key in ("state", "ring", "hist", "k_cache", "v_cache"):
+            if key in L:
+                L[key].zero_()
+    dec.length = [0] * dec.max_seqs
+    dec.pending = [0] * dec.max_seqs
+
+
+STEPS = 48
+
+
+@pytest.fixture(scope="module")
+def run(ckpt):
+    dec = Decoder(ckpt, max_seqs=3, max_ctx=512, mtp=True, draft_tokens=3)
+    seqs = [0, 1, 2]
+    t0 = torch.tensor([5, 77, 4000], device="cuda")
+    ref = [[] for _ in seqs]
+    tok = t0
+    for _ in range(STEPS):
+        tok = dec.step(tok, seqs)
+        for r, x in zip(ref, tok.tolist()):
+            r.append(x)
+    return dec, seqs, t0, ref
+
+
+def test_oracle_drafts_with_errors(run):
+    """Drafts from the reference with random errors: the accepted text is the reference."""
+    dec, seqs, t0, ref = run
+    _reset(dec)
+    rng = torch.Generator().manual_seed(3)
+    out = [[] for _ in seqs]
+    last = t0.tolist()
+    total_acc, steps = 0, 0
+    while min(len(o) for o in out) < STEPS - 4:
+        drafts = []
+        for n in range(len(seqs)):
+            d = (ref[n][len(out[n]) : len(out[n]) + 3] + [0, 0, 0])[:3]  # past the reference: any drafts
+            d = [x if torch.rand(1, generator=rng).item() > 0.25 else (x + 1) % VOCAB for x in d]
+            drafts.append(d)
+        vin = torch.tensor([[last[n]] + drafts[n] for n in range(len(seqs))], device="cuda")
+        g, _ = dec.verify(vin, seqs)
+        gl = g.tolist()
+        counts = []
+        for n in range(len(seqs)):
+            a = 0
+            while a < 3 and drafts[n][a] == gl[n][a]:
+                a += 1
+            out[n] += drafts[n][:a] + [gl[n][a]]
+            last[n] = gl[n][a]
+            counts.append(a + 1)
+            total_acc += a
+        dec.accept(seqs, counts)
+        steps += 1
+    for n in range(len(seqs)):
+        assert out[n][:STEPS] == ref[n][: len(out[n])], n
+    assert total_acc > steps  # some drafts were accepted, so the replay ran
+
+
+def test_generate_mtp_matches_plain(run):
+    dec, seqs, t0, ref = run
+    _reset(dec)
+    hidden, first = dec._forward(t0, seqs, 1, commit=False)
+    for s in seqs:
+        dec.length[s] += 1
+    out, steps = dec.generate_mtp(seqs, first, hidden, max_new=STEPS)
+    for n in range(len(seqs)):
+        assert out[n] == ref[n][: len(out[n])], n
+        assert len(out[n]) == STEPS
+    assert steps <= STEPS
