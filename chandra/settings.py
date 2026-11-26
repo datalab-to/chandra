@@ -10,6 +10,11 @@ class Settings(BaseSettings):
     IMAGE_DPI: int = 192
     MIN_PDF_IMAGE_DIM: int = 1024
     MIN_IMAGE_DIM: int = 1536
+    # Page images sent to the model: at most this many pixels, sides on this
+    # grid. The ViT's cost grows with the square of the pixel count, and the
+    # processor snaps images to a 32-px grid (16-px patches, 2x2 merge).
+    IMAGE_MAX_PIXELS: int = 3072 * 2048
+    IMAGE_GRID_SIZE: int = 28
     MODEL_CHECKPOINT: str = "datalab-to/chandra-ocr-2"
     TORCH_DEVICE: str | None = None
     MAX_OUTPUT_TOKENS: int = 12384
