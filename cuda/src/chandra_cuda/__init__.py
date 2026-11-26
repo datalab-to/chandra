@@ -285,11 +285,13 @@ def rmsnorm_add(residual: torch.Tensor, w: torch.Tensor, x: torch.Tensor | None 
 
 
 def silu_mul(gate_up: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-    """[M, 2 * 9216] gate | up -> [M, 9216] bf16(silu(gate) * up)."""
-    m = gate_up.shape[0]
+    """[M, 2F] gate | up (contiguous) -> [M, F] bf16(silu(gate) * up); F = 9,216 in the MLP."""
+    m, f2 = gate_up.shape
+    if f2 % 16 or not gate_up.is_contiguous():
+        raise ValueError("gate_up must be contiguous [M, 2F] with F a multiple of 8")
     if out is None:
-        out = torch.empty(m, 9216, dtype=torch.bfloat16, device=gate_up.device)
-    _core.silu_mul(gate_up.data_ptr(), out.data_ptr(), m, _stream(gate_up))
+        out = torch.empty(m, f2 // 2, dtype=torch.bfloat16, device=gate_up.device)
+    _core.silu_mul(gate_up.data_ptr(), out.data_ptr(), m, _stream(gate_up), f2 // 2)
     return out
 
 

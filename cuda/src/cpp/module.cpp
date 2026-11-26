@@ -195,9 +195,9 @@ NB_MODULE(_core, m) {
                                reinterpret_cast<void*>(res_out), reinterpret_cast<void*>(out),
                                reinterpret_cast<const void*>(w), M, reinterpret_cast<cudaStream_t>(stream)));
   });
-  m.def("silu_mul", [](uintptr_t gu, uintptr_t out, int M, uintptr_t stream) {
+  m.def("silu_mul", [](uintptr_t gu, uintptr_t out, int M, uintptr_t stream, int F) {
     check(chandra::silu_mul(reinterpret_cast<const void*>(gu), reinterpret_cast<void*>(out), M,
-                            reinterpret_cast<cudaStream_t>(stream)));
+                            reinterpret_cast<cudaStream_t>(stream), F));
   });
   m.def("qk_norm_rope_kv", [](uintptr_t qkv, int64_t qkv_stride, uintptr_t qw, uintptr_t kw, uintptr_t pos,
                               float theta, uintptr_t q_out, uintptr_t kc, uintptr_t vc, uintptr_t page,

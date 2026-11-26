@@ -76,17 +76,17 @@ __global__ void __launch_bounds__(32) rmsnorm_add_kernel(const bf16* __restrict_
   }
 }
 
-__global__ void silu_mul_kernel(const bf16* __restrict__ gu, bf16* __restrict__ out, int M) {
-  const size_t n8 = static_cast<size_t>(M) * kMlp / 8;
+__global__ void silu_mul_kernel(const bf16* __restrict__ gu, bf16* __restrict__ out, int M, int F) {
+  const size_t n8 = static_cast<size_t>(M) * F / 8;
   for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n8;
        i += static_cast<size_t>(gridDim.x) * blockDim.x) {
-    const size_t m = i / (kMlp / 8), c = (i % (kMlp / 8)) * 8;
+    const size_t m = i / (F / 8), c = (i % (F / 8)) * 8;
     float g[8], u[8], o[8];
-    unpack8(*reinterpret_cast<const uint4*>(gu + m * 2 * kMlp + c), g);
-    unpack8(*reinterpret_cast<const uint4*>(gu + m * 2 * kMlp + kMlp + c), u);
+    unpack8(*reinterpret_cast<const uint4*>(gu + m * 2 * F + c), g);
+    unpack8(*reinterpret_cast<const uint4*>(gu + m * 2 * F + F + c), u);
 #pragma unroll
     for (int j = 0; j < 8; ++j) o[j] = g[j] / (1.f + expf(-g[j])) * u[j];
-    *reinterpret_cast<uint4*>(out + m * kMlp + c) = pack8(o);
+    *reinterpret_cast<uint4*>(out + m * F + c) = pack8(o);
   }
 }
 
@@ -169,9 +169,10 @@ cudaError_t rmsnorm_add(const void* x, const void* residual, void* residual_out,
   return cudaGetLastError();
 }
 
-cudaError_t silu_mul(const void* gate_up, void* out, int M, cudaStream_t stream) {
-  const int blocks = std::min(1024, (M * kMlp / 8 + 255) / 256);
-  silu_mul_kernel<<<blocks, 256, 0, stream>>>(static_cast<const bf16*>(gate_up), static_cast<bf16*>(out), M);
+cudaError_t silu_mul(const void* gate_up, void* out, int M, cudaStream_t stream, int F) {
+  if (F % 8) return cudaErrorInvalidValue;
+  const int blocks = std::min(1024, (M * F / 8 + 255) / 256);
+  silu_mul_kernel<<<blocks, 256, 0, stream>>>(static_cast<const bf16*>(gate_up), static_cast<bf16*>(out), M, F);
   return cudaGetLastError();
 }
 

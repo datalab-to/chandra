@@ -15,8 +15,8 @@ constexpr int kMlp = 9216;
 cudaError_t rmsnorm_add(const void* x, const void* residual, void* residual_out, void* out, const void* w, int M,
                         cudaStream_t stream);
 
-// out[m][j] = bf16(silu(gu[m][j]) * gu[m][kMlp + j]) for gate_up rows [M][2 * kMlp].
-cudaError_t silu_mul(const void* gate_up, void* out, int M, cudaStream_t stream);
+// out[m][j] = bf16(silu(gu[m][j]) * gu[m][F + j]) for gate_up rows [M][2 * F] (F % 8 == 0).
+cudaError_t silu_mul(const void* gate_up, void* out, int M, cudaStream_t stream, int F = kMlp);
 
 // Full-attention layer, after the merged qkv GEMM: row m of qkv is
 // [16 heads x (q 256 | gate 256)] [k 4 x 256] [v 4 x 256] (10,240 BF16).
