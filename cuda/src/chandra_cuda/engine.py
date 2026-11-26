@@ -31,6 +31,15 @@ PAGE = 64
 ROWS = 64  # the decode GEMMs take up to 64 rows per call
 
 
+def _quant_kv(x: torch.Tensor):
+    """[heads, L, 256] -> (INT8 values, FP32 scales [heads, L]): the INT8 KV write's rounding."""
+    xf = x.float()
+    mx = xf.abs().amax(dim=-1)
+    scale = torch.where(mx > 0, mx / 127.0, torch.ones_like(mx))
+    q = torch.round(xf * (1.0 / scale)[..., None]).clamp(-127, 127).to(torch.int8)
+    return q, scale
+
+
 def _rows(fn, x: torch.Tensor) -> torch.Tensor:
     """fn over row blocks of at most 64 (the decode kernels are batch-invariant, so this is exact)."""
     if x.shape[0] <= ROWS:
@@ -41,10 +50,13 @@ def _rows(fn, x: torch.Tensor) -> torch.Tensor:
 class Decoder:
     def __init__(self, ckpt_dir: str, device: str = "cuda", max_seqs: int = 8, max_ctx: int = 18432,
                  state_dtype: torch.dtype = torch.float32, mtp: bool = False, draft_tokens: int = 3,
-                 weights: str = "bf16", lm_head: str = "bf16"):
+                 weights: str = "bf16", lm_head: str = "bf16", kv: str = "bf16"):
         """weights: the format of the decoder layers' linear weights (bf16; fp8, mxfp4, int4 are
         approximate, class G). lm_head: "bf16", or "exact" (INT8 pass + BF16 re-check, the same picks).
-        The MTP layer, if any, stays BF16."""
+        The MTP layer, if any, stays BF16. kv: "bf16", or "int8" (symmetric per token and head, class G)."""
+        if kv not in ("bf16", "int8"):
+            raise ValueError(kv)
+        self.kv = kv
         from safetensors import safe_open
 
         cfg = json.load(open(os.path.join(ckpt_dir, "config.json")))["text_config"]
@@ -135,8 +147,12 @@ class Decoder:
                     L["hist"] = torch.zeros(max_seqs + 1, self.t_max, 32, _core.gdn_hist_floats,
                                             dtype=torch.float32, device=dev)
         for L in attn_layers:
-            L["k_cache"] = torch.zeros(pages, 4, PAGE, 256, dtype=torch.bfloat16, device=dev)
+            dt = torch.int8 if kv == "int8" else torch.bfloat16
+            L["k_cache"] = torch.zeros(pages, 4, PAGE, 256, dtype=dt, device=dev)
             L["v_cache"] = torch.zeros_like(L["k_cache"])
+            if kv == "int8":
+                L["k_scale"] = torch.ones(pages, 4, PAGE, dtype=torch.float32, device=dev)
+                L["v_scale"] = torch.ones_like(L["k_scale"])
         self.length = [0] * max_seqs  # tokens in the cache per sequence
         self.rope_delta = [0] * max_seqs
         self.pending = [0] * max_seqs  # DeltaNet updates to replay at the next step (commit mode)
@@ -158,11 +174,20 @@ class Decoder:
                 lay = cache.layers[i]
                 k = lay.keys[batch_index]  # [4, L, 256]
                 v = lay.values[batch_index]
+                if self.kv == "int8":  # as the INT8 KV write: amax / 127 per (head, token), round to nearest
+                    qk, sk = _quant_kv(k[:, :length])
+                    qv, sv = _quant_kv(v[:, :length])
                 for p in range(math.ceil(length / PAGE)):
                     page = int(self.block_table[seq, p])
                     n = min(PAGE, length - p * PAGE)
-                    L["k_cache"][page, :, :n] = k[:, p * PAGE : p * PAGE + n]
-                    L["v_cache"][page, :, :n] = v[:, p * PAGE : p * PAGE + n]
+                    if self.kv == "int8":
+                        L["k_cache"][page, :, :n] = qk[:, p * PAGE : p * PAGE + n]
+                        L["v_cache"][page, :, :n] = qv[:, p * PAGE : p * PAGE + n]
+                        L["k_scale"][page, :, :n] = sk[:, p * PAGE : p * PAGE + n]
+                        L["v_scale"][page, :, :n] = sv[:, p * PAGE : p * PAGE + n]
+                    else:
+                        L["k_cache"][page, :, :n] = k[:, p * PAGE : p * PAGE + n]
+                        L["v_cache"][page, :, :n] = v[:, p * PAGE : p * PAGE + n]
         self.length[seq] = length
         self.rope_delta[seq] = int(rope_delta)
         self.pending[seq] = 0
@@ -185,9 +210,10 @@ class Decoder:
         m = xn.shape[0]
         qkv = _rows(L["qkv"], xn)
         q = qk_norm_rope_kv(qkv, L["q_norm"], L["k_norm"], pos3, L["k_cache"], L["v_cache"], page, in_page,
-                            rope_theta=self.rope_theta)
+                            rope_theta=self.rope_theta, k_scale=L.get("k_scale"), v_scale=L.get("v_scale"))
         gate = qkv[:, :8192].view(m, 16, 512)[..., 256:]
-        att = attn_decode(q, gate, L["k_cache"], L["v_cache"], bt, ctx, n_q=T, max_ctx=max_ctx)
+        att = attn_decode(q, gate, L["k_cache"], L["v_cache"], bt, ctx, n_q=T, max_ctx=max_ctx,
+                          k_scale=L.get("k_scale"), v_scale=L.get("v_scale"))
         return _rows(L["o"], att.reshape(m, 4096))
 
     @torch.no_grad()
@@ -287,7 +313,8 @@ class Decoder:
             page = self.block_table[seq, pos // PAGE].contiguous()
             in_page = (pos % PAGE).to(torch.int32)
             qk_norm_rope_kv(qkv, M["q_norm"], M["k_norm"], pos3[i:j].to(torch.int32), M["k_cache"], M["v_cache"],
-                            page, in_page, rope_theta=self.rope_theta)
+                            page, in_page, rope_theta=self.rope_theta, k_scale=M.get("k_scale"),
+                            v_scale=M.get("v_scale"))
 
     @torch.no_grad()
     def mtp_forward(self, tokens: torch.Tensor, hidden: torch.Tensor, seqs: list[int], start: list[int], T: int):

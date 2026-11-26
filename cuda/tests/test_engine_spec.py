@@ -169,3 +169,17 @@ def test_graph_step_matches_eager(run):
     for n in range(len(seqs)):
         assert out[n] == ref[n][:16], n
 
+
+def test_int8_kv_decoder_runs_and_mostly_agrees(ckpt, run):
+    """INT8 KV is approximate (class G): on random weights the greedy tokens stay close to BF16 KV's."""
+    _, seqs, t0, ref = run
+    dec8 = Decoder(ckpt, max_seqs=3, max_ctx=512, kv="int8")
+    tok = t0
+    out = [[] for _ in seqs]
+    for _ in range(24):
+        tok = dec8.step(tok, seqs)
+        for o, x in zip(out, tok.tolist()):
+            o.append(x)
+    lead = [next((j for j in range(24) if out[n][j] != ref[n][j]), 24) for n in range(len(seqs))]
+    assert max(lead) >= 4, lead
+
