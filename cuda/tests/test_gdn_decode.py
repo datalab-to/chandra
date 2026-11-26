@@ -166,3 +166,50 @@ def test_replay_gives_the_state_after_the_accepted_tokens(accepted):
                                       _i32(p0 + accepted))
     assert torch.equal(state[2], ref_state[1])
     assert torch.equal(out, ref_out)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16])
+def test_commit_mode_rounds_equal_plain_decode(state_dtype):
+    """Verify rounds in commit mode (one slot, history in place, random acceptance) give the
+    outputs of plain one-token steps, and the slot holds the committed state: bit for bit with an
+    FP32 state. An FP16 state is rounded once per step here and once per token in plain steps."""
+    lay, g = _layer(40)
+    batch, T, rounds = 3, 4, 7
+    state = (torch.randn(batch + 1, HV, D, D, device="cuda", generator=g) * 0.1).to(state_dtype)
+    ring = torch.randn(batch + 1, 8, C, device="cuda", generator=g).to(torch.bfloat16)
+    ref_state, ref_ring = state.clone(), ring.clone()
+    hist = torch.zeros(batch + 1, T, HV, chandra_cuda._core.gdn_hist_floats, device="cuda")
+    slot = torch.arange(1, batch + 1, dtype=torch.int32, device="cuda")
+    pos = [5, 9, 2]
+    n_rep = [0] * batch
+    acc_g = torch.Generator().manual_seed(7)
+
+    def same(got, ref, where):
+        if state_dtype == torch.float32:
+            assert torch.equal(got, ref), where
+        else:
+            err = (got.float() - ref.float()).abs().max().item()
+            assert err <= 1e-2 * ref.float().abs().max().item() + 1e-3, (where, err)
+    for r in range(rounds):
+        qkv, z, ba = _tokens(g, batch * T)
+        out = chandra_cuda.gdn_decode(qkv, z, ba[:, :HV], ba[:, HV:], lay["A_log"], lay["dt_bias"],
+                                      lay["conv_w"], lay["norm_w"], state, slot, slot, ring, slot,
+                                      _i32(*pos), T=T, n_replay=_i32(*n_rep), hist_in=hist, hist_out=hist,
+                                      commit=True)
+        # The slot now holds the committed state: the reference's, before this round's tokens.
+        same(state[1:], ref_state[1:], (r,))
+        accepted = [int(torch.randint(1, T + 1, (1,), generator=acc_g)) for _ in range(batch)]
+        for n in range(batch):
+            sl = _i32(n + 1)
+            for t in range(T):  # every token's output, from plain steps on the reference
+                row = n * T + t
+                o = chandra_cuda.gdn_decode(qkv[row : row + 1], z[row : row + 1], ba[row : row + 1, :HV],
+                                            ba[row : row + 1, HV:], lay["A_log"], lay["dt_bias"], lay["conv_w"],
+                                            lay["norm_w"], ref_state, sl, sl, ref_ring, sl, _i32(pos[n] + t))
+                same(out[row : row + 1], o, (r, n, t))
+                if t + 1 == accepted[n]:  # keep the state after the accepted tokens
+                    keep_s, keep_r = ref_state[n + 1].clone(), ref_ring[n + 1].clone()
+            ref_state[n + 1], ref_ring[n + 1] = keep_s, keep_r
+            pos[n] += accepted[n]
+        n_rep = accepted
+

@@ -34,6 +34,7 @@ def gdn_decode(
     n_replay: torch.Tensor | None = None,
     hist_in: torch.Tensor | None = None,
     hist_out: torch.Tensor | None = None,
+    commit: bool = False,
 ) -> torch.Tensor:
     """One Gated DeltaNet step of one layer, for B sequences of T tokens each (T = 1: decode;
     T = 2..4: verification of draft tokens; row n * T + t is token t of sequence n).
@@ -49,6 +50,10 @@ def gdn_decode(
     FP32, indexed by conv_slot) receives each token's k, v' and decay. If the next step starts from
     the same input state with n_replay[n] = j and hist_in = this hist_out, it first replays the j
     accepted updates, which gives exactly the state after token j.
+
+    commit=True (speculative decoding with one state slot per sequence): slot_out gets the state
+    after the replay, the committed one, and not the state after this step's tokens; hist_out may
+    be hist_in. Each step then replays the tokens accepted from the previous one.
     """
     if qkv.shape[0] % T:
         raise ValueError("qkv rows must be B * T")
@@ -74,7 +79,7 @@ def gdn_decode(
         0 if n_replay is None else n_replay.data_ptr(),
         0 if hist_in is None else hist_in.data_ptr(),
         0 if hist_out is None else hist_out.data_ptr(),
-        tmax, torch.cuda.current_stream(qkv.device).cuda_stream,
+        tmax, bool(commit), torch.cuda.current_stream(qkv.device).cuda_stream,
     )
     return out
 

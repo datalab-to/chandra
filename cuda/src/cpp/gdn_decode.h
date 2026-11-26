@@ -48,8 +48,13 @@ struct GdnDecodeArgs {
   // slot_in holds the state before them. hist_out gets this step's history. Either may be null.
   const int* n_replay;  // [B]
   const float* hist_in;   // [slots][hist_tmax][32][kGdnHistFloats]
-  float* hist_out;        // same layout, a different buffer
+  float* hist_out;        // same layout; may be hist_in itself (replay reads end before writes)
   int hist_tmax;
+  // Commit mode (speculative decoding): slot_out receives the state after the replay, i.e. the
+  // committed state after the previous step's accepted tokens, and the state after this step's
+  // tokens is not stored (the next step replays the ones that get accepted). With n_replay = 0
+  // nothing is stored. One state read and at most one write per step, whatever is accepted.
+  bool commit;
 };
 
 cudaError_t gdn_decode(const GdnDecodeArgs& a, cudaStream_t stream);

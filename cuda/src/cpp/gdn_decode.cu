@@ -148,6 +148,9 @@ __global__ void __launch_bounds__(256, 2) gdn_step_kernel(const GdnDecodeArgs a)
         const float vp = ht[kGdnDim + rbase + i * RPI];
 #pragma unroll
         for (int e = 0; e < E; ++e) s[i][e] = fmaf(dec, s[i][e], vp * kk[e]);
+        if (a.commit && t == nrep - 1)  // this row is committed: store it while the rest replay
+          __stcs(reinterpret_cast<uint4*>(s_out + static_cast<size_t>(rbase + i * RPI) * kGdnDim + kl * E),
+                 SV<ST>::pack(s[i]));
       }
     }
   }
@@ -214,7 +217,7 @@ __global__ void __launch_bounds__(256, 2) gdn_step_kernel(const GdnDecodeArgs a)
       for (int e = 0; e < E; ++e) s[i][e] = fmaf(decay, s[i][e], vp * k[e]);
       // After the last token each row is final: store it now, so the writes overlap the
       // remaining rows' arithmetic instead of leaving in one burst at the end.
-      if (t == T - 1)
+      if (t == T - 1 && !a.commit)
         __stcs(reinterpret_cast<uint4*>(s_out + static_cast<size_t>(r) * kGdnDim + kl * E), SV<ST>::pack(s[i]));
       if (kl == 0) {
         o_s[t][r] = round_bf16(o);  // vLLM rounds o to BF16 before the norm

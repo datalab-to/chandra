@@ -104,7 +104,7 @@ NB_MODULE(_core, m) {
          int64_t ab_stride, uintptr_t A_log, uintptr_t dt_bias, uintptr_t conv_w, uintptr_t norm_w,
          uintptr_t state, bool state_fp16, uintptr_t slot_in, uintptr_t slot_out, uintptr_t conv_ring, int ring,
          uintptr_t conv_slot, uintptr_t pos, uintptr_t out, int64_t out_stride, int B, int T, uintptr_t n_replay,
-         uintptr_t hist_in, uintptr_t hist_out, int hist_tmax, uintptr_t stream) {
+         uintptr_t hist_in, uintptr_t hist_out, int hist_tmax, bool commit, uintptr_t stream) {
         chandra::GdnDecodeArgs g{};
         g.qkv = reinterpret_cast<const void*>(qkv);
         g.qkv_stride = qkv_stride;
@@ -133,6 +133,7 @@ NB_MODULE(_core, m) {
         g.hist_in = reinterpret_cast<const float*>(hist_in);
         g.hist_out = reinterpret_cast<float*>(hist_out);
         g.hist_tmax = hist_tmax;
+        g.commit = commit;
         check(chandra::gdn_decode(g, reinterpret_cast<cudaStream_t>(stream)));
       });
 
