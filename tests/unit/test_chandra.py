@@ -326,6 +326,13 @@ def test_vllm_gpu_presets_and_help():
     assert tokens_t4 >= 1024
     assert seqs_t4 >= 8
 
+    # Mid-size GPUs are sized from their KV cache; the 80 GB baseline is unchanged.
+    assert get_gpu_settings("h100") == (8192, 64)
+    assert get_gpu_settings("a6000") == (8192, 64)
+    assert get_gpu_settings("l40s") == (8192, 64)
+    assert get_gpu_settings("a100-40") == (8192, 56)
+    assert get_gpu_settings("4090") == (2048, 16)
+
     with patch.object(sys, "argv", ["chandra_vllm", "--help"]):
         with pytest.raises(SystemExit) as exc_info:
             vllm_main()

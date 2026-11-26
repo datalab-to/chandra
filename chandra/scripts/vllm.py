@@ -13,6 +13,14 @@ BASELINE_VRAM_GB = 80
 BASELINE_MAX_BATCHED_TOKENS = 8192
 BASELINE_MAX_NUM_SEQS = 64
 
+GPU_MEMORY_UTILIZATION = 0.85
+# Weights (10.6 GB in BF16) plus activations and CUDA graphs.
+RESERVED_GB = 13.5
+# Cache per page in flight: full-attention KV (8 layers x 32 KB per token for
+# ~8.5K tokens of image, prompt and output) plus the Gated DeltaNet and conv
+# state (~51 MB).
+PAGE_CACHE_GB = 0.33
+
 GPU_VRAM_GB = {
     "b200": 180,
     "h200": 141,
@@ -22,6 +30,7 @@ GPU_VRAM_GB = {
     "a100": 40,
     "a100-40": 40,
     "l40s": 48,
+    "a6000": 48,
     "rtx5090": 32,
     "5090": 32,
     "a10": 24,
@@ -44,6 +53,17 @@ def get_gpu_settings(gpu: str):
     raw_tokens = BASELINE_MAX_BATCHED_TOKENS * ratio
     max_batched_tokens = max(1024, 2 ** math.floor(math.log2(raw_tokens)))
     max_num_seqs = max(8, (int(BASELINE_MAX_NUM_SEQS * ratio) // 8) * 8)
+
+    # Scaling linearly from the baseline undersizes mid-size GPUs: on 48 GB the
+    # KV cache holds ~80 pages, but the linear rule allows 32. Allow as many
+    # pages as the cache holds, up to the baseline's count; never fewer than
+    # the linear rule gives.
+    cache_pages = int((vram * GPU_MEMORY_UTILIZATION - RESERVED_GB) / PAGE_CACHE_GB)
+    cache_seqs = min(BASELINE_MAX_NUM_SEQS, (cache_pages // 8) * 8)
+    max_num_seqs = max(max_num_seqs, cache_seqs)
+    # A ViT image is ~6K tokens; chunks smaller than the baseline's only add steps.
+    if vram >= 40:
+        max_batched_tokens = max(max_batched_tokens, BASELINE_MAX_BATCHED_TOKENS)
 
     return max_batched_tokens, max_num_seqs
 
@@ -94,9 +114,33 @@ def main():
         default=False,
         help="Enable MTP speculative decoding (disabled by default, unstable with vLLM)",
     )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        help="Override the pages in flight per GPU (default: sized from --gpu)",
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=None,
+        help="Override the tokens per scheduler step (default: sized from --gpu)",
+    )
+    parser.add_argument(
+        "--data-parallel-size",
+        type=int,
+        default=None,
+        help="Model replicas, one per GPU (default: the number of GPUs in VLLM_GPUS)",
+    )
     args = parser.parse_args()
 
     max_batched_tokens, max_num_seqs = get_gpu_settings(args.gpu)
+    if args.max_num_seqs is not None:
+        max_num_seqs = args.max_num_seqs
+    if args.max_num_batched_tokens is not None:
+        max_batched_tokens = args.max_num_batched_tokens
+    gpu_ids = [g.strip() for g in str(settings.VLLM_GPUS).split(",") if g.strip()]
+    data_parallel_size = args.data_parallel_size or max(1, len(gpu_ids))
     runtime = detect_container_runtime(args.runtime)
     dtype = "float16" if args.gpu == "t4" else "bfloat16"
 
@@ -106,10 +150,8 @@ def main():
     cmd.extend([runtime, "run"])
 
     if runtime == "podman":
-        for gpu_id in str(settings.VLLM_GPUS).split(","):
-            gid = gpu_id.strip()
-            if gid:
-                cmd.extend(["--device", f"nvidia.com/gpu={gid}"])
+        for gid in gpu_ids:
+            cmd.extend(["--device", f"nvidia.com/gpu={gid}"])
     else:
         cmd.extend(["--runtime", "nvidia", "--gpus", f"device={settings.VLLM_GPUS}"])
 
@@ -133,7 +175,7 @@ def main():
             "--max_num_batched_tokens",
             str(max_batched_tokens),
             "--gpu-memory-utilization",
-            ".85",
+            str(GPU_MEMORY_UTILIZATION),
             "--enable-prefix-caching",
             "--mm-processor-kwargs",
             json.dumps({"min_pixels": 3136, "max_pixels": 6291456}),
@@ -142,6 +184,11 @@ def main():
         ]
     )
 
+    # One replica per GPU: pages are independent, so two GPUs give about
+    # twice the pages per second without any cross-GPU traffic.
+    if data_parallel_size > 1:
+        cmd.extend(["--data-parallel-size", str(data_parallel_size)])
+
     if args.mtp:
         spec_config = json.dumps({"method": "mtp", "num_speculative_tokens": 1})
         cmd.extend(["--speculative-config", spec_config])
@@ -149,6 +196,7 @@ def main():
     vram = GPU_VRAM_GB[args.gpu]
     print(f"GPU: {args.gpu} ({vram}GB VRAM, dtype={dtype})")
     print(f"max-num-batched-tokens: {max_batched_tokens}, max-num-seqs: {max_num_seqs}")
+    print(f"GPUs: {','.join(gpu_ids)} (data-parallel-size {data_parallel_size})")
     print(f"Listening on: http://{args.host}:{args.port}/v1")
     print(f"MTP: {'enabled' if args.mtp else 'disabled'}")
     print(f"Command: {' '.join(cmd)}")
