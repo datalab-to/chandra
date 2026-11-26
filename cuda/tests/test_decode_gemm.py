@@ -47,3 +47,32 @@ def test_repeated_calls_reset_counters():
     for _ in range(5):
         assert torch.equal(lin(x), first)
     assert int(lin.counters.abs().sum()) == 0
+
+
+@pytest.mark.parametrize("n,k", [(248320, 2560), (4096, 2560)])
+def test_lm_head_argmax_matches_its_logits(n, k):
+    torch.manual_seed(5)
+    w = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
+    head = chandra_cuda.LMHead(w)
+    lin = chandra_cuda.DecodeLinear(w)
+    agree = total = 0
+    for m in ROWS:
+        x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
+        ids = head(x)
+        # Same accumulation as DecodeLinear, so the same BF16 logits: an exact match.
+        assert torch.equal(ids, lin(x).float().argmax(dim=-1)), m
+        agree += int((ids == torch.nn.functional.linear(x, w).float().argmax(dim=-1)).sum())
+        total += m
+    assert agree >= 0.97 * total  # cuBLAS rounds some logits differently (near-ties)
+
+
+def test_lm_head_ties_go_to_the_lowest_index():
+    torch.manual_seed(6)
+    w = (torch.randn(1024, 2560, device="cuda") * 0.02).to(torch.bfloat16)
+    x = torch.randn(8, 2560, device="cuda").to(torch.bfloat16)
+    best = torch.nn.functional.linear(x, w).float().argmax(dim=-1)
+    w2 = w.clone()
+    w2[1000] = w[int(best[0])]  # a later copy of token 0's best row
+    w2[3] = w[int(best[0])]  # and an earlier one
+    ids = chandra_cuda.LMHead(w2)(x)
+    assert int(ids[0]) == min(3, int(best[0]))

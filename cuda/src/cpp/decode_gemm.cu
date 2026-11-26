@@ -66,18 +66,34 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], const uint4& a, uint32_t
       : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1));
 }
 
-// NP: pairs of n8 token tiles (M <= 16 * NP). RW x KW = kWarps.
-template <int NP, int RW, int KW>
+// Greedy-pick key of a logit: the order-preserving bits of its BF16 value, then the
+// inverted row, so a max picks the largest value and, among equal ones, the lowest row
+// (the first index, as torch.argmax does).
+__device__ __forceinline__ unsigned long long argmax_key(float v, int row) {
+  const unsigned u = __float_as_uint(__bfloat162float(__float2bfloat16_rn(v)));
+  const unsigned ord = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+  return (static_cast<unsigned long long>(ord) << 32) | (0xffffffffu - static_cast<unsigned>(row));
+}
+
+// NP: pairs of n8 token tiles (M <= 16 * NP). RW x KW = kWarps. ARGMAX: instead of
+// writing y, reduce each token's greedy pick into keys[token] (an LM head that never
+// writes its logits); needs splits == 1.
+template <int NP, int RW, int KW, bool ARGMAX = false>
 __global__ void __launch_bounds__(kThreads, 2)
     decode_gemm_kernel(const __nv_bfloat16* __restrict__ x, const uint4* __restrict__ wp,
                        __nv_bfloat16* __restrict__ y, float* __restrict__ partial,
-                       unsigned* __restrict__ counters, int M, int N, int K, int splits) {
+                       unsigned* __restrict__ counters, int M, int N, int K, int splits,
+                       unsigned long long* __restrict__ keys) {
   static_assert(RW * KW == kWarps, "8 warps per CTA");
   constexpr int MP = NP * 16;
   constexpr int kBufBytes = MP * kRowBytes;
   constexpr int kAcc = 2 * NP * 4;  // accumulator floats per lane
   extern __shared__ __align__(16) unsigned char smem[];
   __shared__ int s_last;
+  __shared__ unsigned long long s_best[64];
+  if constexpr (ARGMAX) {
+    if (threadIdx.x < 64) s_best[threadIdx.x] = 0ull;  // the main loop's barriers order this
+  }
 
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int rw = warp / KW, kq = warp % KW;
@@ -178,6 +194,30 @@ __global__ void __launch_bounds__(kThreads, 2)
   // Accumulator layout: c0, c1 = row gid, tokens 2*tig, 2*tig+1; c2, c3 = row gid + 8.
   const int gid = lane >> 2, tig = lane & 3;
   const int row = g * 16 + gid;
+  if constexpr (ARGMAX) {
+    static_assert(KW == 1, "the argmax epilogue needs every warp");
+#pragma unroll
+    for (int t = 0; t < 2 * NP; ++t) {
+#pragma unroll
+      for (int c = 0; c < 2; ++c) {
+        const int tok = t * 8 + tig * 2 + c;
+        unsigned long long kk = argmax_key(acc[t][c], row);
+        const unsigned long long k8 = argmax_key(acc[t][c + 2], row + 8);
+        kk = kk > k8 ? kk : k8;
+        // Max over the 8 row lanes (gid) that hold this token.
+#pragma unroll
+        for (int off = 4; off < 32; off <<= 1) {
+          const unsigned long long o = __shfl_xor_sync(0xffffffffu, kk, off);
+          kk = kk > o ? kk : o;
+        }
+        if (gid == 0 && tok < M) atomicMax(&s_best[tok], kk);
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x < M) atomicMax(keys + threadIdx.x, s_best[threadIdx.x]);
+    return;
+  }
+
   if (splits == 1) {
 #pragma unroll
     for (int t = 0; t < 2 * NP; ++t) {
@@ -225,14 +265,14 @@ __global__ void __launch_bounds__(kThreads, 2)
   if (tid == 0) counters[tile] = 0;
 }
 
-template <int NP, int RW, int KW>
+template <int NP, int RW, int KW, bool ARGMAX = false>
 cudaError_t launch(const void* x, const void* wp, void* y, float* ws, unsigned* counters, int M, int N,
-                   int K, int splits, cudaStream_t stream) {
+                   int K, int splits, cudaStream_t stream, unsigned long long* keys = nullptr) {
   constexpr int smem = 2 * NP * 16 * kRowBytes;
   const dim3 grid(N / (16 * RW), splits);
-  decode_gemm_kernel<NP, RW, KW><<<grid, kThreads, smem, stream>>>(
+  decode_gemm_kernel<NP, RW, KW, ARGMAX><<<grid, kThreads, smem, stream>>>(
       static_cast<const __nv_bfloat16*>(x), static_cast<const uint4*>(wp), static_cast<__nv_bfloat16*>(y),
-      ws, counters, M, N, K, splits);
+      ws, counters, M, N, K, splits, keys);
   return cudaGetLastError();
 }
 
@@ -292,6 +332,20 @@ cudaError_t decode_gemm(const void* x, const void* wp, void* y, float* workspace
     case 2: return launch_rw<2>(p.row_groups, x, wp, y, workspace, counters, M, N, K, p.splits, stream);
     case 3: return launch_rw<3>(p.row_groups, x, wp, y, workspace, counters, M, N, K, p.splits, stream);
     default: return launch_rw<4>(p.row_groups, x, wp, y, workspace, counters, M, N, K, p.splits, stream);
+  }
+}
+
+cudaError_t decode_gemm_argmax(const void* x, const void* wp, unsigned long long* keys, int M, int N, int K,
+                               int sms, cudaStream_t stream) {
+  // One CTA per 128-row tile and no K split (a max cannot combine partial sums). A
+  // vocabulary-sized N gives thousands of tiles, so the GPU is full anyway.
+  (void)sms;
+  if (M < 1 || M > 64 || N % 128 != 0 || K % kKC != 0) return cudaErrorInvalidValue;
+  switch ((M + 15) / 16) {
+    case 1: return launch<1, 8, 1, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys);
+    case 2: return launch<2, 8, 1, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys);
+    case 3: return launch<3, 8, 1, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys);
+    default: return launch<4, 8, 1, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys);
   }
 }
 

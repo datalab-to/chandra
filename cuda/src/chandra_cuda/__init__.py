@@ -10,7 +10,7 @@ import torch
 
 from . import _core
 
-__all__ = ["pack_weight", "DecodeLinear", "attn_decode", "gdn_decode"]
+__all__ = ["pack_weight", "DecodeLinear", "LMHead", "attn_decode", "gdn_decode"]
 
 
 def gdn_decode(
@@ -204,3 +204,29 @@ class DecodeLinear:
             torch.cuda.current_stream(self.device).cuda_stream,
         )
         return out
+
+
+class LMHead:
+    """Greedy next tokens for 1 to 64 rows: argmax_n of bf16(x @ weight.T)[m, n], computed
+    while the weight streams, without writing the [M, vocab] logits. Ties go to the lowest
+    index, as torch.argmax. weight: [vocab, K] BF16 with vocab % 128 == 0."""
+
+    def __init__(self, weight: torch.Tensor):
+        self.n, self.k = weight.shape
+        if self.n % 128 or self.k % 128:
+            raise ValueError("vocabulary and K must be multiples of 128")
+        self.device = weight.device
+        self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self.packed = pack_weight(weight)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        m = x.shape[0]
+        if x.dtype != torch.bfloat16 or x.shape[1] != self.k or not 1 <= m <= 64:
+            raise ValueError(f"expected a [1..64, {self.k}] bfloat16 input")
+        x = x.contiguous()
+        keys = torch.zeros(m, dtype=torch.int64, device=self.device)
+        _core.decode_gemm_argmax(
+            x.data_ptr(), self.packed.data_ptr(), keys.data_ptr(), m, self.n, self.k, self.sms,
+            torch.cuda.current_stream(self.device).cuda_stream,
+        )
+        return 0xFFFFFFFF - (keys & 0xFFFFFFFF)

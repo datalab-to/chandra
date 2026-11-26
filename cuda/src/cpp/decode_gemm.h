@@ -27,4 +27,10 @@ cudaError_t decode_gemm(const void* x, const void* wp, void* y, float* workspace
                         unsigned* counters, int M, int N, int K, int sms,
                         cudaStream_t stream);
 
+// LM head with the greedy pick fused: for each token m, keys[m] (zeroed before the call)
+// becomes the max over rows n of key(bf16(y[m][n]), n); the picked row is
+// 0xffffffff - (keys[m] & 0xffffffff). Ties go to the lowest row. y is never written.
+cudaError_t decode_gemm_argmax(const void* x, const void* wp, unsigned long long* keys, int M, int N, int K,
+                               int sms, cudaStream_t stream);
+
 }  // namespace chandra
