@@ -10,7 +10,8 @@ import torch
 
 from . import _core
 
-__all__ = ["pack_weight", "DecodeLinear", "LMHead", "attn_decode", "gdn_decode"]
+__all__ = ["pack_weight", "DecodeLinear", "LMHead", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul",
+           "qk_norm_rope_kv"]
 
 
 def gdn_decode(
@@ -230,3 +231,48 @@ class LMHead:
             torch.cuda.current_stream(self.device).cuda_stream,
         )
         return 0xFFFFFFFF - (keys & 0xFFFFFFFF)
+
+
+def _stream(t: torch.Tensor) -> int:
+    return torch.cuda.current_stream(t.device).cuda_stream
+
+
+def rmsnorm_add(residual: torch.Tensor, w: torch.Tensor, x: torch.Tensor | None = None,
+                residual_out: torch.Tensor | None = None, out: torch.Tensor | None = None):
+    """Qwen3.5's decoder-layer norm on [M, 2560] BF16 rows: r = bf16(x + residual) (r = residual
+    when x is None), out = bf16(rmsnorm(r) * (1 + w)). Returns (out, r)."""
+    m = residual.shape[0]
+    if out is None:
+        out = torch.empty_like(residual)
+    if x is not None and residual_out is None:
+        residual_out = torch.empty_like(residual)
+    _core.rmsnorm_add(0 if x is None else x.data_ptr(), residual.data_ptr(),
+                      0 if residual_out is None else residual_out.data_ptr(), out.data_ptr(), w.data_ptr(), m,
+                      _stream(residual))
+    return out, (residual if x is None else residual_out)
+
+
+def silu_mul(gate_up: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """[M, 2 * 9216] gate | up -> [M, 9216] bf16(silu(gate) * up)."""
+    m = gate_up.shape[0]
+    if out is None:
+        out = torch.empty(m, 9216, dtype=torch.bfloat16, device=gate_up.device)
+    _core.silu_mul(gate_up.data_ptr(), out.data_ptr(), m, _stream(gate_up))
+    return out
+
+
+def qk_norm_rope_kv(qkv: torch.Tensor, q_norm_w: torch.Tensor, k_norm_w: torch.Tensor, pos: torch.Tensor,
+                    k_cache: torch.Tensor, v_cache: torch.Tensor, page: torch.Tensor, slot: torch.Tensor,
+                    rope_theta: float = 1e7, q_out: torch.Tensor | None = None) -> torch.Tensor:
+    """After the merged qkv GEMM of a full-attention layer (rows [16 x (q | gate)] [k] [v], 10,240 BF16):
+    q -> RMSNorm(1 + w) + partial mRoPE -> q_out [M, 16, 256]; k likewise and v as is into the paged
+    cache [pages, 4, 64, 256] at (page[m], slot[m]). pos: [M, 3] int32 (t, h, w) positions."""
+    m = qkv.shape[0]
+    if qkv.stride(-1) != 1:
+        raise ValueError("qkv rows must be contiguous")
+    if q_out is None:
+        q_out = torch.empty(m, 16, 256, dtype=torch.bfloat16, device=qkv.device)
+    _core.qk_norm_rope_kv(qkv.data_ptr(), qkv.stride(0), q_norm_w.data_ptr(), k_norm_w.data_ptr(),
+                          pos.contiguous().data_ptr(), float(rope_theta), q_out.data_ptr(), k_cache.data_ptr(),
+                          v_cache.data_ptr(), page.data_ptr(), slot.data_ptr(), m, _stream(qkv))
+    return q_out

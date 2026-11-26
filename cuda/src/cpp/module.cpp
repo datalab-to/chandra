@@ -6,6 +6,7 @@
 #include "attn_decode.h"
 #include "decode_gemm.h"
 #include "gdn_decode.h"
+#include "small_ops.h"
 
 namespace nb = nanobind;
 
@@ -124,4 +125,33 @@ NB_MODULE(_core, m) {
         g.hist_tmax = hist_tmax;
         check(chandra::gdn_decode(g, reinterpret_cast<cudaStream_t>(stream)));
       });
+
+  m.def("rmsnorm_add", [](uintptr_t x, uintptr_t res, uintptr_t res_out, uintptr_t out, uintptr_t w, int M,
+                          uintptr_t stream) {
+    check(chandra::rmsnorm_add(reinterpret_cast<const void*>(x), reinterpret_cast<const void*>(res),
+                               reinterpret_cast<void*>(res_out), reinterpret_cast<void*>(out),
+                               reinterpret_cast<const void*>(w), M, reinterpret_cast<cudaStream_t>(stream)));
+  });
+  m.def("silu_mul", [](uintptr_t gu, uintptr_t out, int M, uintptr_t stream) {
+    check(chandra::silu_mul(reinterpret_cast<const void*>(gu), reinterpret_cast<void*>(out), M,
+                            reinterpret_cast<cudaStream_t>(stream)));
+  });
+  m.def("qk_norm_rope_kv", [](uintptr_t qkv, int64_t qkv_stride, uintptr_t qw, uintptr_t kw, uintptr_t pos,
+                              float theta, uintptr_t q_out, uintptr_t kc, uintptr_t vc, uintptr_t page,
+                              uintptr_t slot, int M, uintptr_t stream) {
+    chandra::QkNormRopeArgs a{};
+    a.qkv = reinterpret_cast<const void*>(qkv);
+    a.qkv_stride = qkv_stride;
+    a.q_norm_w = reinterpret_cast<const void*>(qw);
+    a.k_norm_w = reinterpret_cast<const void*>(kw);
+    a.pos = reinterpret_cast<const int*>(pos);
+    a.rope_theta = theta;
+    a.q_out = reinterpret_cast<void*>(q_out);
+    a.k_cache = reinterpret_cast<void*>(kc);
+    a.v_cache = reinterpret_cast<void*>(vc);
+    a.page = reinterpret_cast<const int*>(page);
+    a.slot = reinterpret_cast<const int*>(slot);
+    a.M = M;
+    check(chandra::qk_norm_rope_kv(a, reinterpret_cast<cudaStream_t>(stream)));
+  });
 }
