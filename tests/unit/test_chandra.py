@@ -266,6 +266,42 @@ def test_resolve_device_fallback():
     assert resolve_device(fake_torch) == "cpu"
 
 
+def test_generate_hf_counts_tokens_per_page_in_a_batch():
+    torch = pytest.importorskip("torch")
+    from chandra.model.hf import generate_hf
+
+    eos, im_end, pad = 7, 8, 9
+    prompt = torch.tensor([[1, 1, 1], [1, 1, 1]])
+    # Page 1 ends after 3 tokens and is padded to the longer page 2 (5 tokens).
+    generated = torch.tensor([[1, 1, 1, 4, 5, im_end, pad, pad], [1, 1, 1, 4, 5, 6, 4, eos]])
+
+    class _Inputs(dict):
+        def to(self, _device):
+            return self
+
+        @property
+        def input_ids(self):
+            return self["input_ids"]
+
+    tokenizer = SimpleNamespace(
+        pad_token_id=pad, convert_tokens_to_ids=lambda tok: im_end if tok == "<|im_end|>" else None
+    )
+    processor = SimpleNamespace(
+        tokenizer=tokenizer,
+        apply_chat_template=lambda *a, **k: _Inputs(input_ids=prompt),
+        batch_decode=lambda ids, **k: ["page one", "page two"],
+    )
+    model = SimpleNamespace(
+        processor=processor,
+        device="cpu",
+        generation_config=SimpleNamespace(eos_token_id=eos),
+        generate=lambda **k: generated,
+    )
+    img = Image.new("RGB", (64, 64), color=(255, 255, 255))
+    results = generate_hf([BatchInputItem(image=img), BatchInputItem(image=img)], model)
+    assert [r.token_count for r in results] == [3, 5]
+
+
 # ---------------------------------------------------------------------------
 # 5. CLI, Skill Installation, and vLLM Launcher Tests (#118)
 # ---------------------------------------------------------------------------

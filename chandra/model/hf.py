@@ -97,8 +97,21 @@ def generate_hf(
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     )
+    # In a batch, pages that finish early are padded to the longest one;
+    # count each page's tokens up to and including its first stop token.
+    stop_ids = set(eos_token_id)
+    pad_id = model.processor.tokenizer.pad_token_id
+    if pad_id is not None:
+        stop_ids.add(pad_id)
+
+    def generated_len(ids) -> int:
+        for i, tok in enumerate(ids.tolist()):
+            if tok in stop_ids:
+                return i + 1
+        return len(ids)
+
     results = [
-        GenerationResult(raw=out, token_count=len(ids), error=False)
+        GenerationResult(raw=out, token_count=generated_len(ids), error=False)
         for out, ids in zip(output_text, generated_ids_trimmed)
     ]
     return results
