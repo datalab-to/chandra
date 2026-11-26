@@ -50,10 +50,12 @@ def _rows(fn, x: torch.Tensor) -> torch.Tensor:
 class Decoder:
     def __init__(self, ckpt_dir: str, device: str = "cuda", max_seqs: int = 8, max_ctx: int = 18432,
                  state_dtype: torch.dtype = torch.float32, mtp: bool = False, draft_tokens: int = 3,
-                 weights: str = "bf16", lm_head: str = "bf16", kv: str = "bf16", attn_split_keys: int | None = 1024):
+                 weights: str = "bf16", lm_head: str = "bf16", kv: str = "bf16", attn_split_keys: int | None = 1024,
+                 mtp_weights: str = "bf16"):
         """weights: the format of the decoder layers' linear weights (bf16; fp8, mxfp4, int4 are
         approximate, class G). lm_head: "bf16", or "exact" (INT8 pass + BF16 re-check, the same picks).
-        The MTP layer, if any, stays BF16. kv: "bf16", or "int8" (symmetric per token and head, class G)."""
+        mtp_weights: the MTP layer's GEMM format (drafts are verified, so any format changes only how
+        many tokens a step keeps). kv: "bf16", or "int8" (symmetric per token and head, class G)."""
         if kv not in ("bf16", "int8"):
             raise ValueError(kv)
         self.kv = kv
@@ -126,9 +128,9 @@ class Decoder:
             ))
         self.mtp = None
         if mtp:
-            self.mtp = attn_layer("mtp.layers.0.", Lin=DecodeLinear)
+            self.mtp = attn_layer("mtp.layers.0.", Lin=WEIGHT_FORMATS[mtp_weights])
             self.mtp.update(
-                fc=DecodeLinear(g("mtp.fc.weight")),
+                fc=WEIGHT_FORMATS[mtp_weights](g("mtp.fc.weight")),
                 w_emb=g("mtp.pre_fc_norm_embedding.weight"),
                 w_hid=g("mtp.pre_fc_norm_hidden.weight"),
                 w_norm=g("mtp.norm.weight"),

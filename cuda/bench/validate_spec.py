@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--draft-heads", default="bf16,fp8,fp8:32768,fp8:65536",
                     help="draft LM heads to try: bf16, fp8, or fp8:N (token ids below N plus the added tokens)")
+    ap.add_argument("--mtp-weights", default="bf16", help="the MTP layer's GEMM format (bf16, fp8, mxfp4, int4)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     ckpt = glob.glob(os.path.expanduser(
@@ -51,7 +52,8 @@ def main():
     tok = proc.tokenizer
     eos = model.generation_config.eos_token_id
     eos = set(eos if isinstance(eos, list) else [eos])
-    dec = Decoder(ckpt, max_seqs=len(pick), max_ctx=8192 + a.steps + 64, mtp=True, draft_tokens=a.k)
+    dec = Decoder(ckpt, max_seqs=len(pick), max_ctx=8192 + a.steps + 64, mtp=True, draft_tokens=a.k,
+                  mtp_weights=a.mtp_weights)
     refs, firsts, h_last, saved = [], [], [], []
     with torch.no_grad():
         for i, m in enumerate(pick):

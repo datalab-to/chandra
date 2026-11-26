@@ -183,3 +183,16 @@ def test_int8_kv_decoder_runs_and_mostly_agrees(ckpt, run):
     lead = [next((j for j in range(24) if out[n][j] != ref[n][j]), 24) for n in range(len(seqs))]
     assert max(lead) >= 4, lead
 
+
+
+def test_generate_mtp_with_4bit_draft_layer(ckpt, run):
+    """Drafts from an MXFP4 MTP layer and an FP8 draft head: the output is still plain decoding's."""
+    _, seqs, t0, ref = run
+    dec4 = Decoder(ckpt, max_seqs=3, max_ctx=512, mtp=True, draft_tokens=3, mtp_weights="mxfp4")
+    dec4.set_draft_head("fp8")
+    hidden, first = dec4._forward(t0, seqs, 1, commit=False)
+    for s in seqs:
+        dec4.length[s] += 1
+    out, steps = dec4.generate_mtp(seqs, first, hidden, max_new=32)
+    for n in range(len(seqs)):
+        assert out[n] == ref[n][:32], n
