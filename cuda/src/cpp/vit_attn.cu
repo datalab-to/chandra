@@ -646,6 +646,176 @@ __global__ void __launch_bounds__(kThreads, 2) vit_attn_kernel_i8(const VitAttnA
   }
 }
 
+// ---------------------------------------------------------------------------------
+// v4: 4 warps x 32 query rows. Each K (ldmatrix.x4) and V (ldmatrix.x4.trans) fragment feeds
+// the MMAs of two m16 tiles, halving shared-memory reads per MMA against v1, and each warp has
+// twice the independent MMA chains. Same 128-query CTA, 64-key stages and 3-stage ring.
+constexpr int kThreads4 = 128;
+
+__global__ void __launch_bounds__(kThreads4, 2) vit_attn_kernel_v4(const VitAttnArgs a) {
+  extern __shared__ __align__(128) unsigned char smem[];
+  const int tile = blockIdx.x, h = blockIdx.y, seq = blockIdx.z;
+  const int start = a.cu_seqlens[seq], len = a.cu_seqlens[seq + 1] - start;
+  if (tile * kQTile >= len) return;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
+  const __nv_bfloat16* kg = static_cast<const __nv_bfloat16*>(a.k) + static_cast<int64_t>(start) * a.qkv_stride + h * kDim;
+  const __nv_bfloat16* vg = static_cast<const __nv_bfloat16*>(a.v) + static_cast<int64_t>(start) * a.qkv_stride + h * kDim;
+  const int n_tiles = (len + kKTile - 1) / kKTile;
+
+  auto load = [&](int t, int buf) {
+    unsigned char* sk = smem + buf * kStage;
+    unsigned char* sv = sk + kHalf;
+#pragma unroll
+    for (int i = threadIdx.x; i < kKTile * 8; i += kThreads4) {
+      const int key = i >> 3, c = i & 7, row = t * kKTile + key;
+      const bool valid = row < len;
+      const int64_t off = static_cast<int64_t>(valid ? row : 0) * a.qkv_stride + c * 8;
+      cp_async16(sk + swz(key, c), kg + off, valid);
+      cp_async16(sv + swz(key, c), vg + off, valid);
+    }
+  };
+  load(0, 0);
+  cp_async_commit();
+  if (n_tiles > 1) load(1, 1);
+  cp_async_commit();
+
+  uint32_t qf[2][4][4];
+  const __nv_bfloat16* qg = static_cast<const __nv_bfloat16*>(a.q) + static_cast<int64_t>(start) * a.qkv_stride + h * kDim;
+#pragma unroll
+  for (int mt = 0; mt < 2; ++mt) {
+    const int r0 = tile * kQTile + warp * 32 + mt * 16 + gid;
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      const int r = r0 + half * 8;
+      const bool live = r < len;
+      const __nv_bfloat16* qr = qg + static_cast<int64_t>(live ? r : 0) * a.qkv_stride + tig * 2;
+#pragma unroll
+      for (int kk = 0; kk < 4; ++kk) {
+        qf[mt][kk][half] = live ? *reinterpret_cast<const uint32_t*>(qr + kk * 16) : 0u;
+        qf[mt][kk][half + 2] = live ? *reinterpret_cast<const uint32_t*>(qr + kk * 16 + 8) : 0u;
+      }
+    }
+  }
+
+  float o[2][8][4];
+#pragma unroll
+  for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+    for (int d = 0; d < 8; ++d) o[mt][d][0] = o[mt][d][1] = o[mt][d][2] = o[mt][d][3] = 0.f;
+  float m[2][2] = {{-INFINITY, -INFINITY}, {-INFINITY, -INFINITY}}, l[2][2] = {{0.f, 0.f}, {0.f, 0.f}};
+  const int lq = lane >> 3, lr = lane & 7;
+
+  for (int t = 0; t < n_tiles; ++t) {
+    if (t + 2 < n_tiles) load(t + 2, (t + 2) % kStages);
+    cp_async_commit();
+    cp_async_wait<2>();
+    __syncthreads();
+    const unsigned char* sk = smem + (t % kStages) * kStage;
+    const unsigned char* sv = sk + kHalf;
+
+    float sc[2][8][4];
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+      for (int n = 0; n < 8; ++n) sc[mt][n][0] = sc[mt][n][1] = sc[mt][n][2] = sc[mt][n][3] = 0.f;
+#pragma unroll
+    for (int np = 0; np < 4; ++np) {
+#pragma unroll
+      for (int kk = 0; kk < 4; ++kk) {
+        uint32_t b[4];
+        ldsm_x4(b, sk + swz(16 * np + 8 * (lq >> 1) + lr, 2 * kk + (lq & 1)));
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+          mma(sc[mt][2 * np], qf[mt][kk], b[0], b[1]);
+          mma(sc[mt][2 * np + 1], qf[mt][kk], b[2], b[3]);
+        }
+      }
+    }
+
+    const int key0 = t * kKTile + tig * 2;
+    uint32_t pf[2][4][4];
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+      float mx0 = -INFINITY, mx1 = -INFINITY;
+#pragma unroll
+      for (int n = 0; n < 8; ++n) {
+        const bool v0 = key0 + n * 8 < len, v1 = key0 + n * 8 + 1 < len;
+        sc[mt][n][0] = v0 ? sc[mt][n][0] * kScaleLog2 : -INFINITY;
+        sc[mt][n][1] = v1 ? sc[mt][n][1] * kScaleLog2 : -INFINITY;
+        sc[mt][n][2] = v0 ? sc[mt][n][2] * kScaleLog2 : -INFINITY;
+        sc[mt][n][3] = v1 ? sc[mt][n][3] * kScaleLog2 : -INFINITY;
+        mx0 = fmaxf(mx0, fmaxf(sc[mt][n][0], sc[mt][n][1]));
+        mx1 = fmaxf(mx1, fmaxf(sc[mt][n][2], sc[mt][n][3]));
+      }
+      mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+      mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+      mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+      mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+      const float n0 = fmaxf(m[mt][0], mx0), n1 = fmaxf(m[mt][1], mx1);
+      const float al0 = ex2(m[mt][0] - n0), al1 = ex2(m[mt][1] - n1);
+      m[mt][0] = n0;
+      m[mt][1] = n1;
+      float rs0 = 0.f, rs1 = 0.f;
+#pragma unroll
+      for (int n = 0; n < 8; ++n) {
+        const float e0 = ex2(sc[mt][n][0] - n0), e1 = ex2(sc[mt][n][1] - n0);
+        const float e2 = ex2(sc[mt][n][2] - n1), e3 = ex2(sc[mt][n][3] - n1);
+        rs0 += e0 + e1;
+        rs1 += e2 + e3;
+        pf[mt][n >> 1][(n & 1) * 2] = pack_bf16(e0, e1);
+        pf[mt][n >> 1][(n & 1) * 2 + 1] = pack_bf16(e2, e3);
+      }
+      l[mt][0] = l[mt][0] * al0 + rs0;
+      l[mt][1] = l[mt][1] * al1 + rs1;
+#pragma unroll
+      for (int d = 0; d < 8; ++d) {
+        o[mt][d][0] *= al0;
+        o[mt][d][1] *= al0;
+        o[mt][d][2] *= al1;
+        o[mt][d][3] *= al1;
+      }
+    }
+
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+#pragma unroll
+      for (int dp = 0; dp < 4; ++dp) {
+        uint32_t b[4];
+        ldsm_x4_t(b, sv + swz(16 * kk + 8 * (lq & 1) + lr, 2 * dp + (lq >> 1)));
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+          mma(o[mt][2 * dp], pf[mt][kk], b[0], b[1]);
+          mma(o[mt][2 * dp + 1], pf[mt][kk], b[2], b[3]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+  cp_async_wait<0>();
+
+  __nv_bfloat16* og = static_cast<__nv_bfloat16*>(a.out) + static_cast<int64_t>(start) * a.out_stride + h * kDim;
+#pragma unroll
+  for (int mt = 0; mt < 2; ++mt) {
+    float l0 = l[mt][0], l1 = l[mt][1];
+    l0 += __shfl_xor_sync(0xffffffffu, l0, 1);
+    l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
+    l1 += __shfl_xor_sync(0xffffffffu, l1, 1);
+    l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
+    const float i0 = 1.f / l0, i1 = 1.f / l1;
+    const int r0 = tile * kQTile + warp * 32 + mt * 16 + gid;
+#pragma unroll
+    for (int d = 0; d < 8; ++d) {
+      const int col = d * 8 + tig * 2;
+      if (r0 < len)
+        *reinterpret_cast<uint32_t*>(og + static_cast<int64_t>(r0) * a.out_stride + col) =
+            pack_bf16(o[mt][d][0] * i0, o[mt][d][1] * i0);
+      if (r0 + 8 < len)
+        *reinterpret_cast<uint32_t*>(og + static_cast<int64_t>(r0 + 8) * a.out_stride + col) =
+            pack_bf16(o[mt][d][2] * i1, o[mt][d][3] * i1);
+    }
+  }
+}
+
 }  // namespace
 
 cudaError_t vit_attn(const VitAttnArgs& a, cudaStream_t stream) {
@@ -654,6 +824,8 @@ cudaError_t vit_attn(const VitAttnArgs& a, cudaStream_t stream) {
     cudaError_t e = cudaFuncSetAttribute(vit_attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
     if (e == cudaSuccess)
       e = cudaFuncSetAttribute(vit_attn_kernel_v2, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+    if (e == cudaSuccess)
+      e = cudaFuncSetAttribute(vit_attn_kernel_v4, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
     if (e != cudaSuccess) return e;
     configured = true;
   }
@@ -670,6 +842,10 @@ cudaError_t vit_attn(const VitAttnArgs& a, cudaStream_t stream) {
     vit_k_mean_kernel<<<dim3(16, a.n_seq), 256, 0, stream>>>(a);
     vit_k_quant_kernel<<<dim3(a.max_tiles, 16, a.n_seq), 256, 0, stream>>>(a);
     vit_attn_kernel_i8<<<grid, kThreads, kSmem8, stream>>>(a);
+    return cudaGetLastError();
+  }
+  if (a.version == 4) {
+    vit_attn_kernel_v4<<<grid, kThreads4, kSmem, stream>>>(a);
     return cudaGetLastError();
   }
   if (a.version == 1)

@@ -9,7 +9,7 @@ if not torch.cuda.is_available():
     pytest.skip("needs a CUDA GPU", allow_module_level=True)
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 4])
 @pytest.mark.parametrize("lens", [[1], [64], [300], [1000, 77, 4096], [24552]])
 def test_matches_sdpa(lens, version):
     g = torch.Generator(device="cuda").manual_seed(sum(lens))

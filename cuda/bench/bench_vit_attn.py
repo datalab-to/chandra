@@ -38,6 +38,8 @@ def main():
     print(f"ours v1: {t1:.2f} ms, {flops / t1 / 1e9:.1f} TFLOPS")
     t = time_ms(lambda: chandra_cuda.vit_attn(q, k, v, cu, n, out, version=2), a.reps)
     print(f"ours v2: {t:.2f} ms, {flops / t / 1e9:.1f} TFLOPS")
+    t4 = time_ms(lambda: chandra_cuda.vit_attn(q, k, v, cu, n, out, version=4), a.reps)
+    print(f"ours v4: {t4:.2f} ms, {flops / t4 / 1e9:.1f} TFLOPS")
     ref1 = chandra_cuda.vit_attn(q, k, v, cu, n, version=1).float()
     t3 = time_ms(lambda: chandra_cuda.vit_attn(q, k, v, cu, n, out, version=3), a.reps)
     rel = ((out.float() - ref1).abs().sum() / ref1.abs().sum()).item()

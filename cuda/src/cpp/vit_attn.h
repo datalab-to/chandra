@@ -25,7 +25,7 @@ struct VitAttnArgs {
   float* k_scale;
   float* k_mean;
   int max_tiles;
-  int version;  // 1 (default): plain loop, 2 CTAs/SM; 2: next tile's QK overlapped with softmax, 1 CTA/SM
+  int version;  // 1 (default): 8 warps x 16 rows; 2: QK of the next tile overlapped; 3: INT8 QK; 4: 4 warps x 32 rows
 };
 
 cudaError_t vit_attn(const VitAttnArgs& a, cudaStream_t stream);
