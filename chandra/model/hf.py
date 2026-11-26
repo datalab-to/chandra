@@ -20,6 +20,29 @@ def resolve_device(torch_mod, model=None) -> str:
     return "cpu"
 
 
+def default_batch_size() -> int:
+    """Pages per `generate` call for the HF backend, from the GPU's memory.
+
+    At batch 1, decoding is bound by per-step overhead (Python and kernel
+    launches), so batching pages gives several times the pages per second.
+    Peak memory with full-size pages (~6 MP) is ~18 GB at 4 pages and ~27 GB
+    at 8.
+    """
+    try:
+        import torch
+    except ImportError:
+        return 1
+    device = resolve_device(torch)
+    if not device.startswith("cuda"):
+        return 1
+    total_gb = torch.cuda.get_device_properties(torch.device(device)).total_memory / 2**30
+    if total_gb >= 40:
+        return 8
+    if total_gb >= 22:
+        return 4
+    return 1
+
+
 def generate_hf(
     batch: List[BatchInputItem],
     model,
