@@ -191,10 +191,11 @@ __device__ __forceinline__ __nv_bfloat16 silu_mul_bf16(float gate, float up) {
 // lower bound cannot hold the pick (not even a tie) and returns at once; the others run
 // exactly as the plain BF16 argmax kernel does.
 struct BoundArgs {
-  const float* xnorm;  // [M] ||x_m||_2, rounded up
-  const float* rowc;   // [N] c_n: |x . (w_n - w8_n)| <= ||x|| c_n, accumulation error included
+  const float* xnorm;  // [M][nb] ||x_m,b||_2 per 256-wide K block b, rounded up
+  const float* rowc;   // [N][nb] c_n,b: |x . (w_n - w8_n)| <= sum_b ||x_b|| c_n,b, accumulation error included
   float* tile_ub;      // [N / 128][64]
   unsigned* lb_key;    // [M]
+  int nb;              // K / 256 (at most 16)
 };
 
 // SILU: W rows come in 16-row groups of 8 gate rows then their 8 up rows (interleave_gate_up),
@@ -456,17 +457,29 @@ __global__ void __launch_bounds__(kThreads, 2)
 
       if constexpr (BOUND) {
         static_assert(KW == 1, "the bound epilogue needs every warp");
-        const float c0 = bnd.rowc[row], c8 = bnd.rowc[row + 8];
+        const float* cr0 = bnd.rowc + static_cast<size_t>(row) * bnd.nb;
+        const float* cr8 = bnd.rowc + static_cast<size_t>(row + 8) * bnd.nb;
     #pragma unroll
         for (int t = 0; t < 2 * NP; ++t) {
     #pragma unroll
           for (int c = 0; c < 2; ++c) {
             const int tok = t * 8 + tig * 2 + c;
-            const float xn = tok < M ? bnd.xnorm[tok] : 0.f;
+            // Blockwise Cauchy-Schwarz: sum_b ||x_b|| ||r_n,b|| <= ||x|| ||r_n||, and much less when
+            // a few blocks carry most of x (as hidden states with outlier channels do).
+            float e0 = 0.f, e8 = 0.f;
+            if (tok < M) {
+              const float* xb = bnd.xnorm + static_cast<size_t>(tok) * bnd.nb;
+              for (int b = 0; b < bnd.nb; ++b) {
+                const float xv = __ldg(xb + b);
+                e0 = fmaf(xv, __ldg(cr0 + b), e0);
+                e8 = fmaf(xv, __ldg(cr8 + b), e8);
+              }
+            }
             const float l0 = acc[t][c], l8 = acc[t][c + 2];
-            // |l| * 2^-20 covers the rounding of l, l * scale and l +- b (a few ulps each).
-            const float b0 = fmaf(xn, c0, fmaf(fabsf(l0), 1e-6f, 1e-30f));
-            const float b8 = fmaf(xn, c8, fmaf(fabsf(l8), 1e-6f, 1e-30f));
+            // |l| * 1e-6 and the 1e-5 relative pad cover the rounding of l, l * scale, the sum
+            // above and l +- b (a few ulps each).
+            const float b0 = fmaf(e0, 1.00001f, fmaf(fabsf(l0), 1e-6f, 1e-30f));
+            const float b8 = fmaf(e8, 1.00001f, fmaf(fabsf(l8), 1e-6f, 1e-30f));
             float ub = fmaxf(l0 + b0, l8 + b8), lb = fmaxf(l0 - b0, l8 - b8);
     #pragma unroll
             for (int off = 4; off < 32; off <<= 1) {
@@ -719,8 +732,8 @@ cudaError_t decode_gemm_argmax(const void* x, const void* wp, unsigned long long
 cudaError_t lm_head_bound_i8(const void* x, const void* wp, const float* wscale, const float* rowc,
                              const float* xnorm, float* tile_ub, unsigned* lb_key, int M, int N, int K,
                              cudaStream_t stream) {
-  if (M < 1 || M > 64 || N % 128 != 0 || K % kKC != 0) return cudaErrorInvalidValue;
-  const BoundArgs b{xnorm, rowc, tile_ub, lb_key};
+  if (M < 1 || M > 64 || N % 128 != 0 || K % 256 != 0 || K > 4096) return cudaErrorInvalidValue;
+  const BoundArgs b{xnorm, rowc, tile_ub, lb_key, K / 256};
   switch ((M + 15) / 16) {
     case 1: return launch<1, 8, 1, false, false, false, true, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, nullptr, wscale, b);
     case 2: return launch<2, 8, 1, false, false, false, true, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, nullptr, wscale, b);
@@ -732,7 +745,7 @@ cudaError_t lm_head_bound_i8(const void* x, const void* wp, const float* wscale,
 cudaError_t lm_head_recheck(const void* x, const void* wp, const float* tile_ub, const unsigned* lb_key,
                             unsigned long long* keys, int M, int N, int K, cudaStream_t stream) {
   if (M < 1 || M > 64 || N % 128 != 0 || K % kKC != 0) return cudaErrorInvalidValue;
-  const BoundArgs b{nullptr, nullptr, const_cast<float*>(tile_ub), const_cast<unsigned*>(lb_key)};
+  const BoundArgs b{nullptr, nullptr, const_cast<float*>(tile_ub), const_cast<unsigned*>(lb_key), 0};
   switch ((M + 15) / 16) {
     case 1: return launch<1, 8, 1, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys, nullptr, b);
     case 2: return launch<2, 8, 1, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys, nullptr, b);

@@ -554,22 +554,24 @@ class DecodeLinearFP4(DecodeLinear):
 
 def pack_weight_i8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """INT8 per-row weights for the exact LM head: q = round(w / s), s = absmax / 127, stored as
-    sign-magnitude bytes in pack_weight_fp8's layout. Also returns, per row, c_n with
-    |x . w_n - s_n (x . q_n)| + (both FP32 accumulations' error) <= ||x||_2 c_n:
-    c_n = ||w_n - s_n q_n||_2 (Cauchy-Schwarz, from FP64) + 1e-3 ||w_n||_2 (accumulation; 2 K u
-    per sum is 3.1e-4 at K = 2,560, covering truncating accumulators), rounded up."""
+    sign-magnitude bytes in pack_weight_fp8's layout. Also returns, per row and 256-wide K block b,
+    c_n,b with |x . w_n - s_n (x . q_n)| + (both FP32 accumulations' error) <= sum_b ||x_b||_2 c_n,b:
+    c_n,b = ||w_n,b - s_n q_n,b||_2 (Cauchy-Schwarz per block, from FP64) + 1e-3 ||w_n,b||_2
+    (accumulation; 2 K u per sum is 3.1e-4 at K = 2,560, covering truncating accumulators),
+    rounded up. K must be a multiple of 256."""
     n, k = w.shape
-    if n % 16 or k % 32:
-        raise ValueError(f"weight shape {tuple(w.shape)}: N must be a multiple of 16 and K of 32")
+    if n % 16 or k % 256:
+        raise ValueError(f"weight shape {tuple(w.shape)}: N must be a multiple of 16 and K of 256")
+    nb = k // 256
     scale = torch.empty(n, dtype=torch.float32, device=w.device)
-    rowc = torch.empty(n, dtype=torch.float32, device=w.device)
+    rowc = torch.empty(n, nb, dtype=torch.float32, device=w.device)
     q8 = torch.empty(n, k, dtype=torch.uint8, device=w.device)
     for i in range(0, n, 16384):
         wf = w[i : i + 16384].double()
         s = (wf.abs().amax(dim=1) / 127.0).float().clamp_min(1e-30)
         q = torch.round(wf / s.double()[:, None]).clamp(-127, 127)
-        r = wf - q * s.double()[:, None]
-        c = r.norm(dim=1) * (1 + 1e-6) + 1e-3 * wf.norm(dim=1) + 1e-30
+        r = (wf - q * s.double()[:, None]).reshape(-1, nb, 256)
+        c = r.norm(dim=2) * (1 + 1e-6) + 1e-3 * wf.reshape(-1, nb, 256).norm(dim=2) + 1e-30
         scale[i : i + 16384] = s
         rowc[i : i + 16384] = c.float() * (1 + 2**-20)
         qi = q.to(torch.int16)
@@ -605,7 +607,7 @@ class LMHeadExact:
         if x.dtype != torch.bfloat16 or x.shape[1] != self.k or not 1 <= m <= 64:
             raise ValueError(f"expected a [1..64, {self.k}] bfloat16 input")
         x = x.contiguous()
-        xnorm = (x.float().norm(dim=1) * (1 + 1e-3)).contiguous()
+        xnorm = (x.float().reshape(m, self.k // 256, 256).norm(dim=2) * (1 + 1e-3)).contiguous()
         lb = torch.zeros(m, dtype=torch.int32, device=self.device)
         _core.lm_head_bound_i8(x.data_ptr(), self.packed8.data_ptr(), self.scale.data_ptr(), self.rowc.data_ptr(),
                                xnorm.data_ptr(), self.tile_ub.data_ptr(), lb.data_ptr(), m, self.n, self.k,
