@@ -127,3 +127,44 @@ def test_fp8_lm_head_subset_returns_vocabulary_ids():
     picked = ref.gather(1, torch.searchsorted(rows, got)[:, None])[:, 0]
     assert ((best - picked) <= 0.05 * best.abs() + 0.05).all()  # FP8 weights: near the BF16 best
 
+
+@pytest.mark.parametrize("n,k", [s for s in SHAPES if s[0] % 64 == 0])
+def test_fp4_matches_its_dequantized_weight(n, k):
+    torch.manual_seed(n * 3 + k)
+    w = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
+    lin = chandra_cuda.DecodeLinearFP4(w, keep_codes=True)
+    wd = lin.dequantized()
+    rel = ((wd - w.float()).norm() / w.float().norm()).item()
+    assert rel < 0.15, rel  # e2m1 with a shared power-of-two scale: ~9% RMS error on Gaussian weights
+    for m in ROWS:
+        x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
+        ref = x.float() @ wd.T
+        got = lin(x).float()
+        assert (got - ref).abs().max().item() <= ref.abs().max().item() * 2**-7 + 1e-3, m
+
+
+def test_fp4_same_result_at_every_batch_size():
+    torch.manual_seed(4)
+    w = (torch.randn(2560, 9216, device="cuda") * 0.02).to(torch.bfloat16)
+    lin = chandra_cuda.DecodeLinearFP4(w)
+    x = torch.randn(64, 9216, device="cuda").to(torch.bfloat16)
+    full = lin(x)
+    for m in (1, 5, 17, 40):
+        assert torch.equal(lin(x[:m]), full[:m]), m
+
+
+def test_mxfp4_quantize_matches_vllm():
+    try:
+        from vllm.model_executor.layers.quantization.utils.mxfp4_utils import mxfp4_quantize as vq
+    except Exception:  # noqa: BLE001
+        pytest.skip("vLLM not importable")
+    torch.manual_seed(12)
+    w = (torch.randn(512, 2560, device="cuda") * 0.03).to(torch.bfloat16)
+    w[0, :32] = 0  # an all-zero block
+    w[1, 5] = 6.5  # a large outlier
+    codes, exps = chandra_cuda.mxfp4_quantize(w)
+    vp, vs = vq(w.contiguous())
+    vcodes = torch.stack([vp & 0xF, vp >> 4], dim=-1).reshape(512, 2560)
+    assert torch.equal(exps, vs.view(torch.uint8).reshape(512, -1))
+    assert torch.equal(codes, vcodes)
+

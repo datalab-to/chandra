@@ -10,7 +10,8 @@ import torch
 
 from . import _core
 
-__all__ = ["pack_weight", "pack_weight_fp8", "DecodeLinear", "DecodeLinearFP8", "LMHead", "LMHeadFP8", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul",
+__all__ = ["pack_weight", "pack_weight_fp8", "DecodeLinear", "DecodeLinearFP8", "DecodeLinearFP4", "mxfp4_quantize",
+           "pack_weight_fp4", "LMHead", "LMHeadFP8", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul",
            "qk_norm_rope_kv", "vit_attn"]
 
 
@@ -411,4 +412,108 @@ class LMHeadFP8:
                                      m, self.n, self.k, torch.cuda.current_stream(self.device).cuda_stream)
         idx = 0xFFFFFFFF - (keys & 0xFFFFFFFF)
         return idx if self.rows is None else self.rows[idx]
+
+
+def mxfp4_quantize(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """OCP MX FP4 along K, bit for bit as vLLM's online `mxfp4` (triton_kernels' downcast_to_mxfp):
+    per 32 weights E8M0 = floor(log2(amax, its FP32 mantissa rounded off)) - 2, codes
+    e2m1 (sign << 3 | e1 e0 m) rounded to nearest even and saturated at 6. Returns (codes [N, K]
+    uint8 0..15, E [N, K / 32] uint8, the scale being 2^(E - 127))."""
+    n, k = w.shape
+    if k % 32:
+        raise ValueError("K must be a multiple of 32")
+    codes = torch.empty(n, k, dtype=torch.uint8, device=w.device)
+    exps = torch.empty(n, k // 32, dtype=torch.uint8, device=w.device)
+    for i in range(0, n, 8192):
+        f = w[i : i + 8192].float().reshape(-1, k // 32, 32)
+        amax = f.abs().amax(dim=-1)
+        mb = ((amax.view(torch.int32).to(torch.int64) + 0x200000) & 0x7F800000).to(torch.int32).view(torch.float32)
+        unb = torch.floor(torch.log2(mb + torch.where(mb == 0, 2.0**-126, 0.0))) - 2
+        scale = torch.exp2(unb.clamp(-127, 127))
+        e = (scale.view(torch.int32) >> 23) & 0xFF
+        qs = torch.where(scale == 0, 0.0, 1.0 / scale)
+        u = (f * qs[..., None]).reshape(-1, k).view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+        sign = (u >> 31) & 1
+        ex = (u >> 23) & 0xFF
+        man = u & 0x7FFFFF
+        adj = (126 - ex).clamp(0, 40)
+        folded = 0x400000 | (man >> 1)
+        den = folded >> adj
+        den = den | ((den << adj) != folded).to(torch.int64)
+        man = torch.where(ex < 127, den, man)
+        ex2 = ex.clamp_min(126) - 126
+        rm = (man + ((man >> 22) & 1) + 0x1FFFFF) >> 22
+        code = torch.minimum((ex2 << 1) + rm, torch.tensor(7, device=w.device)) | (sign << 3)
+        codes[i : i + 8192] = code.to(torch.uint8)
+        exps[i : i + 8192] = e.to(torch.uint8)
+    return codes, exps
+
+
+def mxfp4_dequantize(codes: torch.Tensor, exps: torch.Tensor) -> torch.Tensor:
+    """FP32 weights of (codes, E) from mxfp4_quantize."""
+    lut = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], device=codes.device)
+    v = lut[codes.long()]
+    return v * torch.exp2(exps.float() - 127).repeat_interleave(32, dim=1)
+
+
+def pack_weight_fp4(codes: torch.Tensor, exps: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Lay out MXFP4 (codes, E) for DecodeLinearFP4. Per 16-row group g, 64-wide K load L and lane
+    (gid, tig): four 32-bit words, one per k16 block, each the lane's 8 A-fragment weights with the
+    magnitude bits of a0 / a1 / a2 / a3 at bits 8:6 / 11:9 / 2:0 / 5:3 of each half and their
+    signs at 15 / 14 / 13 / 12 (the kernel's fp4x8_to_bf16). Scales: per (g, L, gid) one word of
+    E + 126 for (gid, K block 0), (gid, 1), (gid + 8, 0), (gid + 8, 1)."""
+    n, k = codes.shape
+    if n % 16 or k % 64:
+        raise ValueError("N must be a multiple of 16 and K of 64")
+    if int(exps.max()) > 128:
+        raise ValueError("a scale above 2 (E > 128) does not fit the BF16 multiplier 2^(E - 1)")
+    c = codes.to(torch.int64).reshape(n // 16, 2, 8, k // 64, 4, 2, 4, 2)  # g rh gid L bb kh tig e
+    mag, sgn = c & 7, c >> 3
+    mbase = torch.tensor([[6, 0], [9, 3]], device=codes.device)  # [rh][kh]
+    sbase = torch.tensor([[15, 13], [14, 12]], device=codes.device)
+    e16 = torch.tensor([0, 16], device=codes.device)
+    mshift = (mbase[:, None, None, None, :, None, None] + e16).view(1, 2, 1, 1, 1, 2, 1, 2)
+    sshift = (sbase[:, None, None, None, :, None, None] + e16).view(1, 2, 1, 1, 1, 2, 1, 2)
+    word = ((mag << mshift) | (sgn << sshift)).sum(dim=(1, 5, 7))  # [g, gid, L, bb, tig] (bits are disjoint)
+    packed = word.permute(0, 2, 1, 4, 3).contiguous()  # [g, L, gid, tig, bb]
+    packed = (packed & 0xFFFFFFFF).to(torch.int64)
+    packed = torch.where(packed >= 2**31, packed - 2**32, packed).to(torch.int32).reshape(-1)
+    e = (exps.to(torch.int64) + 126).reshape(n // 16, 2, 8, k // 64, 2)  # g rh gid L blk
+    sw = (e[:, 0, :, :, 0] | (e[:, 0, :, :, 1] << 8) | (e[:, 1, :, :, 0] << 16) | (e[:, 1, :, :, 1] << 24))
+    sw = sw.permute(0, 2, 1).contiguous()  # [g, L, gid]
+    sw = torch.where(sw >= 2**31, sw - 2**32, sw).to(torch.int32).reshape(-1)
+    return packed, sw
+
+
+class DecodeLinearFP4(DecodeLinear):
+    """DecodeLinear with MXFP4 weights (e2m1, one power-of-two scale per 32 along K, as vLLM's
+    online `mxfp4`): 4.25 bits per weight, a quarter of BF16's bytes. Approximate (class G):
+    y = x @ mxfp4_dequantize(mxfp4_quantize(weight)).T. N must be a multiple of 64."""
+
+    def __init__(self, weight: torch.Tensor, keep_codes: bool = False):
+        if weight.shape[0] % 64:
+            raise ValueError("N must be a multiple of 64")
+        super().__init__(weight, _pack=False)
+        codes, exps = mxfp4_quantize(weight)
+        self.codes, self.exps = (codes, exps) if keep_codes else (None, None)  # for dequantized()
+        self.packed, self.scales = pack_weight_fp4(codes, exps)
+
+    def dequantized(self) -> torch.Tensor:
+        if self.codes is None:
+            raise ValueError("built without keep_codes=True")
+        return mxfp4_dequantize(self.codes, self.exps)
+
+    def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != self.k:
+            raise ValueError(f"expected a [M, {self.k}] bfloat16 input")
+        m = x.shape[0]
+        if not 1 <= m <= 64:
+            raise ValueError("M must be between 1 and 64")
+        x = x.contiguous()
+        if out is None:
+            out = torch.empty(m, self.n, dtype=torch.bfloat16, device=self.device)
+        _core.decode_gemm_fp4(x.data_ptr(), self.packed.data_ptr(), self.scales.data_ptr(), out.data_ptr(),
+                              self.workspace.data_ptr(), self.counters.data_ptr(), m, self.n, self.k, self.sms,
+                              torch.cuda.current_stream(self.device).cuda_stream)
+        return out
 

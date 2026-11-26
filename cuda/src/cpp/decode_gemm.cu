@@ -93,18 +93,51 @@ __device__ __forceinline__ void fp8x4_to_bf16(uint32_t w, uint32_t& lo, uint32_t
   hi = *reinterpret_cast<const uint32_t*>(&r23);
 }
 
+// Eight MXFP4 (e2m1) weights of one k16 block -> the four BF16 A registers, exactly.
+// pack_weight_fp4 places each code's magnitude bits (e1 e0 m) where BF16's exponent LSBs
+// and mantissa MSB are (bits 8:6 of a half; already there for a0, a shift away for the
+// others) and its sign at bit 15: those BF16 bits are e2m1 * 2^-126, subnormal 0.5 included.
+// One HMUL2 by 2^(E - 1) then gives e2m1 * 2^(E - 127), the block's scale applied.
+__device__ __forceinline__ void fp4x8_to_bf16(uint32_t w, uint32_t m_lo, uint32_t m_hi, uint4& a) {
+  constexpr uint32_t kMag = 0x01C001C0u, kSign = 0x80008000u;
+  const uint32_t a0 = w & (kMag | kSign);
+  const uint32_t a1 = ((w >> 3) & kMag) | ((w << 1) & kSign);
+  const uint32_t a2 = ((w << 6) & kMag) | ((w << 2) & kSign);
+  const uint32_t a3 = (w << 3) & (kMag | kSign);
+  const __nv_bfloat162 r0 = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&a0),
+                                    *reinterpret_cast<const __nv_bfloat162*>(&m_lo));
+  const __nv_bfloat162 r1 = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&a1),
+                                    *reinterpret_cast<const __nv_bfloat162*>(&m_hi));
+  const __nv_bfloat162 r2 = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&a2),
+                                    *reinterpret_cast<const __nv_bfloat162*>(&m_lo));
+  const __nv_bfloat162 r3 = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&a3),
+                                    *reinterpret_cast<const __nv_bfloat162*>(&m_hi));
+  a.x = *reinterpret_cast<const uint32_t*>(&r0);
+  a.y = *reinterpret_cast<const uint32_t*>(&r1);
+  a.z = *reinterpret_cast<const uint32_t*>(&r2);
+  a.w = *reinterpret_cast<const uint32_t*>(&r3);
+}
+
+// Byte b (E + 126) of a scale word -> 2^(E - 1) in both BF16 halves: (b << 7) | (b << 23).
+template <int B>
+__device__ __forceinline__ uint32_t e8_to_bf16x2(uint32_t s) {
+  return __byte_perm(s, 0u, 0x0404 | (B << 4) | (B << 12)) >> 1;
+}
+
 // NP: pairs of n8 token tiles (M <= 16 * NP). RW x KW = kWarps. ARGMAX: instead of
 // writing y, reduce each token's greedy pick into keys[token] (an LM head that never
 // writes its logits); needs splits == 1. FP8: W holds e4m3 bytes (one 16-byte load per
 // lane covers two k16 blocks) and wscale[row] scales each output row.
-template <int NP, int RW, int KW, bool ARGMAX = false, bool FP8 = false>
+template <int NP, int RW, int KW, bool ARGMAX = false, bool FP8 = false, bool FP4 = false>
 __global__ void __launch_bounds__(kThreads, 2)
     decode_gemm_kernel(const __nv_bfloat16* __restrict__ x, const uint4* __restrict__ wp,
                        __nv_bfloat16* __restrict__ y, float* __restrict__ partial,
                        unsigned* __restrict__ counters, int M, int N, int K, int splits,
                        unsigned long long* __restrict__ keys, const float* __restrict__ wscale) {
-  constexpr int BPL = FP8 ? 2 : 1;  // k16 blocks per 16-byte W load
+  constexpr int BPL = FP8 ? 2 : FP4 ? 4 : 1;  // k16 blocks per 16-byte W load
   static_assert(!FP8 || KW <= 4, "FP8 needs at least one W load per warp per chunk");
+  static_assert(!FP4 || KW <= 2, "FP4 needs at least one W load per warp per chunk");
+  static_assert(!(FP8 && FP4), "one weight format");
   static_assert(RW * KW == kWarps, "8 warps per CTA");
   constexpr int MP = NP * 16;
   constexpr int kBufBytes = MP * kRowBytes;
@@ -128,6 +161,12 @@ __global__ void __launch_bounds__(kThreads, 2)
   // Block i of this warp is k16 block kb0 + i * KW + kq of row group g.
   const uint4* w = wp + (static_cast<size_t>(g) * (KB / BPL) + kb0 / BPL + kq) * 32 + lane;
   const size_t wstep = static_cast<size_t>(KW) * 32;
+  // FP4: one scale word per (row group, W load, gid): E + 126 of rows gid and gid + 8 for the
+  // load's two 32-wide K blocks; the 4 lanes of a quad read the same word.
+  const uint32_t* sc = FP4 ? reinterpret_cast<const uint32_t*>(wscale) +
+                                 (static_cast<size_t>(g) * (KB / 4) + kb0 / 4 + kq) * 8 + (lane >> 2)
+                           : nullptr;
+  constexpr size_t sstep = static_cast<size_t>(KW) * 8;
 
   auto load_x = [&](int c, int buf) {
     unsigned char* s = smem + buf * kBufBytes;
@@ -147,6 +186,13 @@ __global__ void __launch_bounds__(kThreads, 2)
   if (1 < nblk) w1 = ld_stream(w + wstep);
   if (2 < nblk) w2 = ld_stream(w + 2 * wstep);
   if (3 < nblk) w3 = ld_stream(w + 3 * wstep);
+  uint32_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;  // FP4 scale words, in step with w0..w3
+  if constexpr (FP4) {
+    if (0 < nblk) s0 = __ldg(sc);
+    if (1 < nblk) s1 = __ldg(sc + sstep);
+    if (2 < nblk) s2 = __ldg(sc + 2 * sstep);
+    if (3 < nblk) s3 = __ldg(sc + 3 * sstep);
+  }
 
   float acc[2 * NP][4];
 #pragma unroll
@@ -175,7 +221,19 @@ __global__ void __launch_bounds__(kThreads, 2)
       w2 = w3;
       if (i + kDepth < nblk) w3 = ld_stream(w + (i + kDepth) * wstep);
       uint4 af[BPL];
-      if constexpr (FP8) {
+      if constexpr (FP4) {
+        const uint32_t sv = s0;
+        s0 = s1;
+        s1 = s2;
+        s2 = s3;
+        if (i + kDepth < nblk) s3 = __ldg(sc + (i + kDepth) * sstep);
+        const uint32_t m00 = e8_to_bf16x2<0>(sv), m01 = e8_to_bf16x2<1>(sv);  // row gid, K blocks 0 / 1
+        const uint32_t m80 = e8_to_bf16x2<2>(sv), m81 = e8_to_bf16x2<3>(sv);  // row gid + 8
+        fp4x8_to_bf16(wv.x, m00, m80, af[0]);
+        fp4x8_to_bf16(wv.y, m00, m80, af[1]);
+        fp4x8_to_bf16(wv.z, m01, m81, af[2]);
+        fp4x8_to_bf16(wv.w, m01, m81, af[3]);
+      } else if constexpr (FP8) {
         fp8x4_to_bf16(wv.x, af[0].x, af[0].y);
         fp8x4_to_bf16(wv.y, af[0].z, af[0].w);
         fp8x4_to_bf16(wv.z, af[1].x, af[1].y);
@@ -310,13 +368,13 @@ __global__ void __launch_bounds__(kThreads, 2)
   if (tid == 0) counters[tile] = 0;
 }
 
-template <int NP, int RW, int KW, bool ARGMAX = false, bool FP8 = false>
+template <int NP, int RW, int KW, bool ARGMAX = false, bool FP8 = false, bool FP4 = false>
 cudaError_t launch(const void* x, const void* wp, void* y, float* ws, unsigned* counters, int M, int N,
                    int K, int splits, cudaStream_t stream, unsigned long long* keys = nullptr,
                    const float* wscale = nullptr) {
   constexpr int smem = 2 * NP * 16 * kRowBytes;
   const dim3 grid(N / (16 * RW), splits);
-  decode_gemm_kernel<NP, RW, KW, ARGMAX, FP8><<<grid, kThreads, smem, stream>>>(
+  decode_gemm_kernel<NP, RW, KW, ARGMAX, FP8, FP4><<<grid, kThreads, smem, stream>>>(
       static_cast<const __nv_bfloat16*>(x), static_cast<const uint4*>(wp), static_cast<__nv_bfloat16*>(y),
       ws, counters, M, N, K, splits, keys, wscale);
   return cudaGetLastError();
@@ -330,6 +388,17 @@ cudaError_t launch_fp8(int rw, const void* x, const void* wp, const float* wscal
     case 4: return launch<NP, 4, 2, false, true>(x, wp, y, ws, counters, M, N, K, splits, stream, nullptr, wscale);
     case 2: return launch<NP, 2, 4, false, true>(x, wp, y, ws, counters, M, N, K, splits, stream, nullptr, wscale);
     default: return cudaErrorInvalidValue;  // FP8 needs N % 32 == 0
+  }
+}
+
+template <int NP>
+cudaError_t launch_fp4(int rw, const void* x, const void* wp, const void* sc, void* y, float* ws,
+                       unsigned* counters, int M, int N, int K, int splits, cudaStream_t stream) {
+  const float* s = static_cast<const float*>(sc);
+  switch (rw) {
+    case 8: return launch<NP, 8, 1, false, false, true>(x, wp, y, ws, counters, M, N, K, splits, stream, nullptr, s);
+    case 4: return launch<NP, 4, 2, false, false, true>(x, wp, y, ws, counters, M, N, K, splits, stream, nullptr, s);
+    default: return cudaErrorInvalidValue;  // FP4 needs N % 64 == 0
   }
 }
 
@@ -414,6 +483,18 @@ cudaError_t decode_gemm_argmax_fp8(const void* x, const void* wp, const float* w
     case 2: return launch<2, 8, 1, true, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys, wscale);
     case 3: return launch<3, 8, 1, true, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys, wscale);
     default: return launch<4, 8, 1, true, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys, wscale);
+  }
+}
+
+cudaError_t decode_gemm_fp4(const void* x, const void* wp, const void* scales, void* y, float* workspace,
+                            unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream) {
+  if (M < 1 || M > 64 || N % 64 != 0 || K % kKC != 0) return cudaErrorInvalidValue;
+  const DecodeGemmPlan p = decode_gemm_plan(N, K, sms);
+  switch ((M + 15) / 16) {
+    case 1: return launch_fp4<1>(p.row_groups, x, wp, scales, y, workspace, counters, M, N, K, p.splits, stream);
+    case 2: return launch_fp4<2>(p.row_groups, x, wp, scales, y, workspace, counters, M, N, K, p.splits, stream);
+    case 3: return launch_fp4<3>(p.row_groups, x, wp, scales, y, workspace, counters, M, N, K, p.splits, stream);
+    default: return launch_fp4<4>(p.row_groups, x, wp, scales, y, workspace, counters, M, N, K, p.splits, stream);
   }
 }
 

@@ -32,6 +32,11 @@ cudaError_t decode_gemm(const void* x, const void* wp, void* y, float* workspace
 cudaError_t decode_gemm_fp8(const void* x, const void* wp, const float* wscale, void* y, float* workspace,
                             unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream);
 
+// The same GEMM with MXFP4 weights (OCP MX: e2m1 codes, one E8M0 scale per 32 K), packed by
+// pack_weight_fp4: 4.25 bits per weight. N % 64 == 0. Same plan, workspace and counters.
+cudaError_t decode_gemm_fp4(const void* x, const void* wp, const void* scales, void* y, float* workspace,
+                            unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream);
+
 // LM head with the greedy pick fused: for each token m, keys[m] (zeroed before the call)
 // becomes the max over rows n of key(bf16(y[m][n]), n); the picked row is
 // 0xffffffff - (keys[m] & 0xffffffff). Ties go to the lowest row. y is never written.
