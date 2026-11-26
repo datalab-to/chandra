@@ -452,3 +452,43 @@ def test_viewer_http_endpoints(tmp_path: Path):
     )
     assert status == 400
     assert "Unsupported file type" in json.loads(body.decode("utf-8"))["error"]
+
+
+def test_olmocr_bench_keeps_workers_pages_in_flight(tmp_path: Path, monkeypatch):
+    pytest.importorskip("unicodeit")
+    import time
+
+    from chandra.scripts import olmocr_bench
+
+    pdf_dir = tmp_path / "pdfs" / "cat"
+    pdf_dir.mkdir(parents=True)
+    for i in range(7):
+        (pdf_dir / f"p{i}.pdf").write_bytes(b"%PDF-1.4")
+    monkeypatch.setattr(
+        olmocr_bench, "load_pdf_images", lambda *a, **k: [Image.new("RGB", (8, 8))]
+    )
+
+    lock = threading.Lock()
+    state = {"now": 0, "peak": 0}
+
+    class _Manager:
+        def __init__(self, method):
+            pass
+
+        def generate(self, items, **kwargs):
+            with lock:
+                state["now"] += 1
+                state["peak"] = max(state["peak"], state["now"])
+            time.sleep(0.05)
+            with lock:
+                state["now"] -= 1
+            return [SimpleNamespace(markdown="text") for _ in items]
+
+    monkeypatch.setattr(olmocr_bench, "InferenceManager", _Manager)
+    olmocr_bench.run_inference(
+        str(tmp_path), "cand", 300, 3, "http://localhost:8000/v1", apply_postprocess=False
+    )
+
+    outs = sorted(p.name for p in (tmp_path / "cand" / "cat").glob("*.md"))
+    assert outs == [f"p{i}_pg1_repeat1.md" for i in range(7)]
+    assert 2 <= state["peak"] <= 3  # several pages in flight, never more than --workers

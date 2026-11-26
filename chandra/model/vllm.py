@@ -50,6 +50,9 @@ def generate_vllm(
         api_key=vllm_api_key or settings.VLLM_API_KEY,
         base_url=normalized_base,
         default_headers=custom_headers,
+        # The client's default (10 minutes for the whole response) is shorter
+        # than a long page takes when many pages share the server.
+        timeout=settings.VLLM_TIMEOUT,
     )
     model_name = vllm_model_name if vllm_model_name is not None else settings.VLLM_MODEL_NAME
 

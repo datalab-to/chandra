@@ -168,7 +168,7 @@ chandra --install-skill
 - `--vllm-api-base TEXT`: Override `VLLM_API_BASE` URL
 - `--vllm-api-key TEXT`: Override `VLLM_API_KEY`
 - `--vllm-model-name TEXT`: Override `VLLM_MODEL_NAME`
-- `--batch-size INTEGER`: Pages per batch (default: 28 for vllm, 1 for hf)
+- `--batch-size INTEGER`: Pages per batch (default: all pages of a file for vllm, with `--max-workers` in flight; 1 for hf)
 - `--skill` / `--install-skill`: Print or install the bundled Chandra AI agent skill
 
 **Output Structure:**
