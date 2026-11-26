@@ -44,11 +44,15 @@ def main():
         flash_attn_varlen_func = None
         print("FA2 unavailable:", e)
     print(f"{'B':>3s} {'n_q':>3s} {'ctx':>5s} {'MB':>7s} {'ours us':>8s} {'GB/s':>5s} {'FA2 us':>8s} {'GB/s':>5s} {'x':>5s} "
-          f"{'1K-split us':>11s}")
+          f"{'1K-split us':>11s} {'INT8 KV us':>10s}")
     for b in a.batches:
         pages = math.ceil(a.ctx / PAGE)
         kc = torch.randn(b * pages, KVH, PAGE, D, device="cuda").to(torch.bfloat16)
         vc = torch.randn_like(kc)
+        k8 = torch.randint(-127, 128, kc.shape, device="cuda", dtype=torch.int8)  # INT8 KV: half the bytes
+        v8 = torch.randint(-127, 128, kc.shape, device="cuda", dtype=torch.int8)
+        ks = torch.rand(kc.shape[:3], device="cuda") * 0.02
+        vs = torch.rand(kc.shape[:3], device="cuda") * 0.02
         bt = torch.arange(b * pages, device="cuda", dtype=torch.int32).reshape(b, pages)
         ctx = torch.full((b,), a.ctx, dtype=torch.int32, device="cuda")
         # vLLM's layout for FA2: [blocks, 576, 4, 256], K and V interleaved per block.
@@ -69,6 +73,10 @@ def main():
                 lambda: chandra_cuda.attn_decode(q, gate, kc, vc, bt, ctx, n_q=n_q, max_ctx=a.ctx, out=out,
                                                  split_keys=1024), a.reps
             )
+            t_i8 = time_us(
+                lambda: chandra_cuda.attn_decode(q, gate, k8, v8, bt, ctx, n_q=n_q, max_ctx=a.ctx, out=out,
+                                                 k_scale=ks, v_scale=vs, split_keys=1024), a.reps
+            )
             t_fa = float("nan")
             if flash_attn_varlen_func is not None:
                 qf = q.contiguous()
@@ -82,8 +90,8 @@ def main():
                     a.reps,
                 )
             print(f"{b:3d} {n_q:3d} {a.ctx:5d} {mb:7.0f} {t_ours:8.1f} {mb / t_ours * 1e3:5.0f} "
-                  f"{t_fa:8.1f} {mb / t_fa * 1e3:5.0f} {t_fa / t_ours:5.2f} {t_fix:11.1f}")
-        del kc, vc, phys, kf, vf
+                  f"{t_fa:8.1f} {mb / t_fa * 1e3:5.0f} {t_fa / t_ours:5.2f} {t_fix:11.1f} {t_i8:10.1f}")
+        del kc, vc, phys, kf, vf, k8, v8
         torch.cuda.empty_cache()
 
 
