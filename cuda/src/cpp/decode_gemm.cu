@@ -250,23 +250,26 @@ cudaError_t launch_rw(int rw, const void* x, const void* wp, void* y, float* ws,
 }  // namespace
 
 DecodeGemmPlan decode_gemm_plan(int N, int K, int sms) {
-  // Aim for two resident CTAs per SM. Prefer wide row tiles (one K slice per
-  // warp); narrow GEMMs split K across warps, and only GEMMs with fewer 16-row
-  // groups than CTAs split K across CTAs.
-  const int target = 2 * sms;
+  // A CTA's x chunk is re-read from L2 by every CTA, so x traffic per weight byte is
+  // (padded tokens) / (rows per CTA): take the widest row tile (128 rows). GEMMs with
+  // fewer tiles than SMs split K across CTAs, using the largest split (dividing K's
+  // chunks) that does not exceed one CTA per SM, so the FP32 partials stay small.
+  // One CTA per SM keeps 8 warps x kDepth x 512 B = 16 KB of weights in flight per SM,
+  // about 3x what DRAM latency needs.
   const int chunks = K / kKC;
-  for (int rw : {8, 4, 2}) {
-    if (N % (16 * rw) == 0 && N / (16 * rw) >= target) return {rw, 1};
-  }
-  const int tiles = N / 16;
+  const int rw = N % 128 == 0 ? 8 : N % 64 == 0 ? 4 : N % 32 == 0 ? 2 : 1;
+  const int tiles = N / (16 * rw);
   int splits = 1;
-  for (int s = std::min(std::max(1, target / tiles), chunks); s >= 1; --s) {
-    if (chunks % s == 0) {
-      splits = s;
-      break;
+  if (tiles < sms) {
+    const int want = std::max(1, sms / tiles);
+    for (int s = std::min(want, chunks); s >= 1; --s) {
+      if (chunks % s == 0) {
+        splits = s;
+        break;
+      }
     }
   }
-  return {1, splits};
+  return {rw, splits};
 }
 
 size_t decode_gemm_workspace_bytes(int N, int K, int sms) {
