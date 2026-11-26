@@ -11,7 +11,7 @@ import torch
 from . import _core
 
 __all__ = ["pack_weight", "pack_weight_fp8", "DecodeLinear", "DecodeLinearFP8", "DecodeLinearFP4", "mxfp4_quantize",
-           "pack_weight_fp4", "pack_weight_i8", "LMHead", "LMHeadFP8", "LMHeadExact", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul",
+           "pack_weight_fp4", "pack_weight_i8", "interleave_gate_up", "LMHead", "LMHeadFP8", "LMHeadExact", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul",
            "qk_norm_rope_kv", "vit_attn"]
 
 
@@ -149,6 +149,13 @@ def attn_decode(
     return out
 
 
+def interleave_gate_up(w: torch.Tensor) -> torch.Tensor:
+    """[gate; up] (2F rows) -> 16-row groups of 8 gate rows then the same 8 up rows, the row
+    order of the decode GEMM's silu_mul epilogue."""
+    f = w.shape[0] // 2
+    return torch.stack([w[:f].reshape(f // 8, 8, -1), w[f:].reshape(f // 8, 8, -1)], dim=1).reshape(2 * f, -1)
+
+
 def pack_weight(w: torch.Tensor) -> torch.Tensor:
     """Reorder a [N, K] BF16 weight for `DecodeLinear`.
 
@@ -180,7 +187,9 @@ class DecodeLinear:
     once (its workspace is shared).
     """
 
-    def __init__(self, weight: torch.Tensor, _pack: bool = True):
+    def __init__(self, weight: torch.Tensor, _pack: bool = True, epilogue: str | None = None):
+        """epilogue="silu_mul": weight is [gate; up] (2F rows) and the call returns
+        silu(x @ gate.T) * (x @ up.T), [M, F], exactly as silu_mul of the two BF16 outputs."""
         if not weight.is_cuda:
             raise ValueError("weight must be on a CUDA device")
         self.n, self.k = weight.shape
@@ -188,6 +197,15 @@ class DecodeLinear:
         self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         if self.k % 128:
             raise ValueError("K must be a multiple of 128")
+        if epilogue not in (None, "silu_mul"):
+            raise ValueError(f"unknown epilogue {epilogue!r}")
+        self.epilogue = 1 if epilogue == "silu_mul" else 0
+        if self.epilogue:
+            if self.n % 16:
+                raise ValueError("silu_mul needs gate and up of a multiple of 8 rows each")
+            weight = interleave_gate_up(weight)
+        self.n_out = self.n // 2 if self.epilogue else self.n
+        self._prep = None if _pack else weight  # for the quantized subclasses
         self.packed = pack_weight(weight) if _pack else None
         ws = _core.decode_gemm_workspace_bytes(self.n, self.k, self.sms)
         self.workspace = torch.empty(max(ws // 4, 1), dtype=torch.float32, device=self.device)
@@ -204,7 +222,7 @@ class DecodeLinear:
             raise ValueError("M must be between 1 and 64")
         x = x.contiguous()
         if out is None:
-            out = torch.empty(m, self.n, dtype=torch.bfloat16, device=self.device)
+            out = torch.empty(m, self.n_out, dtype=torch.bfloat16, device=self.device)
         _core.decode_gemm(
             x.data_ptr(),
             self.packed.data_ptr(),
@@ -216,6 +234,7 @@ class DecodeLinear:
             self.k,
             self.sms,
             torch.cuda.current_stream(self.device).cuda_stream,
+            self.epilogue,
         )
         return out
 
@@ -322,11 +341,12 @@ class DecodeLinearFP8(DecodeLinear):
     """DecodeLinear with FP8 e4m3 weights (per-row scales): half the weight bytes per step.
     Approximate (class G): y = x @ (scale[:, None] * fp8(weight / scale[:, None])).T."""
 
-    def __init__(self, weight: torch.Tensor):
+    def __init__(self, weight: torch.Tensor, epilogue: str | None = None):
         if weight.shape[0] % 32:
             raise ValueError("N must be a multiple of 32")
-        super().__init__(weight, _pack=False)  # shapes and the split workspace only
-        self.packed, self.scale = pack_weight_fp8(weight)
+        super().__init__(weight, _pack=False, epilogue=epilogue)  # shapes and the split workspace only
+        w, self._prep = self._prep, None
+        self.packed, self.scale = pack_weight_fp8(w)
 
     def dequantized(self) -> torch.Tensor:
         """The weight this layer actually multiplies by, as FP32 (for checks)."""
@@ -348,11 +368,11 @@ class DecodeLinearFP8(DecodeLinear):
             raise ValueError("M must be between 1 and 64")
         x = x.contiguous()
         if out is None:
-            out = torch.empty(m, self.n, dtype=torch.bfloat16, device=self.device)
+            out = torch.empty(m, self.n_out, dtype=torch.bfloat16, device=self.device)
         _core.decode_gemm_fp8(
             x.data_ptr(), self.packed.data_ptr(), self.scale.data_ptr(), out.data_ptr(),
             self.workspace.data_ptr(), self.counters.data_ptr(), m, self.n, self.k, self.sms,
-            torch.cuda.current_stream(self.device).cuda_stream,
+            torch.cuda.current_stream(self.device).cuda_stream, self.epilogue,
         )
         return out
 
@@ -490,11 +510,12 @@ class DecodeLinearFP4(DecodeLinear):
     online `mxfp4`): 4.25 bits per weight, a quarter of BF16's bytes. Approximate (class G):
     y = x @ mxfp4_dequantize(mxfp4_quantize(weight)).T. N must be a multiple of 64."""
 
-    def __init__(self, weight: torch.Tensor, keep_codes: bool = False):
+    def __init__(self, weight: torch.Tensor, keep_codes: bool = False, epilogue: str | None = None):
         if weight.shape[0] % 64:
             raise ValueError("N must be a multiple of 64")
-        super().__init__(weight, _pack=False)
-        codes, exps = mxfp4_quantize(weight)
+        super().__init__(weight, _pack=False, epilogue=epilogue)
+        w, self._prep = self._prep, None
+        codes, exps = mxfp4_quantize(w)
         self.codes, self.exps = (codes, exps) if keep_codes else (None, None)  # for dequantized()
         self.packed, self.scales = pack_weight_fp4(codes, exps)
 
@@ -511,10 +532,10 @@ class DecodeLinearFP4(DecodeLinear):
             raise ValueError("M must be between 1 and 64")
         x = x.contiguous()
         if out is None:
-            out = torch.empty(m, self.n, dtype=torch.bfloat16, device=self.device)
+            out = torch.empty(m, self.n_out, dtype=torch.bfloat16, device=self.device)
         _core.decode_gemm_fp4(x.data_ptr(), self.packed.data_ptr(), self.scales.data_ptr(), out.data_ptr(),
                               self.workspace.data_ptr(), self.counters.data_ptr(), m, self.n, self.k, self.sms,
-                              torch.cuda.current_stream(self.device).cuda_stream)
+                              torch.cuda.current_stream(self.device).cuda_stream, self.epilogue)
         return out
 
 

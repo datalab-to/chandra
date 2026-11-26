@@ -150,6 +150,12 @@ __device__ __forceinline__ float ord2f(unsigned o) {
 }
 __device__ __forceinline__ float bf16r(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
 
+// The SILU epilogue: what silu_mul computes from BF16 gate and up outputs, bit for bit.
+__device__ __forceinline__ __nv_bfloat16 silu_mul_bf16(float gate, float up) {
+  const float g = bf16r(gate), u = bf16r(up);
+  return __float2bfloat16_rn(g / (1.f + expf(-g)) * u);
+}
+
 // NP: pairs of n8 token tiles (M <= 16 * NP). RW x KW = kWarps. ARGMAX: instead of
 // writing y, reduce each token's greedy pick into keys[token] (an LM head that never
 // writes its logits); needs splits == 1. FP8: W holds e4m3 bytes (one 16-byte load per
@@ -168,8 +174,10 @@ struct BoundArgs {
   unsigned* lb_key;    // [M]
 };
 
+// SILU: W rows come in 16-row groups of 8 gate rows then their 8 up rows (interleave_gate_up),
+// and y[m][8 * group + r] = silu_mul(gate row, up row): the MLP's activation, y of N / 2 columns.
 template <int NP, int RW, int KW, bool ARGMAX = false, bool FP8 = false, bool FP4 = false, bool I8 = false,
-          bool BOUND = false>
+          bool BOUND = false, bool SILU = false>
 __global__ void __launch_bounds__(kThreads, 2)
     decode_gemm_kernel(const __nv_bfloat16* __restrict__ x, const uint4* __restrict__ wp,
                        __nv_bfloat16* __restrict__ y, float* __restrict__ partial,
@@ -416,6 +424,16 @@ __global__ void __launch_bounds__(kThreads, 2)
   }
 
   if (splits == 1) {
+    if constexpr (SILU) {  // rows gid (gate) and gid + 8 (up) of this group make one output column
+      const int NO = N / 2, col = g * 8 + gid;
+#pragma unroll
+      for (int t = 0; t < 2 * NP; ++t) {
+        const int tok = t * 8 + tig * 2;
+        if (tok < M) y[static_cast<size_t>(tok) * NO + col] = silu_mul_bf16(acc[t][0], acc[t][2]);
+        if (tok + 1 < M) y[static_cast<size_t>(tok + 1) * NO + col] = silu_mul_bf16(acc[t][1], acc[t][3]);
+      }
+      return;
+    }
 #pragma unroll
     for (int t = 0; t < 2 * NP; ++t) {
       const int tok = t * 8 + tig * 2;
@@ -452,60 +470,89 @@ __global__ void __launch_bounds__(kThreads, 2)
   __threadfence();
   const int rows = RW * 16, r0 = tile * rows;
   const int tid = rw * 32 + lane;
-  for (int i = tid; i < rows * M; i += kWriters * 32) {
-    const int tok = i / rows, r = r0 + i % rows;
-    float sum = 0.f;
-    for (int s2 = 0; s2 < splits; ++s2)
-      sum += __ldcg(partial + (static_cast<size_t>(s2) * N + r) * MP + tok);
-    y[static_cast<size_t>(tok) * N + r] = __float2bfloat16_rn(sum);
+  if constexpr (SILU) {
+    const int NO = N / 2, half = rows / 2;
+    for (int i = tid; i < half * M; i += kWriters * 32) {
+      const int tok = i / half, j = i % half;
+      const int r = r0 + (j >> 3) * 16 + (j & 7);
+      float sg = 0.f, su = 0.f;
+      for (int s2 = 0; s2 < splits; ++s2) {
+        sg += __ldcg(partial + (static_cast<size_t>(s2) * N + r) * MP + tok);
+        su += __ldcg(partial + (static_cast<size_t>(s2) * N + r + 8) * MP + tok);
+      }
+      y[static_cast<size_t>(tok) * NO + r0 / 2 + j] = silu_mul_bf16(sg, su);
+    }
+  } else {
+    for (int i = tid; i < rows * M; i += kWriters * 32) {
+      const int tok = i / rows, r = r0 + i % rows;
+      float sum = 0.f;
+      for (int s2 = 0; s2 < splits; ++s2)
+        sum += __ldcg(partial + (static_cast<size_t>(s2) * N + r) * MP + tok);
+      y[static_cast<size_t>(tok) * N + r] = __float2bfloat16_rn(sum);
+    }
   }
   if (tid == 0) counters[tile] = 0;
 }
 
 template <int NP, int RW, int KW, bool ARGMAX = false, bool FP8 = false, bool FP4 = false, bool I8 = false,
-          bool BOUND = false>
+          bool BOUND = false, bool SILU = false>
 cudaError_t launch(const void* x, const void* wp, void* y, float* ws, unsigned* counters, int M, int N,
                    int K, int splits, cudaStream_t stream, unsigned long long* keys = nullptr,
                    const float* wscale = nullptr, BoundArgs bnd = {}) {
   constexpr int smem = 2 * NP * 16 * kRowBytes;
   const dim3 grid(N / (16 * RW), splits);
-  decode_gemm_kernel<NP, RW, KW, ARGMAX, FP8, FP4, I8, BOUND><<<grid, kThreads, smem, stream>>>(
+  decode_gemm_kernel<NP, RW, KW, ARGMAX, FP8, FP4, I8, BOUND, SILU><<<grid, kThreads, smem, stream>>>(
       static_cast<const __nv_bfloat16*>(x), static_cast<const uint4*>(wp), static_cast<__nv_bfloat16*>(y),
       ws, counters, M, N, K, splits, keys, wscale, bnd);
   return cudaGetLastError();
 }
 
-template <int NP>
-cudaError_t launch_fp8(int rw, const void* x, const void* wp, const float* wscale, void* y, float* ws,
+// Weight format (FP8 / FP4 / BF16) and epilogue for one decode GEMM; invalid row-group counts
+// for a format (it needs whole W loads per warp per chunk) are not instantiated.
+template <int NP, bool FP8, bool FP4, bool SILU>
+cudaError_t launch_fmt(int rw, const void* x, const void* wp, const float* sc, void* y, float* ws,
                        unsigned* counters, int M, int N, int K, int splits, cudaStream_t stream) {
   switch (rw) {
-    case 8: return launch<NP, 8, 1, false, true>(x, wp, y, ws, counters, M, N, K, splits, stream, nullptr, wscale);
-    case 4: return launch<NP, 4, 2, false, true>(x, wp, y, ws, counters, M, N, K, splits, stream, nullptr, wscale);
-    case 2: return launch<NP, 2, 4, false, true>(x, wp, y, ws, counters, M, N, K, splits, stream, nullptr, wscale);
-    default: return cudaErrorInvalidValue;  // FP8 needs N % 32 == 0
+    case 8:
+      return launch<NP, 8, 1, false, FP8, FP4, false, false, SILU>(x, wp, y, ws, counters, M, N, K, splits, stream,
+                                                                   nullptr, sc);
+    case 4:
+      return launch<NP, 4, 2, false, FP8, FP4, false, false, SILU>(x, wp, y, ws, counters, M, N, K, splits, stream,
+                                                                   nullptr, sc);
+    case 2:
+      if constexpr (!FP4)
+        return launch<NP, 2, 4, false, FP8, FP4, false, false, SILU>(x, wp, y, ws, counters, M, N, K, splits,
+                                                                     stream, nullptr, sc);
+      else
+        return cudaErrorInvalidValue;  // FP4 needs N % 64 == 0
+    default:
+      if constexpr (!FP4 && !FP8)
+        return launch<NP, 1, 8, false, FP8, FP4, false, false, SILU>(x, wp, y, ws, counters, M, N, K, splits,
+                                                                     stream, nullptr, sc);
+      else
+        return cudaErrorInvalidValue;  // FP8 needs N % 32 == 0
   }
 }
 
-template <int NP>
-cudaError_t launch_fp4(int rw, const void* x, const void* wp, const void* sc, void* y, float* ws,
-                       unsigned* counters, int M, int N, int K, int splits, cudaStream_t stream) {
-  const float* s = static_cast<const float*>(sc);
-  switch (rw) {
-    case 8: return launch<NP, 8, 1, false, false, true>(x, wp, y, ws, counters, M, N, K, splits, stream, nullptr, s);
-    case 4: return launch<NP, 4, 2, false, false, true>(x, wp, y, ws, counters, M, N, K, splits, stream, nullptr, s);
-    default: return cudaErrorInvalidValue;  // FP4 needs N % 64 == 0
+template <bool FP8, bool FP4>
+cudaError_t gemm_entry(const void* x, const void* wp, const float* sc, void* y, float* ws, unsigned* counters, int M,
+                       int N, int K, int sms, int epilogue, cudaStream_t stream) {
+  if (epilogue != 0 && epilogue != 1) return cudaErrorInvalidValue;
+  const DecodeGemmPlan p = decode_gemm_plan(N, K, sms);
+#define CHANDRA_GEMM_CASE(NPV)                                                                                  \
+  case NPV:                                                                                                    \
+    return epilogue ? launch_fmt<NPV, FP8, FP4, true>(p.row_groups, x, wp, sc, y, ws, counters, M, N, K, p.splits, \
+                                                      stream)                                                  \
+                    : launch_fmt<NPV, FP8, FP4, false>(p.row_groups, x, wp, sc, y, ws, counters, M, N, K,       \
+                                                       p.splits, stream);
+  switch ((M + 15) / 16) {
+    CHANDRA_GEMM_CASE(1)
+    CHANDRA_GEMM_CASE(2)
+    CHANDRA_GEMM_CASE(3)
+    default:
+    CHANDRA_GEMM_CASE(4)
   }
-}
-
-template <int NP>
-cudaError_t launch_rw(int rw, const void* x, const void* wp, void* y, float* ws, unsigned* counters,
-                      int M, int N, int K, int splits, cudaStream_t stream) {
-  switch (rw) {
-    case 8: return launch<NP, 8, 1>(x, wp, y, ws, counters, M, N, K, splits, stream);
-    case 4: return launch<NP, 4, 2>(x, wp, y, ws, counters, M, N, K, splits, stream);
-    case 2: return launch<NP, 2, 4>(x, wp, y, ws, counters, M, N, K, splits, stream);
-    default: return launch<NP, 1, 8>(x, wp, y, ws, counters, M, N, K, splits, stream);
-  }
+#undef CHANDRA_GEMM_CASE
 }
 
 }  // namespace
@@ -544,16 +591,9 @@ int decode_gemm_counters(int N, int K, int sms) {
 }
 
 cudaError_t decode_gemm(const void* x, const void* wp, void* y, float* workspace, unsigned* counters,
-                        int M, int N, int K, int sms, cudaStream_t stream) {
+                        int M, int N, int K, int sms, cudaStream_t stream, int epilogue) {
   if (M < 1 || M > 64 || N % 16 != 0 || K % kKC != 0) return cudaErrorInvalidValue;
-  const DecodeGemmPlan p = decode_gemm_plan(N, K, sms);
-  const int np = (M + 15) / 16;
-  switch (np) {
-    case 1: return launch_rw<1>(p.row_groups, x, wp, y, workspace, counters, M, N, K, p.splits, stream);
-    case 2: return launch_rw<2>(p.row_groups, x, wp, y, workspace, counters, M, N, K, p.splits, stream);
-    case 3: return launch_rw<3>(p.row_groups, x, wp, y, workspace, counters, M, N, K, p.splits, stream);
-    default: return launch_rw<4>(p.row_groups, x, wp, y, workspace, counters, M, N, K, p.splits, stream);
-  }
+  return gemm_entry<false, false>(x, wp, nullptr, y, workspace, counters, M, N, K, sms, epilogue, stream);
 }
 
 cudaError_t decode_gemm_argmax(const void* x, const void* wp, unsigned long long* keys, int M, int N, int K,
@@ -607,27 +647,16 @@ cudaError_t decode_gemm_argmax_fp8(const void* x, const void* wp, const float* w
 }
 
 cudaError_t decode_gemm_fp4(const void* x, const void* wp, const void* scales, void* y, float* workspace,
-                            unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream) {
+                            unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream, int epilogue) {
   if (M < 1 || M > 64 || N % 64 != 0 || K % kKC != 0) return cudaErrorInvalidValue;
-  const DecodeGemmPlan p = decode_gemm_plan(N, K, sms);
-  switch ((M + 15) / 16) {
-    case 1: return launch_fp4<1>(p.row_groups, x, wp, scales, y, workspace, counters, M, N, K, p.splits, stream);
-    case 2: return launch_fp4<2>(p.row_groups, x, wp, scales, y, workspace, counters, M, N, K, p.splits, stream);
-    case 3: return launch_fp4<3>(p.row_groups, x, wp, scales, y, workspace, counters, M, N, K, p.splits, stream);
-    default: return launch_fp4<4>(p.row_groups, x, wp, scales, y, workspace, counters, M, N, K, p.splits, stream);
-  }
+  return gemm_entry<false, true>(x, wp, static_cast<const float*>(scales), y, workspace, counters, M, N, K, sms,
+                                 epilogue, stream);
 }
 
 cudaError_t decode_gemm_fp8(const void* x, const void* wp, const float* wscale, void* y, float* workspace,
-                            unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream) {
+                            unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream, int epilogue) {
   if (M < 1 || M > 64 || N % 32 != 0 || K % kKC != 0) return cudaErrorInvalidValue;
-  const DecodeGemmPlan p = decode_gemm_plan(N, K, sms);
-  switch ((M + 15) / 16) {
-    case 1: return launch_fp8<1>(p.row_groups, x, wp, wscale, y, workspace, counters, M, N, K, p.splits, stream);
-    case 2: return launch_fp8<2>(p.row_groups, x, wp, wscale, y, workspace, counters, M, N, K, p.splits, stream);
-    case 3: return launch_fp8<3>(p.row_groups, x, wp, wscale, y, workspace, counters, M, N, K, p.splits, stream);
-    default: return launch_fp8<4>(p.row_groups, x, wp, wscale, y, workspace, counters, M, N, K, p.splits, stream);
-  }
+  return gemm_entry<true, false>(x, wp, wscale, y, workspace, counters, M, N, K, sms, epilogue, stream);
 }
 
 }  // namespace chandra

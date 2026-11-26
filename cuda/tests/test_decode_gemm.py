@@ -191,3 +191,16 @@ def test_exact_lm_head_equals_bf16_head():
     assert torch.equal(chandra_cuda.LMHeadExact(w2, h2)(x), h2(x))
     print("mean candidate tiles per token:", [round(c, 1) for c in cands])
 
+
+@pytest.mark.parametrize("fmt", ["bf16", "fp8", "fp4"])
+@pytest.mark.parametrize("f,k", [(9216, 2560), (1024, 2560)])  # the MLP; a narrow one, split along K
+def test_silu_mul_epilogue_equals_separate_ops(fmt, f, k):
+    torch.manual_seed(f + k)
+    w = (torch.randn(2 * f, k, device="cuda") * 0.02).to(torch.bfloat16)
+    cls = {"bf16": chandra_cuda.DecodeLinear, "fp8": chandra_cuda.DecodeLinearFP8,
+           "fp4": chandra_cuda.DecodeLinearFP4}[fmt]
+    plain, fused = cls(w), cls(w, epilogue="silu_mul")
+    for m in (1, 9, 33, 64):
+        x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
+        assert torch.equal(fused(x), chandra_cuda.silu_mul(plain(x))), (fmt, m)
+

@@ -25,14 +25,14 @@ NB_MODULE(_core, m) {
   m.def(
       "decode_gemm",
       [](uintptr_t x, uintptr_t wp, uintptr_t y, uintptr_t workspace, uintptr_t counters, int M, int N,
-         int K, int sms, uintptr_t stream) {
+         int K, int sms, uintptr_t stream, int epilogue) {
         check(chandra::decode_gemm(reinterpret_cast<const void*>(x), reinterpret_cast<const void*>(wp),
                                    reinterpret_cast<void*>(y), reinterpret_cast<float*>(workspace),
                                    reinterpret_cast<unsigned*>(counters), M, N, K, sms,
-                                   reinterpret_cast<cudaStream_t>(stream)));
+                                   reinterpret_cast<cudaStream_t>(stream), epilogue));
       },
       nb::arg("x"), nb::arg("wp"), nb::arg("y"), nb::arg("workspace"), nb::arg("counters"), nb::arg("M"),
-      nb::arg("N"), nb::arg("K"), nb::arg("sms"), nb::arg("stream"));
+      nb::arg("N"), nb::arg("K"), nb::arg("sms"), nb::arg("stream"), nb::arg("epilogue") = 0);
 
   m.def(
       "decode_gemm_plan",
@@ -42,12 +42,13 @@ NB_MODULE(_core, m) {
       },
       nb::arg("N"), nb::arg("K"), nb::arg("sms"));
   m.def("decode_gemm_fp8", [](uintptr_t x, uintptr_t wp, uintptr_t wscale, uintptr_t y, uintptr_t workspace,
-                              uintptr_t counters, int M, int N, int K, int sms, uintptr_t stream) {
+                              uintptr_t counters, int M, int N, int K, int sms, uintptr_t stream, int epilogue) {
     check(chandra::decode_gemm_fp8(reinterpret_cast<const void*>(x), reinterpret_cast<const void*>(wp),
                                    reinterpret_cast<const float*>(wscale), reinterpret_cast<void*>(y),
                                    reinterpret_cast<float*>(workspace), reinterpret_cast<unsigned*>(counters), M, N,
-                                   K, sms, reinterpret_cast<cudaStream_t>(stream)));
-  });
+                                   K, sms, reinterpret_cast<cudaStream_t>(stream), epilogue));
+  }, nb::arg("x"), nb::arg("wp"), nb::arg("wscale"), nb::arg("y"), nb::arg("workspace"), nb::arg("counters"),
+     nb::arg("M"), nb::arg("N"), nb::arg("K"), nb::arg("sms"), nb::arg("stream"), nb::arg("epilogue") = 0);
   m.def(
       "decode_gemm_argmax",
       [](uintptr_t x, uintptr_t wp, uintptr_t keys, int M, int N, int K, int sms, uintptr_t stream) {
@@ -56,12 +57,13 @@ NB_MODULE(_core, m) {
                                           reinterpret_cast<cudaStream_t>(stream)));
       });
   m.def("decode_gemm_fp4", [](uintptr_t x, uintptr_t wp, uintptr_t sc, uintptr_t y, uintptr_t workspace,
-                              uintptr_t counters, int M, int N, int K, int sms, uintptr_t stream) {
+                              uintptr_t counters, int M, int N, int K, int sms, uintptr_t stream, int epilogue) {
     check(chandra::decode_gemm_fp4(reinterpret_cast<const void*>(x), reinterpret_cast<const void*>(wp),
                                    reinterpret_cast<const void*>(sc), reinterpret_cast<void*>(y),
                                    reinterpret_cast<float*>(workspace), reinterpret_cast<unsigned*>(counters), M, N,
-                                   K, sms, reinterpret_cast<cudaStream_t>(stream)));
-  });
+                                   K, sms, reinterpret_cast<cudaStream_t>(stream), epilogue));
+  }, nb::arg("x"), nb::arg("wp"), nb::arg("sc"), nb::arg("y"), nb::arg("workspace"), nb::arg("counters"),
+     nb::arg("M"), nb::arg("N"), nb::arg("K"), nb::arg("sms"), nb::arg("stream"), nb::arg("epilogue") = 0);
   m.def("lm_head_bound_i8", [](uintptr_t x, uintptr_t wp, uintptr_t wscale, uintptr_t rowc, uintptr_t xnorm,
                                uintptr_t tile_ub, uintptr_t lb_key, int M, int N, int K, uintptr_t stream) {
     check(chandra::lm_head_bound_i8(reinterpret_cast<const void*>(x), reinterpret_cast<const void*>(wp),

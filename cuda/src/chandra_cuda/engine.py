@@ -63,7 +63,8 @@ class Decoder:
                 type="full_attention",
                 w_in=g(p + "input_layernorm.weight"),
                 w_post=g(p + "post_attention_layernorm.weight"),
-                gate_up=DecodeLinear(torch.cat([g(p + "mlp.gate_proj.weight"), g(p + "mlp.up_proj.weight")])),
+                gate_up=DecodeLinear(torch.cat([g(p + "mlp.gate_proj.weight"), g(p + "mlp.up_proj.weight")]),
+                                     epilogue="silu_mul"),
                 down=DecodeLinear(g(p + "mlp.down_proj.weight")),
                 qkv=DecodeLinear(torch.cat([g(a + "q_proj.weight"), g(a + "k_proj.weight"), g(a + "v_proj.weight")])),
                 o=DecodeLinear(g(a + "o_proj.weight")),
@@ -82,10 +83,13 @@ class Decoder:
                 type=t,
                 w_in=g(p + "input_layernorm.weight"),
                 w_post=g(p + "post_attention_layernorm.weight"),
-                gate_up=DecodeLinear(torch.cat([g(p + "mlp.gate_proj.weight"), g(p + "mlp.up_proj.weight")])),
+                gate_up=DecodeLinear(torch.cat([g(p + "mlp.gate_proj.weight"), g(p + "mlp.up_proj.weight")]),
+                                     epilogue="silu_mul"),
                 down=DecodeLinear(g(p + "mlp.down_proj.weight")),
-                qkvz=DecodeLinear(torch.cat([g(a + "in_proj_qkv.weight"), g(a + "in_proj_z.weight")])),
-                ba=DecodeLinear(torch.cat([g(a + "in_proj_b.weight"), g(a + "in_proj_a.weight")])),
+                # One GEMM for qkv | z | b | a, padded to 12,416 rows (a whole number of 128-row tiles).
+                qkvzba=DecodeLinear(torch.cat([g(a + "in_proj_qkv.weight"), g(a + "in_proj_z.weight"),
+                                               g(a + "in_proj_b.weight"), g(a + "in_proj_a.weight"),
+                                               torch.zeros(64, 2560, dtype=torch.bfloat16, device=self.device)])),
                 out=DecodeLinear(g(a + "out_proj.weight")),
                 conv_w=g(a + "conv1d.weight").reshape(8192, 4).contiguous(),
                 A_log=g(a + "A_log").float(),
@@ -191,10 +195,10 @@ class Decoder:
         for L in self.layers:
             xn, res = rmsnorm_add(res, L["w_in"], x=prev)
             if L["type"] == "linear_attention":
-                qkvz = _rows(L["qkvz"], xn)
-                ba = _rows(L["ba"], xn)
+                y4 = _rows(L["qkvzba"], xn)
                 hist = L.get("hist")
-                o = gdn_decode(qkvz[:, :8192], qkvz[:, 8192:], ba[:, :32], ba[:, 32:], L["A_log"], L["dt_bias"],
+                o = gdn_decode(y4[:, :8192], y4[:, 8192:12288], y4[:, 12288:12320], y4[:, 12320:12352],
+                               L["A_log"], L["dt_bias"],
                                L["conv_w"], L["norm_w"], L["state"], slot, slot, L["ring"], slot, lens, T=T,
                                n_replay=n_rep, hist_in=hist if n_rep is not None else None,
                                hist_out=hist if commit else None, commit=commit)
@@ -202,7 +206,7 @@ class Decoder:
             else:
                 y = self._attention(L, xn, pos3, page, in_page, bt, ctx, T, max_ctx)
             xn, res = rmsnorm_add(res, L["w_post"], x=y)
-            prev = _rows(L["down"], silu_mul(_rows(L["gate_up"], xn)))
+            prev = _rows(L["down"], _rows(L["gate_up"], xn))
         hidden, _ = rmsnorm_add(res, self.final_w, x=prev)
         for s in seqs:
             self.pending[s] = 0
@@ -266,7 +270,7 @@ class Decoder:
         xn, res = rmsnorm_add(x, M["w_in"])
         y = self._attention(M, xn, pos3, page, in_page, bt, st + T, T, max(start) + T)
         xn, res = rmsnorm_add(res, M["w_post"], x=y)
-        z = _rows(M["down"], silu_mul(_rows(M["gate_up"], xn)))
+        z = _rows(M["down"], _rows(M["gate_up"], xn))
         h, _ = rmsnorm_add(res, M["w_norm"], x=z)
         return h, _rows(self.draft_head, h)
 

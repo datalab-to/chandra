@@ -20,22 +20,23 @@ DecodeGemmPlan decode_gemm_plan(int N, int K, int sms);
 size_t decode_gemm_workspace_bytes(int N, int K, int sms);
 int decode_gemm_counters(int N, int K, int sms);
 
-// x: [M][K] BF16 row-major. wp: W packed by `pack_weight` (see the Python side).
+// x: [M][K] BF16 row-major. wp: W packed by `pack_weight` (see the Python side). epilogue 0:
+// y = x W^T; 1: W's rows are interleave_gate_up(gate; up) and y = silu(gate) * up, [M][N / 2].
 // y: [M][N] BF16 row-major. workspace/counters: from the sizes above; counters
 // must be zero before the first call and are left at zero after each call.
 cudaError_t decode_gemm(const void* x, const void* wp, void* y, float* workspace,
                         unsigned* counters, int M, int N, int K, int sms,
-                        cudaStream_t stream);
+                        cudaStream_t stream, int epilogue = 0);
 
 // The same GEMM with FP8 e4m3 weights (packed by pack_weight_fp8) and one FP32 scale per
 // output row: y = x * (scale[n] * W8[n])^T. Same plan, workspace and counters.
 cudaError_t decode_gemm_fp8(const void* x, const void* wp, const float* wscale, void* y, float* workspace,
-                            unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream);
+                            unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream, int epilogue = 0);
 
 // The same GEMM with MXFP4 weights (OCP MX: e2m1 codes, one E8M0 scale per 32 K), packed by
 // pack_weight_fp4: 4.25 bits per weight. N % 64 == 0. Same plan, workspace and counters.
 cudaError_t decode_gemm_fp4(const void* x, const void* wp, const void* scales, void* y, float* workspace,
-                            unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream);
+                            unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream, int epilogue = 0);
 
 // The exact LM head from INT8 weights. lm_head_bound_i8: INT8 sign-magnitude weights in the
 // FP8 layout with per-row scales; per 128-row tile and token an upper bound of the BF16 head's
