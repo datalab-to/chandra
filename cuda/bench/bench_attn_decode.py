@@ -2,8 +2,9 @@
 
 KV bytes per call = B x ctx x 4 KV heads x 256 x 2 (K, V) x 2 bytes. Reports µs and
 GB/s per batch size and query tokens per sequence (1 = decode, 4 = verify of 3
-draft tokens). FA2 runs on a contiguous cache (its paged path needs other page
-sizes); its time does not include the sigmoid gate, ours does.
+draft tokens). FA2 is called as vLLM calls it for this model: flash_attn_varlen_func
+on a paged cache of 576-token blocks, causal. Its time does not include the sigmoid
+gate; ours does.
 
 usage: python bench_attn_decode.py [--ctx 7995] [--batches 1 8 32 64] [--reps 20]
 """
@@ -38,9 +39,9 @@ def main():
     ap.add_argument("--reps", type=int, default=20)
     a = ap.parse_args()
     try:
-        from vllm.vllm_flash_attn import flash_attn_with_kvcache
+        from vllm.vllm_flash_attn import flash_attn_varlen_func
     except Exception as e:  # noqa: BLE001
-        flash_attn_with_kvcache = None
+        flash_attn_varlen_func = None
         print("FA2 unavailable:", e)
     print(f"{'B':>3s} {'n_q':>3s} {'ctx':>5s} {'MB':>7s} {'ours us':>8s} {'GB/s':>5s} {'FA2 us':>8s} {'GB/s':>5s} {'x':>5s}")
     for b in a.batches:
@@ -49,9 +50,12 @@ def main():
         vc = torch.randn_like(kc)
         bt = torch.arange(b * pages, device="cuda", dtype=torch.int32).reshape(b, pages)
         ctx = torch.full((b,), a.ctx, dtype=torch.int32, device="cuda")
-        # Contiguous copies for FA2: [B, ctx, 4, 256].
-        kf = kc.reshape(b, pages, KVH, PAGE, D).permute(0, 1, 3, 2, 4).reshape(b, pages * PAGE, KVH, D)
-        vf = vc.reshape(b, pages, KVH, PAGE, D).permute(0, 1, 3, 2, 4).reshape(b, pages * PAGE, KVH, D)
+        # vLLM's layout for FA2: [blocks, 576, 4, 256], K and V interleaved per block.
+        fbs = 576
+        fblocks = math.ceil(a.ctx / fbs)
+        phys = torch.randn(b * fblocks, fbs, KVH, 2 * D, device="cuda").to(torch.bfloat16)
+        kf, vf = phys[..., :D], phys[..., D:]
+        fbt = torch.arange(b * fblocks, device="cuda", dtype=torch.int32).reshape(b, fblocks)
         mb = b * a.ctx * KVH * D * 2 * 2 / 1e6
         for n_q in (1, 4):
             qg = torch.randn(b * n_q, H, 2 * D, device="cuda").to(torch.bfloat16)
@@ -61,17 +65,20 @@ def main():
                 lambda: chandra_cuda.attn_decode(q, gate, kc, vc, bt, ctx, n_q=n_q, max_ctx=a.ctx, out=out), a.reps
             )
             t_fa = float("nan")
-            if flash_attn_with_kvcache is not None:
-                qf = q.reshape(b, n_q, H, D).contiguous()
+            if flash_attn_varlen_func is not None:
+                qf = q.contiguous()
+                of = torch.empty_like(qf)
+                cu = torch.arange(0, b * n_q + 1, n_q, dtype=torch.int32, device="cuda")
                 t_fa = time_us(
-                    lambda: flash_attn_with_kvcache(
-                        qf, kf, vf, cache_seqlens=ctx, softmax_scale=1 / 16.0, causal=True
+                    lambda: flash_attn_varlen_func(
+                        q=qf, k=kf, v=vf, out=of, cu_seqlens_q=cu, max_seqlen_q=n_q, seqused_k=ctx,
+                        max_seqlen_k=a.ctx, softmax_scale=1 / 16.0, causal=True, block_table=fbt, fa_version=2,
                     ),
                     a.reps,
                 )
             print(f"{b:3d} {n_q:3d} {a.ctx:5d} {mb:7.0f} {t_ours:8.1f} {mb / t_ours * 1e3:5.0f} "
                   f"{t_fa:8.1f} {mb / t_fa * 1e3:5.0f} {t_fa / t_ours:5.2f}")
-        del kc, vc, kf, vf
+        del kc, vc, phys, kf, vf
         torch.cuda.empty_cache()
 
 

@@ -212,6 +212,10 @@ __global__ void __launch_bounds__(256, 2) gdn_step_kernel(const GdnDecodeArgs a)
       const float o = fmaf(vp, kq, decay * dq);
 #pragma unroll
       for (int e = 0; e < E; ++e) s[i][e] = fmaf(decay, s[i][e], vp * k[e]);
+      // After the last token each row is final: store it now, so the writes overlap the
+      // remaining rows' arithmetic instead of leaving in one burst at the end.
+      if (t == T - 1)
+        __stcs(reinterpret_cast<uint4*>(s_out + static_cast<size_t>(r) * kGdnDim + kl * E), SV<ST>::pack(s[i]));
       if (kl == 0) {
         o_s[t][r] = round_bf16(o);  // vLLM rounds o to BF16 before the norm
         if (ht) ht[kGdnDim + r] = vp;
@@ -219,11 +223,6 @@ __global__ void __launch_bounds__(256, 2) gdn_step_kernel(const GdnDecodeArgs a)
     }
   }
 
-  // 6. The state after the last token, stored once.
-#pragma unroll
-  for (int i = 0; i < IT; ++i)
-    __stcs(reinterpret_cast<uint4*>(s_out + static_cast<size_t>(rbase + i * RPI) * kGdnDim + kl * E),
-           SV<ST>::pack(s[i]));
   __syncthreads();
 
   // 7. Gated RMSNorm per token (warp t): out = o * rsqrt(mean(o^2) + eps) * w * SiLU(z).
