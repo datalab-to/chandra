@@ -31,8 +31,9 @@ def test_matches_sdpa(lens, version):
         assert (sub - ref).abs().max().item() < 1e-2, (ln, (sub - ref).abs().max().item())
 
 
+@pytest.mark.parametrize("version", [3, 5])
 @pytest.mark.parametrize("lens", [[300], [1000, 77, 4096], [24552]])
-def test_int8_qk_close_to_sdpa(lens):
+def test_int8_qk_close_to_sdpa(lens, version):
     """Approximate (INT8 Q and K): relative L1 error against FP32, as SageAttention reports it."""
     g = torch.Generator(device="cuda").manual_seed(sum(lens) + 1)
     n = sum(lens)
@@ -40,7 +41,7 @@ def test_int8_qk_close_to_sdpa(lens):
     qkv[:, 1] += 0.7  # a K mean, which the smoothing removes
     q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
     cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32, device="cuda")
-    got = chandra_cuda.vit_attn(q, k, v, cu, max(lens), version=3).float()
+    got = chandra_cuda.vit_attn(q, k, v, cu, max(lens), version=version).float()
     for i, ln in enumerate(lens):
         s = int(cu[i])
         step = max(1, ln // 1024)

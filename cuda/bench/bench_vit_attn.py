@@ -45,6 +45,9 @@ def main():
     rel = ((out.float() - ref1).abs().sum() / ref1.abs().sum()).item()
     print(f"ours INT8 QK (incl. K mean + quant): {t3:.2f} ms, {flops / t3 / 1e9:.1f} TFLOPS-equiv, "
           f"rel L1 vs BF16 {rel:.2e}")
+    t5 = time_ms(lambda: chandra_cuda.vit_attn(q, k, v, cu, n, out, version=5), a.reps)
+    rel5 = ((out.float() - ref1).abs().sum() / ref1.abs().sum()).item()
+    print(f"ours v5 (v4 + INT8 QK): {t5:.2f} ms, {flops / t5 / 1e9:.1f} TFLOPS-equiv, rel L1 vs BF16 {rel5:.2e}")
     try:
         from vllm.vllm_flash_attn import flash_attn_varlen_func
 

@@ -19,13 +19,13 @@ struct VitAttnArgs {
   const int* cu_seqlens;  // [n_seq + 1] row offsets of the images
   int n_seq;
   int max_len;
-  // version 3 (class G): INT8 QK^T. Workspaces: k8 [rows][16][64] INT8, k_scale
+  // versions 3 and 5 (class G): INT8 QK^T. Workspaces: k8 [rows][16][64] INT8, k_scale
   // [n_seq][max_tiles][16] and k_mean [n_seq][16][64] FP32; max_tiles = ceil(max_len / 64).
   int8_t* k8;
   float* k_scale;
   float* k_mean;
   int max_tiles;
-  int version;  // 1 (default): 8 warps x 16 rows; 2: QK of the next tile overlapped; 3: INT8 QK; 4: 4 warps x 32 rows
+  int version;  // 1 (default): 8 warps x 16 rows; 2: QK of the next tile overlapped; 3: INT8 QK; 4: 4 warps x 32 rows; 5: 4 + INT8 QK
 };
 
 cudaError_t vit_attn(const VitAttnArgs& a, cudaStream_t stream);
