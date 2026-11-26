@@ -28,7 +28,8 @@ find_package(nanobind CONFIG REQUIRED)
 
 nanobind_add_module(_core STABLE_ABI NB_STATIC
   src/cpp/module.cpp
-  src/cpp/decode_gemm.cu)
+  src/cpp/decode_gemm.cu
+  src/cpp/attn_decode.cu)
 target_include_directories(_core PRIVATE src/cpp)
 # The kernels run on the caller's (torch's) CUDA context and stream.
 target_link_libraries(_core PRIVATE CUDA::cudart_static)

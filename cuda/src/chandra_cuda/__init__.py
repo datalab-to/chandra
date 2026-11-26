@@ -10,7 +10,64 @@ import torch
 
 from . import _core
 
-__all__ = ["pack_weight", "DecodeLinear"]
+__all__ = ["pack_weight", "DecodeLinear", "attn_decode"]
+
+HEADS, KV_HEADS, HEAD_DIM, PAGE_TOKENS = 16, 4, 256, 64
+
+_attn_ws: dict = {}
+
+
+def attn_decode(
+    q: torch.Tensor,
+    gate: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    ctx_lens: torch.Tensor,
+    n_q: int = 1,
+    max_ctx: int | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Gated decode/verify attention for Chandra 2's full-attention layers.
+
+    q, gate: [B * n_q, 16, 256] BF16 views (token, head, dim; the last dim
+    contiguous), e.g. the two halves of q_proj's per-head [q | gate] output.
+    k_cache, v_cache: [pages, 4, 64, 256] BF16. block_table: [B, max_pages]
+    int32. ctx_lens: [B] int32, tokens in the cache including this step's n_q.
+    Query token t of a sequence sees keys up to position ctx - n_q + t.
+    Returns [B * n_q, 16, 256] BF16: softmax(q k^T / 16) v * sigmoid(gate).
+    """
+    b = ctx_lens.shape[0]
+    if q.shape != (b * n_q, HEADS, HEAD_DIM) or gate.shape != q.shape:
+        raise ValueError("q and gate must be [B * n_q, 16, 256]")
+    if q.stride(-1) != 1 or gate.stride(-1) != 1:
+        raise ValueError("the head dimension must be contiguous")
+    dev = q.device
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    if max_ctx is None:
+        max_ctx = int(ctx_lens.max())
+    sps, max_splits = _core.attn_decode_split(b, max_ctx, sms)
+    key = (dev, b, max_splits)
+    ws = _attn_ws.get(key)
+    if ws is None:
+        ws = (
+            torch.empty(b * KV_HEADS * max_splits * 16 * HEAD_DIM, dtype=torch.float32, device=dev),
+            torch.empty(b * KV_HEADS * max_splits * 16 * 2, dtype=torch.float32, device=dev),
+            torch.zeros(b * KV_HEADS, dtype=torch.int32, device=dev),
+        )
+        _attn_ws[key] = ws
+    if out is None:
+        out = torch.empty(b * n_q, HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    _core.attn_decode(
+        q.data_ptr(), q.stride(0), q.stride(1),
+        gate.data_ptr(), gate.stride(0), gate.stride(1),
+        out.data_ptr(), out.stride(0), out.stride(1),
+        k_cache.data_ptr(), v_cache.data_ptr(),
+        block_table.data_ptr(), block_table.stride(0), ctx_lens.data_ptr(),
+        ws[0].data_ptr(), ws[1].data_ptr(), ws[2].data_ptr(),
+        b, n_q, sps, max_splits, torch.cuda.current_stream(dev).cuda_stream,
+    )
+    return out
 
 
 def pack_weight(w: torch.Tensor) -> torch.Tensor:
