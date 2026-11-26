@@ -239,3 +239,27 @@ def test_int4_quantizer_matches_the_checkpoint_writer():
     unpacked = torch.stack([(packed >> (4 * i)) & 0xF for i in range(8)], dim=-1).reshape(256, 2560) - 8
     assert torch.equal(q.to(torch.int32), unpacked.to(torch.int32))
 
+
+@pytest.mark.parametrize("fmt", ["bf16", "fp4"])
+@pytest.mark.parametrize("n,k,ctas", [(12416, 2560, 168), (2560, 4096, 168), (18432, 2560, 252), (2560, 9216, 84)])
+def test_stream_k_plan(fmt, n, k, ctas):
+    """Stream-K (forced plan): matches the reference and stays batch-invariant."""
+    torch.manual_seed(n + k + ctas)
+    w = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
+    chandra_cuda._core.set_decode_gemm_plan(n, k, 8, -ctas)
+    try:
+        lin = (chandra_cuda.DecodeLinear(w) if fmt == "bf16" else chandra_cuda.DecodeLinearFP4(w, keep_codes=True))
+        wd = w.float() if fmt == "bf16" else lin.dequantized()
+        x = torch.randn(64, k, device="cuda").to(torch.bfloat16)
+        full = lin(x)
+        ref = x.float() @ wd.T
+        assert (full.float() - ref).abs().max().item() <= ref.abs().max().item() * 2**-7 + 1e-3
+        for m in (1, 9, 33):
+            assert torch.equal(lin(x[:m]), full[:m]), m
+        silu = (chandra_cuda.DecodeLinear(w, epilogue="silu_mul") if fmt == "bf16"
+                else chandra_cuda.DecodeLinearFP4(w, epilogue="silu_mul"))
+        plain = lin if fmt == "bf16" else chandra_cuda.DecodeLinearFP4(w)
+        assert torch.equal(silu(x[:17]), chandra_cuda.silu_mul(plain(x[:17])))
+    finally:
+        chandra_cuda._core.set_decode_gemm_plan(n, k, 0, 0)
+

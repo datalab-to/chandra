@@ -40,6 +40,7 @@ def main():
         chunks = k // 128
         plans = [(rw, s) for rw in (8, 4) if n % (16 * rw) == 0 for s in (1, 2, 3, 4, 6, 8, 12, 16)
                  if chunks % s == 0 and (n // (16 * rw)) * s <= 6 * sms]
+        plans += [(8, -p) for p in (sms, 2 * sms, 3 * sms)]  # stream-K with P CTAs
         print(f"{name} N={n} K={k} default plan {default} ({sms} SMs)")
         for fmt, cls in (("bf16", chandra_cuda.DecodeLinear), ("mxfp4", chandra_cuda.DecodeLinearFP4)):
             for rw, s in plans:
@@ -50,7 +51,7 @@ def main():
                     x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
                     out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
                     row.append(time_us(lambda: lin(x, out)))
-                ctas = (n // (16 * rw)) * s
+                ctas = (n // (16 * rw)) * s if s > 0 else -s
                 print(f"  {fmt:5s} rw {rw} splits {s:2d} ({ctas:4d} CTAs): " +
                       "  ".join(f"M={m} {t:6.1f}" for m, t in zip(a.rows, row)), flush=True)
                 del lin

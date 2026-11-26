@@ -12,7 +12,8 @@ namespace chandra {
 // GPU, never on M, so a token's output is the same at every batch size.
 struct DecodeGemmPlan {
   int row_groups;  // 16-row groups per CTA; its 8 warps are row_groups x (8 / row_groups) K slices
-  int splits;      // CTAs along K per row tile (1 = no partial sums in global memory)
+  int splits;      // CTAs along K per row tile (1 = no partial sums in global memory); negative:
+                   // stream-K with -splits CTAs sharing all (tile, K chunk) units equally
 };
 DecodeGemmPlan decode_gemm_plan(int N, int K, int sms);
 // For measurements: force the plan of (N, K) (rw <= 0 removes the override). Not thread-safe.

@@ -241,301 +241,326 @@ __global__ void __launch_bounds__(kThreads, 2)
 
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int rw = warp / KW, kq = warp % KW;
-  const int tile = blockIdx.x, split = blockIdx.y;
   const int KB = K >> 4;
-  const int kb_split = KB / splits;
-  const int kb0 = split * kb_split;
-  const int nchunks = kb_split / kBlocksPerChunk;
-  const int nblk = kb_split / BPL / KW;  // this warp's W loads
-  const int g = tile * RW + rw;    // 16-row group
-  // Block i of this warp is k16 block kb0 + i * KW + kq of row group g.
-  const uint4* w = wp + (static_cast<size_t>(g) * (KB / BPL) + kb0 / BPL + kq) * 32 + lane;
-  const size_t wstep = static_cast<size_t>(KW) * 32;
-  // FP4: one scale word per (row group, W load, gid): E + 126 of rows gid and gid + 8 for the
-  // load's two 32-wide K blocks; the 4 lanes of a quad read the same word.
-  const uint32_t* sc = FP4 ? reinterpret_cast<const uint32_t*>(wscale) +
-                                 (static_cast<size_t>(g) * (KB / 4) + kb0 / 4 + kq) * 8 + (lane >> 2)
-                           : nullptr;
-  constexpr size_t sstep = static_cast<size_t>(KW) * 8;
-  // INT4: the scale word of W load i (global load index L = kb0 / 4 + kq + i * KW) is group L / 2.
-  const uint32_t* sc4 = I4 ? reinterpret_cast<const uint32_t*>(wscale) + static_cast<size_t>(g) * (KB / 8) * 8 +
-                                 (lane >> 2)
-                           : nullptr;
-  auto sc_addr = [&](int i) -> const uint32_t* {
-    if constexpr (I4)
-      return sc4 + static_cast<size_t>((kb0 / 4 + kq + i * KW) >> 1) * 8;
-    else
-      return sc + i * sstep;
-  };
-
-  auto load_x = [&](int c, int buf) {
-    unsigned char* s = smem + buf * kBufBytes;
-    const int k0 = (kb0 + c * kBlocksPerChunk) * 16;
-#pragma unroll
-    for (int i = threadIdx.x; i < MP * (kKC / 8); i += kThreads) {
-      const int r = i / (kKC / 8), cc = i % (kKC / 8);
-      const bool valid = r < M;
-      const __nv_bfloat16* src = x + static_cast<size_t>(valid ? r : 0) * K + k0 + cc * 8;
-      cp_async16(s + r * kRowBytes + cc * 16, src, valid);
+  const int C = KB / kBlocksPerChunk;  // K chunks of a row tile
+  // Work as (tile, K chunk) units, tile-major. splits > 0: CTA (x, y) takes tile x, chunks
+  // [y C / splits, (y + 1) C / splits). splits < 0 (stream-K): CTA p of P = -splits takes the
+  // units [p U / P, (p + 1) U / P) of U = tiles * C, which may span tiles; each tile's
+  // contributors are the consecutive CTAs that own its units, summed in that order by the last.
+  const long long n_tiles = N / (16 * RW);
+  const long long P = splits > 0 ? 0 : -splits, U = n_tiles * C;
+  int u = splits > 0 ? blockIdx.x * C + blockIdx.y * (C / splits) : static_cast<int>(blockIdx.x * U / P);
+  const int u_end = splits > 0 ? u + C / splits : static_cast<int>((blockIdx.x + 1) * U / P);
+  while (u < u_end) {
+    const int tile = u / C, c0 = u % C;
+    const int nchunks = min(C - c0, u_end - u);
+    int nc = splits, slot = blockIdx.y;
+    if (splits < 0) {  // owner of unit v: floor((v P + P - 1) / U)
+      const int first = static_cast<int>((static_cast<long long>(tile) * C * P + P - 1) / U);
+      const int last = static_cast<int>(((static_cast<long long>(tile) * C + C - 1) * P + P - 1) / U);
+      nc = last - first + 1;
+      slot = blockIdx.x - first;
     }
-  };
+    const int kb0 = c0 * kBlocksPerChunk;
+    const int kb_split = nchunks * kBlocksPerChunk;
+    const int nblk = kb_split / BPL / KW;  // this warp's W loads
+    const int g = tile * RW + rw;    // 16-row group
+    // Block i of this warp is k16 block kb0 + i * KW + kq of row group g.
+    const uint4* w = wp + (static_cast<size_t>(g) * (KB / BPL) + kb0 / BPL + kq) * 32 + lane;
+    const size_t wstep = static_cast<size_t>(KW) * 32;
+    // FP4: one scale word per (row group, W load, gid): E + 126 of rows gid and gid + 8 for the
+    // load's two 32-wide K blocks; the 4 lanes of a quad read the same word.
+    const uint32_t* sc = FP4 ? reinterpret_cast<const uint32_t*>(wscale) +
+                                   (static_cast<size_t>(g) * (KB / 4) + kb0 / 4 + kq) * 8 + (lane >> 2)
+                             : nullptr;
+    constexpr size_t sstep = static_cast<size_t>(KW) * 8;
+    // INT4: the scale word of W load i (global load index L = kb0 / 4 + kq + i * KW) is group L / 2.
+    const uint32_t* sc4 = I4 ? reinterpret_cast<const uint32_t*>(wscale) + static_cast<size_t>(g) * (KB / 8) * 8 +
+                                   (lane >> 2)
+                             : nullptr;
+    auto sc_addr = [&](int i) -> const uint32_t* {
+      if constexpr (I4)
+        return sc4 + static_cast<size_t>((kb0 / 4 + kq + i * KW) >> 1) * 8;
+      else
+        return sc + i * sstep;
+    };
 
-  // The W ring: w0 is the next block to use.
-  uint4 w0 = make_uint4(0, 0, 0, 0), w1 = w0, w2 = w0, w3 = w0;
-  if (0 < nblk) w0 = ld_stream(w);
-  if (1 < nblk) w1 = ld_stream(w + wstep);
-  if (2 < nblk) w2 = ld_stream(w + 2 * wstep);
-  if (3 < nblk) w3 = ld_stream(w + 3 * wstep);
-  uint32_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;  // FP4 scale words, in step with w0..w3
-  if constexpr (FP4) {
-    if (0 < nblk) s0 = __ldg(sc_addr(0));
-    if (1 < nblk) s1 = __ldg(sc_addr(1));
-    if (2 < nblk) s2 = __ldg(sc_addr(2));
-    if (3 < nblk) s3 = __ldg(sc_addr(3));
-  }
+    auto load_x = [&](int c, int buf) {
+      unsigned char* s = smem + buf * kBufBytes;
+      const int k0 = (kb0 + c * kBlocksPerChunk) * 16;
+  #pragma unroll
+      for (int i = threadIdx.x; i < MP * (kKC / 8); i += kThreads) {
+        const int r = i / (kKC / 8), cc = i % (kKC / 8);
+        const bool valid = r < M;
+        const __nv_bfloat16* src = x + static_cast<size_t>(valid ? r : 0) * K + k0 + cc * 8;
+        cp_async16(s + r * kRowBytes + cc * 16, src, valid);
+      }
+    };
 
-  float acc[2 * NP][4];
-#pragma unroll
-  for (int t = 0; t < 2 * NP; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
+    // The W ring: w0 is the next block to use.
+    uint4 w0 = make_uint4(0, 0, 0, 0), w1 = w0, w2 = w0, w3 = w0;
+    if (0 < nblk) w0 = ld_stream(w);
+    if (1 < nblk) w1 = ld_stream(w + wstep);
+    if (2 < nblk) w2 = ld_stream(w + 2 * wstep);
+    if (3 < nblk) w3 = ld_stream(w + 3 * wstep);
+    uint32_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;  // FP4 scale words, in step with w0..w3
+    if constexpr (FP4) {
+      if (0 < nblk) s0 = __ldg(sc_addr(0));
+      if (1 < nblk) s1 = __ldg(sc_addr(1));
+      if (2 < nblk) s2 = __ldg(sc_addr(2));
+      if (3 < nblk) s3 = __ldg(sc_addr(3));
+    }
 
-  load_x(0, 0);
-  cp_async_commit();
-  // ldmatrix.x4 row address of this lane: matrix q = lane / 8 is n8 tile (q / 2)
-  // of a pair and k half (q % 2); its row lane % 8 is a token.
-  const int lq = lane >> 3, lr = lane & 7;
-  const int lane_off = ((lq >> 1) * 8 + lr) * kRowBytes + (lq & 1) * 16;
+    float acc[2 * NP][4];
+  #pragma unroll
+    for (int t = 0; t < 2 * NP; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
 
-  for (int c = 0; c < nchunks; ++c) {
-    if (c + 1 < nchunks) load_x(c + 1, (c + 1) & 1);
+    load_x(0, 0);
     cp_async_commit();
-    cp_async_wait<1>();
-    __syncthreads();
-    const unsigned char* s = smem + (c & 1) * kBufBytes + lane_off;
-#pragma unroll
-    for (int jj = 0; jj < kBlocksPerChunk / BPL / KW; ++jj) {
-      const int u = jj * KW + kq;                             // W load within the chunk
-      const int i = c * (kBlocksPerChunk / BPL / KW) + jj;    // this warp's load index
-      const uint4 wv = w0;
-      w0 = w1;
-      w1 = w2;
-      w2 = w3;
-      if (i + kDepth < nblk) w3 = ld_stream(w + (i + kDepth) * wstep);
-      uint4 af[BPL];
-      if constexpr (FP4) {
-        const uint32_t sv = s0;
-        s0 = s1;
-        s1 = s2;
-        s2 = s3;
-        if (i + kDepth < nblk) s3 = __ldg(sc_addr(i + kDepth));
-        if constexpr (I4) {
-          const uint32_t m0 = __byte_perm(sv, 0u, 0x1010), m8 = __byte_perm(sv, 0u, 0x3232);
-          int4x8_to_bf16(wv.x, m0, m8, af[0]);
-          int4x8_to_bf16(wv.y, m0, m8, af[1]);
-          int4x8_to_bf16(wv.z, m0, m8, af[2]);
-          int4x8_to_bf16(wv.w, m0, m8, af[3]);
+    // ldmatrix.x4 row address of this lane: matrix q = lane / 8 is n8 tile (q / 2)
+    // of a pair and k half (q % 2); its row lane % 8 is a token.
+    const int lq = lane >> 3, lr = lane & 7;
+    const int lane_off = ((lq >> 1) * 8 + lr) * kRowBytes + (lq & 1) * 16;
+
+    for (int c = 0; c < nchunks; ++c) {
+      if (c + 1 < nchunks) load_x(c + 1, (c + 1) & 1);
+      cp_async_commit();
+      cp_async_wait<1>();
+      __syncthreads();
+      const unsigned char* s = smem + (c & 1) * kBufBytes + lane_off;
+  #pragma unroll
+      for (int jj = 0; jj < kBlocksPerChunk / BPL / KW; ++jj) {
+        const int u = jj * KW + kq;                             // W load within the chunk
+        const int i = c * (kBlocksPerChunk / BPL / KW) + jj;    // this warp's load index
+        const uint4 wv = w0;
+        w0 = w1;
+        w1 = w2;
+        w2 = w3;
+        if (i + kDepth < nblk) w3 = ld_stream(w + (i + kDepth) * wstep);
+        uint4 af[BPL];
+        if constexpr (FP4) {
+          const uint32_t sv = s0;
+          s0 = s1;
+          s1 = s2;
+          s2 = s3;
+          if (i + kDepth < nblk) s3 = __ldg(sc_addr(i + kDepth));
+          if constexpr (I4) {
+            const uint32_t m0 = __byte_perm(sv, 0u, 0x1010), m8 = __byte_perm(sv, 0u, 0x3232);
+            int4x8_to_bf16(wv.x, m0, m8, af[0]);
+            int4x8_to_bf16(wv.y, m0, m8, af[1]);
+            int4x8_to_bf16(wv.z, m0, m8, af[2]);
+            int4x8_to_bf16(wv.w, m0, m8, af[3]);
+          } else {
+            const uint32_t m00 = e8_to_bf16x2<0>(sv), m01 = e8_to_bf16x2<1>(sv);  // row gid, K blocks 0 / 1
+            const uint32_t m80 = e8_to_bf16x2<2>(sv), m81 = e8_to_bf16x2<3>(sv);  // row gid + 8
+            fp4x8_to_bf16(wv.x, m00, m80, af[0]);
+            fp4x8_to_bf16(wv.y, m00, m80, af[1]);
+            fp4x8_to_bf16(wv.z, m01, m81, af[2]);
+            fp4x8_to_bf16(wv.w, m01, m81, af[3]);
+          }
+        } else if constexpr (I8) {
+          i8x4_to_bf16(wv.x, af[0].x, af[0].y);
+          i8x4_to_bf16(wv.y, af[0].z, af[0].w);
+          i8x4_to_bf16(wv.z, af[1].x, af[1].y);
+          i8x4_to_bf16(wv.w, af[1].z, af[1].w);
+        } else if constexpr (FP8) {
+          fp8x4_to_bf16(wv.x, af[0].x, af[0].y);
+          fp8x4_to_bf16(wv.y, af[0].z, af[0].w);
+          fp8x4_to_bf16(wv.z, af[1].x, af[1].y);
+          fp8x4_to_bf16(wv.w, af[1].z, af[1].w);
         } else {
-          const uint32_t m00 = e8_to_bf16x2<0>(sv), m01 = e8_to_bf16x2<1>(sv);  // row gid, K blocks 0 / 1
-          const uint32_t m80 = e8_to_bf16x2<2>(sv), m81 = e8_to_bf16x2<3>(sv);  // row gid + 8
-          fp4x8_to_bf16(wv.x, m00, m80, af[0]);
-          fp4x8_to_bf16(wv.y, m00, m80, af[1]);
-          fp4x8_to_bf16(wv.z, m01, m81, af[2]);
-          fp4x8_to_bf16(wv.w, m01, m81, af[3]);
+          af[0] = wv;
         }
-      } else if constexpr (I8) {
-        i8x4_to_bf16(wv.x, af[0].x, af[0].y);
-        i8x4_to_bf16(wv.y, af[0].z, af[0].w);
-        i8x4_to_bf16(wv.z, af[1].x, af[1].y);
-        i8x4_to_bf16(wv.w, af[1].z, af[1].w);
-      } else if constexpr (FP8) {
-        fp8x4_to_bf16(wv.x, af[0].x, af[0].y);
-        fp8x4_to_bf16(wv.y, af[0].z, af[0].w);
-        fp8x4_to_bf16(wv.z, af[1].x, af[1].y);
-        fp8x4_to_bf16(wv.w, af[1].z, af[1].w);
-      } else {
-        af[0] = wv;
-      }
-#pragma unroll
-      for (int bb = 0; bb < BPL; ++bb) {
-        const int j = u * BPL + bb;  // k16 block within the chunk
-#pragma unroll
-        for (int p = 0; p < NP; ++p) {
-          uint32_t b0, b1, b2, b3;
-          ldmatrix_x4(b0, b1, b2, b3, s + p * 16 * kRowBytes + j * 32);
-          mma_bf16(acc[2 * p], af[bb], b0, b1);
-          mma_bf16(acc[2 * p + 1], af[bb], b2, b3);
+  #pragma unroll
+        for (int bb = 0; bb < BPL; ++bb) {
+          const int j = u * BPL + bb;  // k16 block within the chunk
+  #pragma unroll
+          for (int p = 0; p < NP; ++p) {
+            uint32_t b0, b1, b2, b3;
+            ldmatrix_x4(b0, b1, b2, b3, s + p * 16 * kRowBytes + j * 32);
+            mma_bf16(acc[2 * p], af[bb], b0, b1);
+            mma_bf16(acc[2 * p + 1], af[bb], b2, b3);
+          }
         }
       }
+      __syncthreads();
     }
-    __syncthreads();
-  }
 
-  if constexpr (FP8 || I8) {  // per-row weight scales (linear, so before the K-slice sum)
-    const float s0 = wscale[g * 16 + (lane >> 2)], s8 = wscale[g * 16 + (lane >> 2) + 8];
-#pragma unroll
-    for (int t = 0; t < 2 * NP; ++t) {
-      acc[t][0] *= s0;
-      acc[t][1] *= s0;
-      acc[t][2] *= s8;
-      acc[t][3] *= s8;
-    }
-  }
-
-  // Reduce the KW K slices of each row group through shared memory, in order.
-  if constexpr (KW > 1) {
-    float* red = reinterpret_cast<float*>(smem);  // [warp][lane][kAcc], fits in the x buffers
-    float* mine = red + (warp * 32 + lane) * kAcc;
-#pragma unroll
-    for (int t = 0; t < 2 * NP; ++t)
-      *reinterpret_cast<float4*>(mine + t * 4) = make_float4(acc[t][0], acc[t][1], acc[t][2], acc[t][3]);
-    __syncthreads();
-    if (kq != 0) return;  // no later __syncthreads below on this path for these warps
-#pragma unroll
-    for (int t = 0; t < 2 * NP; ++t) {
-      float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-#pragma unroll
-      for (int q = 0; q < KW; ++q) {
-        const float4 u = *reinterpret_cast<const float4*>(red + ((rw * KW + q) * 32 + lane) * kAcc + t * 4);
-        v.x += u.x;
-        v.y += u.y;
-        v.z += u.z;
-        v.w += u.w;
-      }
-      acc[t][0] = v.x;
-      acc[t][1] = v.y;
-      acc[t][2] = v.z;
-      acc[t][3] = v.w;
-    }
-  }
-
-  // Accumulator layout: c0, c1 = row gid, tokens 2*tig, 2*tig+1; c2, c3 = row gid + 8.
-  const int gid = lane >> 2, tig = lane & 3;
-  const int row = g * 16 + gid;
-  if constexpr (ARGMAX) {
-    static_assert(KW == 1, "the argmax epilogue needs every warp");
-#pragma unroll
-    for (int t = 0; t < 2 * NP; ++t) {
-#pragma unroll
-      for (int c = 0; c < 2; ++c) {
-        const int tok = t * 8 + tig * 2 + c;
-        unsigned long long kk = argmax_key(acc[t][c], row);
-        const unsigned long long k8 = argmax_key(acc[t][c + 2], row + 8);
-        kk = kk > k8 ? kk : k8;
-        // Max over the 8 row lanes (gid) that hold this token.
-#pragma unroll
-        for (int off = 4; off < 32; off <<= 1) {
-          const unsigned long long o = __shfl_xor_sync(0xffffffffu, kk, off);
-          kk = kk > o ? kk : o;
-        }
-        if (gid == 0 && tok < M && (bnd.tile_ub == nullptr || s_cand[tok])) atomicMax(&s_best[tok], kk);
+    if constexpr (FP8 || I8) {  // per-row weight scales (linear, so before the K-slice sum)
+      const float s0 = wscale[g * 16 + (lane >> 2)], s8 = wscale[g * 16 + (lane >> 2) + 8];
+  #pragma unroll
+      for (int t = 0; t < 2 * NP; ++t) {
+        acc[t][0] *= s0;
+        acc[t][1] *= s0;
+        acc[t][2] *= s8;
+        acc[t][3] *= s8;
       }
     }
-    __syncthreads();
-    if (threadIdx.x < M) atomicMax(keys + threadIdx.x, s_best[threadIdx.x]);
-    return;
-  }
 
-  if constexpr (BOUND) {
-    static_assert(KW == 1, "the bound epilogue needs every warp");
-    const float c0 = bnd.rowc[row], c8 = bnd.rowc[row + 8];
-#pragma unroll
-    for (int t = 0; t < 2 * NP; ++t) {
-#pragma unroll
-      for (int c = 0; c < 2; ++c) {
-        const int tok = t * 8 + tig * 2 + c;
-        const float xn = tok < M ? bnd.xnorm[tok] : 0.f;
-        const float l0 = acc[t][c], l8 = acc[t][c + 2];
-        // |l| * 2^-20 covers the rounding of l, l * scale and l +- b (a few ulps each).
-        const float b0 = fmaf(xn, c0, fmaf(fabsf(l0), 1e-6f, 1e-30f));
-        const float b8 = fmaf(xn, c8, fmaf(fabsf(l8), 1e-6f, 1e-30f));
-        float ub = fmaxf(l0 + b0, l8 + b8), lb = fmaxf(l0 - b0, l8 - b8);
-#pragma unroll
-        for (int off = 4; off < 32; off <<= 1) {
-          ub = fmaxf(ub, __shfl_xor_sync(0xffffffffu, ub, off));
-          lb = fmaxf(lb, __shfl_xor_sync(0xffffffffu, lb, off));
-        }
-        if (gid == 0 && tok < M) {
-          atomicMax(&s_ub[tok], f2ord(ub));
-          atomicMax(&s_lb[tok], f2ord(lb));
+    // Reduce the KW K slices of each row group through shared memory, in order.
+    if constexpr (KW > 1) {
+      float* red = reinterpret_cast<float*>(smem);  // [warp][lane][kAcc], fits in the x buffers
+      float* mine = red + (warp * 32 + lane) * kAcc;
+  #pragma unroll
+      for (int t = 0; t < 2 * NP; ++t)
+        *reinterpret_cast<float4*>(mine + t * 4) = make_float4(acc[t][0], acc[t][1], acc[t][2], acc[t][3]);
+      __syncthreads();
+      if (kq == 0) {
+  #pragma unroll
+        for (int t = 0; t < 2 * NP; ++t) {
+          float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+  #pragma unroll
+          for (int q = 0; q < KW; ++q) {
+            const float4 u = *reinterpret_cast<const float4*>(red + ((rw * KW + q) * 32 + lane) * kAcc + t * 4);
+            v.x += u.x;
+            v.y += u.y;
+            v.z += u.z;
+            v.w += u.w;
+          }
+          acc[t][0] = v.x;
+          acc[t][1] = v.y;
+          acc[t][2] = v.z;
+          acc[t][3] = v.w;
         }
       }
     }
-    __syncthreads();
-    if (threadIdx.x < M) {
-      bnd.tile_ub[tile * 64 + threadIdx.x] = ord2f(s_ub[threadIdx.x]);
-      atomicMax(bnd.lb_key + threadIdx.x, s_lb[threadIdx.x]);
-    }
-    return;
-  }
 
-  if (splits == 1) {
-    if constexpr (SILU) {  // rows gid (gate) and gid + 8 (up) of this group make one output column
-      const int NO = N / 2, col = g * 8 + gid;
-#pragma unroll
+
+    auto epilogue = [&]() {
+      // Accumulator layout: c0, c1 = row gid, tokens 2*tig, 2*tig+1; c2, c3 = row gid + 8.
+      const int gid = lane >> 2, tig = lane & 3;
+      const int row = g * 16 + gid;
+      if constexpr (ARGMAX) {
+        static_assert(KW == 1, "the argmax epilogue needs every warp");
+    #pragma unroll
+        for (int t = 0; t < 2 * NP; ++t) {
+    #pragma unroll
+          for (int c = 0; c < 2; ++c) {
+            const int tok = t * 8 + tig * 2 + c;
+            unsigned long long kk = argmax_key(acc[t][c], row);
+            const unsigned long long k8 = argmax_key(acc[t][c + 2], row + 8);
+            kk = kk > k8 ? kk : k8;
+            // Max over the 8 row lanes (gid) that hold this token.
+    #pragma unroll
+            for (int off = 4; off < 32; off <<= 1) {
+              const unsigned long long o = __shfl_xor_sync(0xffffffffu, kk, off);
+              kk = kk > o ? kk : o;
+            }
+            if (gid == 0 && tok < M && (bnd.tile_ub == nullptr || s_cand[tok])) atomicMax(&s_best[tok], kk);
+          }
+        }
+        __syncthreads();
+        if (threadIdx.x < M) atomicMax(keys + threadIdx.x, s_best[threadIdx.x]);
+        return;
+      }
+
+      if constexpr (BOUND) {
+        static_assert(KW == 1, "the bound epilogue needs every warp");
+        const float c0 = bnd.rowc[row], c8 = bnd.rowc[row + 8];
+    #pragma unroll
+        for (int t = 0; t < 2 * NP; ++t) {
+    #pragma unroll
+          for (int c = 0; c < 2; ++c) {
+            const int tok = t * 8 + tig * 2 + c;
+            const float xn = tok < M ? bnd.xnorm[tok] : 0.f;
+            const float l0 = acc[t][c], l8 = acc[t][c + 2];
+            // |l| * 2^-20 covers the rounding of l, l * scale and l +- b (a few ulps each).
+            const float b0 = fmaf(xn, c0, fmaf(fabsf(l0), 1e-6f, 1e-30f));
+            const float b8 = fmaf(xn, c8, fmaf(fabsf(l8), 1e-6f, 1e-30f));
+            float ub = fmaxf(l0 + b0, l8 + b8), lb = fmaxf(l0 - b0, l8 - b8);
+    #pragma unroll
+            for (int off = 4; off < 32; off <<= 1) {
+              ub = fmaxf(ub, __shfl_xor_sync(0xffffffffu, ub, off));
+              lb = fmaxf(lb, __shfl_xor_sync(0xffffffffu, lb, off));
+            }
+            if (gid == 0 && tok < M) {
+              atomicMax(&s_ub[tok], f2ord(ub));
+              atomicMax(&s_lb[tok], f2ord(lb));
+            }
+          }
+        }
+        __syncthreads();
+        if (threadIdx.x < M) {
+          bnd.tile_ub[tile * 64 + threadIdx.x] = ord2f(s_ub[threadIdx.x]);
+          atomicMax(bnd.lb_key + threadIdx.x, s_lb[threadIdx.x]);
+        }
+        return;
+      }
+
+      if (nc == 1) {
+        if constexpr (SILU) {  // rows gid (gate) and gid + 8 (up) of this group make one output column
+          const int NO = N / 2, col = g * 8 + gid;
+    #pragma unroll
+          for (int t = 0; t < 2 * NP; ++t) {
+            const int tok = t * 8 + tig * 2;
+            if (tok < M) y[static_cast<size_t>(tok) * NO + col] = silu_mul_bf16(acc[t][0], acc[t][2]);
+            if (tok + 1 < M) y[static_cast<size_t>(tok + 1) * NO + col] = silu_mul_bf16(acc[t][1], acc[t][3]);
+          }
+          return;
+        }
+    #pragma unroll
+        for (int t = 0; t < 2 * NP; ++t) {
+          const int tok = t * 8 + tig * 2;
+          if (tok < M) {
+            y[static_cast<size_t>(tok) * N + row] = __float2bfloat16_rn(acc[t][0]);
+            y[static_cast<size_t>(tok) * N + row + 8] = __float2bfloat16_rn(acc[t][2]);
+          }
+          if (tok + 1 < M) {
+            y[static_cast<size_t>(tok + 1) * N + row] = __float2bfloat16_rn(acc[t][1]);
+            y[static_cast<size_t>(tok + 1) * N + row + 8] = __float2bfloat16_rn(acc[t][3]);
+          }
+        }
+        return;
+      }
+
+      // Split across CTAs: write this split's partial [split][N][MP], then the last
+      // CTA of the row tile sums the splits in order and writes y.
+      float* p0 = partial + (static_cast<size_t>(slot) * N + row) * MP;
+    #pragma unroll
       for (int t = 0; t < 2 * NP; ++t) {
         const int tok = t * 8 + tig * 2;
-        if (tok < M) y[static_cast<size_t>(tok) * NO + col] = silu_mul_bf16(acc[t][0], acc[t][2]);
-        if (tok + 1 < M) y[static_cast<size_t>(tok + 1) * NO + col] = silu_mul_bf16(acc[t][1], acc[t][3]);
+        *reinterpret_cast<float2*>(p0 + tok) = make_float2(acc[t][0], acc[t][1]);
+        *reinterpret_cast<float2*>(p0 + 8 * MP + tok) = make_float2(acc[t][2], acc[t][3]);
       }
-      return;
-    }
-#pragma unroll
-    for (int t = 0; t < 2 * NP; ++t) {
-      const int tok = t * 8 + tig * 2;
-      if (tok < M) {
-        y[static_cast<size_t>(tok) * N + row] = __float2bfloat16_rn(acc[t][0]);
-        y[static_cast<size_t>(tok) * N + row + 8] = __float2bfloat16_rn(acc[t][2]);
+      __threadfence();
+      // With KW > 1 the kq != 0 warps have returned; the RW writer warps meet at a
+      // named barrier (id 1, RW * 32 threads) instead of __syncthreads.
+      constexpr int kWriters = RW;
+      asm volatile("bar.sync 1, %0;" ::"n"(kWriters * 32));
+      if (rw == 0 && lane == 0)
+        s_last = atomicAdd(&counters[tile], 1u) == static_cast<unsigned>(nc - 1);
+      asm volatile("bar.sync 1, %0;" ::"n"(kWriters * 32));
+      if (!s_last) return;
+      __threadfence();
+      const int rows = RW * 16, r0 = tile * rows;
+      const int tid = rw * 32 + lane;
+      if constexpr (SILU) {
+        const int NO = N / 2, half = rows / 2;
+        for (int i = tid; i < half * M; i += kWriters * 32) {
+          const int tok = i / half, j = i % half;
+          const int r = r0 + (j >> 3) * 16 + (j & 7);
+          float sg = 0.f, su = 0.f;
+          for (int s2 = 0; s2 < nc; ++s2) {
+            sg += __ldcg(partial + (static_cast<size_t>(s2) * N + r) * MP + tok);
+            su += __ldcg(partial + (static_cast<size_t>(s2) * N + r + 8) * MP + tok);
+          }
+          y[static_cast<size_t>(tok) * NO + r0 / 2 + j] = silu_mul_bf16(sg, su);
+        }
+      } else {
+        for (int i = tid; i < rows * M; i += kWriters * 32) {
+          const int tok = i / rows, r = r0 + i % rows;
+          float sum = 0.f;
+          for (int s2 = 0; s2 < nc; ++s2)
+            sum += __ldcg(partial + (static_cast<size_t>(s2) * N + r) * MP + tok);
+          y[static_cast<size_t>(tok) * N + r] = __float2bfloat16_rn(sum);
+        }
       }
-      if (tok + 1 < M) {
-        y[static_cast<size_t>(tok + 1) * N + row] = __float2bfloat16_rn(acc[t][1]);
-        y[static_cast<size_t>(tok + 1) * N + row + 8] = __float2bfloat16_rn(acc[t][3]);
-      }
-    }
-    return;
+      if (tid == 0) counters[tile] = 0;    };
+    if (kq == 0) epilogue();
+    __syncthreads();  // the x buffers (and the K-slice reduction in them) and s_last are reused
+    u += nchunks;
   }
 
-  // Split across CTAs: write this split's partial [split][N][MP], then the last
-  // CTA of the row tile sums the splits in order and writes y.
-  float* p0 = partial + (static_cast<size_t>(split) * N + row) * MP;
-#pragma unroll
-  for (int t = 0; t < 2 * NP; ++t) {
-    const int tok = t * 8 + tig * 2;
-    *reinterpret_cast<float2*>(p0 + tok) = make_float2(acc[t][0], acc[t][1]);
-    *reinterpret_cast<float2*>(p0 + 8 * MP + tok) = make_float2(acc[t][2], acc[t][3]);
-  }
-  __threadfence();
-  // With KW > 1 the kq != 0 warps have returned; the RW writer warps meet at a
-  // named barrier (id 1, RW * 32 threads) instead of __syncthreads.
-  constexpr int kWriters = RW;
-  asm volatile("bar.sync 1, %0;" ::"n"(kWriters * 32));
-  if (rw == 0 && lane == 0)
-    s_last = atomicAdd(&counters[tile], 1u) == static_cast<unsigned>(splits - 1);
-  asm volatile("bar.sync 1, %0;" ::"n"(kWriters * 32));
-  if (!s_last) return;
-  __threadfence();
-  const int rows = RW * 16, r0 = tile * rows;
-  const int tid = rw * 32 + lane;
-  if constexpr (SILU) {
-    const int NO = N / 2, half = rows / 2;
-    for (int i = tid; i < half * M; i += kWriters * 32) {
-      const int tok = i / half, j = i % half;
-      const int r = r0 + (j >> 3) * 16 + (j & 7);
-      float sg = 0.f, su = 0.f;
-      for (int s2 = 0; s2 < splits; ++s2) {
-        sg += __ldcg(partial + (static_cast<size_t>(s2) * N + r) * MP + tok);
-        su += __ldcg(partial + (static_cast<size_t>(s2) * N + r + 8) * MP + tok);
-      }
-      y[static_cast<size_t>(tok) * NO + r0 / 2 + j] = silu_mul_bf16(sg, su);
-    }
-  } else {
-    for (int i = tid; i < rows * M; i += kWriters * 32) {
-      const int tok = i / rows, r = r0 + i % rows;
-      float sum = 0.f;
-      for (int s2 = 0; s2 < splits; ++s2)
-        sum += __ldcg(partial + (static_cast<size_t>(s2) * N + r) * MP + tok);
-      y[static_cast<size_t>(tok) * N + r] = __float2bfloat16_rn(sum);
-    }
-  }
-  if (tid == 0) counters[tile] = 0;
 }
 
 template <int NP, int RW, int KW, bool ARGMAX = false, bool FP8 = false, bool FP4 = false, bool I8 = false,
@@ -544,7 +569,7 @@ cudaError_t launch(const void* x, const void* wp, void* y, float* ws, unsigned* 
                    int K, int splits, cudaStream_t stream, unsigned long long* keys = nullptr,
                    const float* wscale = nullptr, BoundArgs bnd = {}) {
   constexpr int smem = 2 * NP * 16 * kRowBytes;
-  const dim3 grid(N / (16 * RW), splits);
+  const dim3 grid = splits > 0 ? dim3(N / (16 * RW), splits) : dim3(-splits, 1);
   decode_gemm_kernel<NP, RW, KW, ARGMAX, FP8, FP4, I8, BOUND, SILU, I4><<<grid, kThreads, smem, stream>>>(
       static_cast<const __nv_bfloat16*>(x), static_cast<const uint4*>(wp), static_cast<__nv_bfloat16*>(y),
       ws, counters, M, N, K, splits, keys, wscale, bnd);
@@ -648,9 +673,22 @@ DecodeGemmPlan decode_gemm_plan(int N, int K, int sms) {
   return {rw, splits};
 }
 
+// Partial-sum slots per tile: the splits, or for stream-K the most CTAs sharing one tile.
+static int max_contributors(const DecodeGemmPlan& p, int N, int K) {
+  if (p.splits > 0) return p.splits;
+  const long long C = K / kKC, tiles = N / (16 * p.row_groups), P = -p.splits, U = tiles * C;
+  int mx = 1;
+  for (long long t = 0; t < tiles; ++t) {
+    const long long first = (t * C * P + P - 1) / U, last = ((t * C + C - 1) * P + P - 1) / U;
+    mx = std::max(mx, static_cast<int>(last - first + 1));
+  }
+  return mx;
+}
+
 size_t decode_gemm_workspace_bytes(int N, int K, int sms) {
   const DecodeGemmPlan p = decode_gemm_plan(N, K, sms);
-  return p.splits > 1 ? static_cast<size_t>(p.splits) * N * 64 * sizeof(float) : 0;
+  const int mc = max_contributors(p, N, K);
+  return mc > 1 ? static_cast<size_t>(mc) * N * 64 * sizeof(float) : 0;
 }
 
 int decode_gemm_counters(int N, int K, int sms) {
