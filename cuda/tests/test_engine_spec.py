@@ -149,3 +149,23 @@ def test_generate_mtp_matches_plain(run):
         assert out[n] == ref[n][: len(out[n])], n
         assert len(out[n]) == STEPS
     assert steps <= STEPS
+
+
+def test_graph_step_matches_eager(run):
+    """A CUDA-graph step gives the eager step's tokens (splits planned for max_ctx may round the
+    attention differently, so this compares tokens, which random weights rarely leave tied)."""
+    dec, seqs, t0, ref = run
+    _reset(dec)
+    gs = dec.graph_step(seqs)
+    tok = t0
+    out = [[] for _ in seqs]
+    for _ in range(16):
+        _, nxt = gs(tok)
+        for s in seqs:
+            dec.length[s] += 1
+        tok = nxt.clone()
+        for o, x in zip(out, tok.tolist()):
+            o.append(x)
+    for n in range(len(seqs)):
+        assert out[n] == ref[n][:16], n
+

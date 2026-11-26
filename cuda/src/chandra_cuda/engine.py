@@ -22,8 +22,10 @@ import os
 
 import torch
 
-from . import (_core, DecodeLinear, LMHead, LMHeadFP8, attn_decode, gdn_decode, qk_norm_rope_kv, rmsnorm_add,
-               silu_mul)
+from . import (_core, DecodeLinear, DecodeLinearFP4, DecodeLinearFP8, DecodeLinearINT4, LMHead, LMHeadFP8,
+               attn_decode, gdn_decode, qk_norm_rope_kv, rmsnorm_add)
+
+WEIGHT_FORMATS = {"bf16": DecodeLinear, "fp8": DecodeLinearFP8, "mxfp4": DecodeLinearFP4, "int4": DecodeLinearINT4}
 
 PAGE = 64
 ROWS = 64  # the decode GEMMs take up to 64 rows per call
@@ -38,7 +40,11 @@ def _rows(fn, x: torch.Tensor) -> torch.Tensor:
 
 class Decoder:
     def __init__(self, ckpt_dir: str, device: str = "cuda", max_seqs: int = 8, max_ctx: int = 18432,
-                 state_dtype: torch.dtype = torch.float32, mtp: bool = False, draft_tokens: int = 3):
+                 state_dtype: torch.dtype = torch.float32, mtp: bool = False, draft_tokens: int = 3,
+                 weights: str = "bf16", lm_head: str = "bf16"):
+        """weights: the format of the decoder layers' linear weights (bf16; fp8, mxfp4, int4 are
+        approximate, class G). lm_head: "bf16", or "exact" (INT8 pass + BF16 re-check, the same picks).
+        The MTP layer, if any, stays BF16."""
         from safetensors import safe_open
 
         cfg = json.load(open(os.path.join(ckpt_dir, "config.json")))["text_config"]
@@ -56,18 +62,25 @@ class Decoder:
         self.final_w = g(P + "norm.weight")
         self.lm_head = LMHead(g("lm_head.weight"))
         self.draft_head = self.lm_head
+        if lm_head == "exact":
+            from . import LMHeadExact
 
-        def attn_layer(p):
+            self.lm_head = LMHeadExact(g("lm_head.weight"), self.draft_head)
+        elif lm_head != "bf16":
+            raise ValueError(lm_head)
+        Lin = WEIGHT_FORMATS[weights]
+
+        def attn_layer(p, Lin=Lin):
             a = p + "self_attn."
             return dict(
                 type="full_attention",
                 w_in=g(p + "input_layernorm.weight"),
                 w_post=g(p + "post_attention_layernorm.weight"),
-                gate_up=DecodeLinear(torch.cat([g(p + "mlp.gate_proj.weight"), g(p + "mlp.up_proj.weight")]),
-                                     epilogue="silu_mul"),
-                down=DecodeLinear(g(p + "mlp.down_proj.weight")),
-                qkv=DecodeLinear(torch.cat([g(a + "q_proj.weight"), g(a + "k_proj.weight"), g(a + "v_proj.weight")])),
-                o=DecodeLinear(g(a + "o_proj.weight")),
+                gate_up=Lin(torch.cat([g(p + "mlp.gate_proj.weight"), g(p + "mlp.up_proj.weight")]),
+                            epilogue="silu_mul"),
+                down=Lin(g(p + "mlp.down_proj.weight")),
+                qkv=Lin(torch.cat([g(a + "q_proj.weight"), g(a + "k_proj.weight"), g(a + "v_proj.weight")])),
+                o=Lin(g(a + "o_proj.weight")),
                 q_norm=g(a + "q_norm.weight"),
                 k_norm=g(a + "k_norm.weight"),
             )
@@ -83,14 +96,14 @@ class Decoder:
                 type=t,
                 w_in=g(p + "input_layernorm.weight"),
                 w_post=g(p + "post_attention_layernorm.weight"),
-                gate_up=DecodeLinear(torch.cat([g(p + "mlp.gate_proj.weight"), g(p + "mlp.up_proj.weight")]),
-                                     epilogue="silu_mul"),
-                down=DecodeLinear(g(p + "mlp.down_proj.weight")),
+                gate_up=Lin(torch.cat([g(p + "mlp.gate_proj.weight"), g(p + "mlp.up_proj.weight")]),
+                            epilogue="silu_mul"),
+                down=Lin(g(p + "mlp.down_proj.weight")),
                 # One GEMM for qkv | z | b | a, padded to 12,416 rows (a whole number of 128-row tiles).
-                qkvzba=DecodeLinear(torch.cat([g(a + "in_proj_qkv.weight"), g(a + "in_proj_z.weight"),
-                                               g(a + "in_proj_b.weight"), g(a + "in_proj_a.weight"),
-                                               torch.zeros(64, 2560, dtype=torch.bfloat16, device=self.device)])),
-                out=DecodeLinear(g(a + "out_proj.weight")),
+                qkvzba=Lin(torch.cat([g(a + "in_proj_qkv.weight"), g(a + "in_proj_z.weight"),
+                                      g(a + "in_proj_b.weight"), g(a + "in_proj_a.weight"),
+                                      torch.zeros(64, 2560, dtype=torch.bfloat16, device=self.device)])),
+                out=Lin(g(a + "out_proj.weight")),
                 conv_w=g(a + "conv1d.weight").reshape(8192, 4).contiguous(),
                 A_log=g(a + "A_log").float(),
                 dt_bias=g(a + "dt_bias"),
@@ -98,7 +111,7 @@ class Decoder:
             ))
         self.mtp = None
         if mtp:
-            self.mtp = attn_layer("mtp.layers.0.")
+            self.mtp = attn_layer("mtp.layers.0.", Lin=DecodeLinear)
             self.mtp.update(
                 fc=DecodeLinear(g("mtp.fc.weight")),
                 w_emb=g("mtp.pre_fc_norm_embedding.weight"),
@@ -182,15 +195,20 @@ class Decoder:
         """The main model on T tokens per sequence at positions length .. length + T - 1 (rows n * T + t).
         Returns the final-norm hidden states [B * T, 2560] and the greedy next tokens [B * T]."""
         dev = self.device
-        b = len(seqs)
         lens, pos3, page, in_page, bt = self._positions(seqs, [self.length[s] for s in seqs], T)
         slot = torch.tensor([s + 1 for s in seqs], dtype=torch.int32, device=dev)
-        ctx = lens + T
         max_ctx = max(self.length[s] for s in seqs) + T
         replay = any(self.pending[s] for s in seqs)
         n_rep = torch.tensor([self.pending[s] for s in seqs], dtype=torch.int32, device=dev) if replay or commit else None
+        out = self._forward_dev(tokens.to(dev), slot, lens, pos3, page, in_page, bt, T, commit, n_rep, max_ctx)
+        for s in seqs:
+            self.pending[s] = 0
+        return out
 
-        res = self.embed[tokens.to(dev)]
+    def _forward_dev(self, tokens, slot, lens, pos3, page, in_page, bt, T, commit, n_rep, max_ctx):
+        """_forward on device tensors only (no host reads): what a CUDA graph captures."""
+        ctx = lens + T
+        res = self.embed[tokens]
         prev = None
         for L in self.layers:
             xn, res = rmsnorm_add(res, L["w_in"], x=prev)
@@ -208,9 +226,20 @@ class Decoder:
             xn, res = rmsnorm_add(res, L["w_post"], x=y)
             prev = _rows(L["down"], _rows(L["gate_up"], xn))
         hidden, _ = rmsnorm_add(res, self.final_w, x=prev)
-        for s in seqs:
-            self.pending[s] = 0
         return hidden, _rows(self.lm_head, hidden)
+
+    def positions_dev(self, lens, delta, bt, T):
+        """Device-side per-row positions (as _positions) from lens [B], rope deltas [B], block table rows."""
+        pos = (lens[:, None] + torch.arange(T, dtype=torch.int32, device=lens.device)).reshape(-1)
+        rope = pos + delta.repeat_interleave(T)
+        pos3 = rope[:, None].expand(-1, 3).contiguous()
+        page = bt.repeat_interleave(T, dim=0).gather(1, (pos // PAGE).long()[:, None])[:, 0].contiguous()
+        in_page = (pos % PAGE).to(torch.int32)
+        return pos3, page, in_page
+
+    def graph_step(self, seqs: list[int], T: int = 1, commit: bool = False) -> "GraphStep":
+        """A CUDA graph of one forward step (T rows per sequence) for these sequences."""
+        return GraphStep(self, seqs, T, commit)
 
     @torch.no_grad()
     def step(self, tokens: torch.Tensor, seqs: list[int]) -> torch.Tensor:
@@ -368,3 +397,52 @@ class Decoder:
                 drafts.append(e)
             last = torch.tensor([gl[n][acc[n]] for n in range(b)], device=dev)
         return out, steps
+
+
+class GraphStep:
+    """One main-model step for a fixed set of sequences as a CUDA graph. Inputs live in static
+    device buffers; positions, pages and the attention split come from the device lengths, so
+    one capture serves every step until the set of sequences changes. Attention splits are
+    planned for the decoder's full context (max_ctx). Warm-up and capture run on slot 0 (no
+    sequence's state) and KV positions at or after each sequence's length (not yet valid)."""
+
+    def __init__(self, dec: Decoder, seqs: list[int], T: int = 1, commit: bool = False):
+        dev = dec.device
+        b = len(seqs)
+        self.dec, self.seqs, self.T, self.commit = dec, list(seqs), T, commit
+        self.tok = torch.zeros(b * T, dtype=torch.int64, device=dev)
+        self.lens = torch.tensor([dec.length[s] for s in seqs], dtype=torch.int32, device=dev)
+        self.delta = torch.tensor([dec.rope_delta[s] for s in seqs], dtype=torch.int32, device=dev)
+        self.slot = torch.zeros(b, dtype=torch.int32, device=dev)  # slot 0 while warming up and capturing
+        self.bt = dec.block_table[torch.tensor(seqs, device=dev)].contiguous()
+        self.n_rep = torch.zeros(b, dtype=torch.int32, device=dev) if (commit or dec.t_max > 1) else None
+
+        def run():
+            pos3, page, in_page = dec.positions_dev(self.lens, self.delta, self.bt, T)
+            return dec._forward_dev(self.tok, self.slot, self.lens, pos3, page, in_page, self.bt, T, commit,
+                                    self.n_rep, dec.max_ctx)
+
+        side = torch.cuda.Stream(dev)
+        side.wait_stream(torch.cuda.current_stream(dev))
+        with torch.cuda.stream(side), torch.no_grad():
+            for _ in range(2):
+                run()
+        torch.cuda.current_stream(dev).wait_stream(side)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph), torch.no_grad():
+            self.hidden, self.next = run()
+        self.slot.copy_(torch.tensor([s + 1 for s in seqs], dtype=torch.int32, device=dev))
+
+    def __call__(self, tokens: torch.Tensor):
+        """Run the step on tokens [B * T] at the sequences' current lengths (and pending replays).
+        Returns (hidden [B * T, 2560], next tokens [B * T]); the outputs are the graph's buffers."""
+        d = self.dec
+        self.tok.copy_(tokens, non_blocking=True)
+        self.lens.copy_(torch.tensor([d.length[s] for s in self.seqs], dtype=torch.int32), non_blocking=True)
+        if self.n_rep is not None:
+            self.n_rep.copy_(torch.tensor([d.pending[s] for s in self.seqs], dtype=torch.int32), non_blocking=True)
+        self.graph.replay()
+        for s in self.seqs:
+            d.pending[s] = 0
+        return self.hidden, self.next
+
