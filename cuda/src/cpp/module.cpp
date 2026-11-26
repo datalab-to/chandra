@@ -64,6 +64,14 @@ NB_MODULE(_core, m) {
                                    K, sms, reinterpret_cast<cudaStream_t>(stream), epilogue));
   }, nb::arg("x"), nb::arg("wp"), nb::arg("sc"), nb::arg("y"), nb::arg("workspace"), nb::arg("counters"),
      nb::arg("M"), nb::arg("N"), nb::arg("K"), nb::arg("sms"), nb::arg("stream"), nb::arg("epilogue") = 0);
+  m.def("decode_gemm_int4", [](uintptr_t x, uintptr_t wp, uintptr_t sc, uintptr_t y, uintptr_t workspace,
+                               uintptr_t counters, int M, int N, int K, int sms, uintptr_t stream, int epilogue) {
+    check(chandra::decode_gemm_int4(reinterpret_cast<const void*>(x), reinterpret_cast<const void*>(wp),
+                                    reinterpret_cast<const void*>(sc), reinterpret_cast<void*>(y),
+                                    reinterpret_cast<float*>(workspace), reinterpret_cast<unsigned*>(counters), M, N,
+                                    K, sms, reinterpret_cast<cudaStream_t>(stream), epilogue));
+  }, nb::arg("x"), nb::arg("wp"), nb::arg("sc"), nb::arg("y"), nb::arg("workspace"), nb::arg("counters"),
+     nb::arg("M"), nb::arg("N"), nb::arg("K"), nb::arg("sms"), nb::arg("stream"), nb::arg("epilogue") = 0);
   m.def("lm_head_bound_i8", [](uintptr_t x, uintptr_t wp, uintptr_t wscale, uintptr_t rowc, uintptr_t xnorm,
                                uintptr_t tile_ub, uintptr_t lb_key, int M, int N, int K, uintptr_t stream) {
     check(chandra::lm_head_bound_i8(reinterpret_cast<const void*>(x), reinterpret_cast<const void*>(wp),

@@ -38,6 +38,11 @@ cudaError_t decode_gemm_fp8(const void* x, const void* wp, const float* wscale, 
 cudaError_t decode_gemm_fp4(const void* x, const void* wp, const void* scales, void* y, float* workspace,
                             unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream, int epilogue = 0);
 
+// The same GEMM with INT4 weights, one BF16 scale per 128 along K (symmetric, stored as q + 8),
+// packed by pack_weight_int4: the W4A16 g128 format. N % 64 == 0, K % 128 == 0.
+cudaError_t decode_gemm_int4(const void* x, const void* wp, const void* scales, void* y, float* workspace,
+                             unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream, int epilogue = 0);
+
 // The exact LM head from INT8 weights. lm_head_bound_i8: INT8 sign-magnitude weights in the
 // FP8 layout with per-row scales; per 128-row tile and token an upper bound of the BF16 head's
 // logits into tile_ub [N / 128][64], and the best lower bound per token into lb_key [M]

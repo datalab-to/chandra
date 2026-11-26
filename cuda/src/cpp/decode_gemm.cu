@@ -118,6 +118,29 @@ __device__ __forceinline__ void fp4x8_to_bf16(uint32_t w, uint32_t m_lo, uint32_
   a.w = *reinterpret_cast<const uint32_t*>(&r3);
 }
 
+// Eight INT4 weights (stored as q + 8) of one k16 block -> the four BF16 A registers:
+// pack_weight_int4 puts a_j's two nibbles at bits 4j and 16 + 4j, so 0x4300 | nibble is the
+// BF16 integer 128 + q + 8 in each half, minus 136 is q exactly, and one HMUL2 by the group's
+// BF16 scale gives bf16(q * s), the reference dequantization.
+__device__ __forceinline__ void int4x8_to_bf16(uint32_t w, uint32_t m0, uint32_t m8, uint4& a) {
+  const uint32_t k136 = 0x43084308u;
+  const uint32_t t0 = (w & 0x000F000Fu) | 0x43004300u;
+  const uint32_t t1 = ((w >> 4) & 0x000F000Fu) | 0x43004300u;
+  const uint32_t t2 = ((w >> 8) & 0x000F000Fu) | 0x43004300u;
+  const uint32_t t3 = ((w >> 12) & 0x000F000Fu) | 0x43004300u;
+  const __nv_bfloat162 c = *reinterpret_cast<const __nv_bfloat162*>(&k136);
+  const __nv_bfloat162 s0 = *reinterpret_cast<const __nv_bfloat162*>(&m0);
+  const __nv_bfloat162 s8 = *reinterpret_cast<const __nv_bfloat162*>(&m8);
+  const __nv_bfloat162 r0 = __hmul2(__hsub2(*reinterpret_cast<const __nv_bfloat162*>(&t0), c), s0);
+  const __nv_bfloat162 r1 = __hmul2(__hsub2(*reinterpret_cast<const __nv_bfloat162*>(&t1), c), s8);
+  const __nv_bfloat162 r2 = __hmul2(__hsub2(*reinterpret_cast<const __nv_bfloat162*>(&t2), c), s0);
+  const __nv_bfloat162 r3 = __hmul2(__hsub2(*reinterpret_cast<const __nv_bfloat162*>(&t3), c), s8);
+  a.x = *reinterpret_cast<const uint32_t*>(&r0);
+  a.y = *reinterpret_cast<const uint32_t*>(&r1);
+  a.z = *reinterpret_cast<const uint32_t*>(&r2);
+  a.w = *reinterpret_cast<const uint32_t*>(&r3);
+}
+
 // Byte b (E + 126) of a scale word -> 2^(E - 1) in both BF16 halves: (b << 7) | (b << 23).
 template <int B>
 __device__ __forceinline__ uint32_t e8_to_bf16x2(uint32_t s) {
@@ -176,8 +199,10 @@ struct BoundArgs {
 
 // SILU: W rows come in 16-row groups of 8 gate rows then their 8 up rows (interleave_gate_up),
 // and y[m][8 * group + r] = silu_mul(gate row, up row): the MLP's activation, y of N / 2 columns.
+// FP4 with I4 (INT4 g128): the same 4-blocks-per-load layout, but the codes are INT4 with one
+// BF16 scale per 128 along K (scale words: s(gid) | s(gid + 8) << 16 per group).
 template <int NP, int RW, int KW, bool ARGMAX = false, bool FP8 = false, bool FP4 = false, bool I8 = false,
-          bool BOUND = false, bool SILU = false>
+          bool BOUND = false, bool SILU = false, bool I4 = false>
 __global__ void __launch_bounds__(kThreads, 2)
     decode_gemm_kernel(const __nv_bfloat16* __restrict__ x, const uint4* __restrict__ wp,
                        __nv_bfloat16* __restrict__ y, float* __restrict__ partial,
@@ -186,6 +211,7 @@ __global__ void __launch_bounds__(kThreads, 2)
                        const BoundArgs bnd) {
   constexpr int BPL = (FP8 || I8) ? 2 : FP4 ? 4 : 1;  // k16 blocks per 16-byte W load
   static_assert(!I8 || !(FP8 || FP4), "one weight format");
+  static_assert(!I4 || FP4, "I4 is a variant of the 4-bit path");
   static_assert(!BOUND || (I8 && !ARGMAX), "the bound pass is INT8, without the argmax epilogue");
   static_assert(!FP8 || KW <= 4, "FP8 needs at least one W load per warp per chunk");
   static_assert(!FP4 || KW <= 2, "FP4 needs at least one W load per warp per chunk");
@@ -231,6 +257,16 @@ __global__ void __launch_bounds__(kThreads, 2)
                                  (static_cast<size_t>(g) * (KB / 4) + kb0 / 4 + kq) * 8 + (lane >> 2)
                            : nullptr;
   constexpr size_t sstep = static_cast<size_t>(KW) * 8;
+  // INT4: the scale word of W load i (global load index L = kb0 / 4 + kq + i * KW) is group L / 2.
+  const uint32_t* sc4 = I4 ? reinterpret_cast<const uint32_t*>(wscale) + static_cast<size_t>(g) * (KB / 8) * 8 +
+                                 (lane >> 2)
+                           : nullptr;
+  auto sc_addr = [&](int i) -> const uint32_t* {
+    if constexpr (I4)
+      return sc4 + static_cast<size_t>((kb0 / 4 + kq + i * KW) >> 1) * 8;
+    else
+      return sc + i * sstep;
+  };
 
   auto load_x = [&](int c, int buf) {
     unsigned char* s = smem + buf * kBufBytes;
@@ -252,10 +288,10 @@ __global__ void __launch_bounds__(kThreads, 2)
   if (3 < nblk) w3 = ld_stream(w + 3 * wstep);
   uint32_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;  // FP4 scale words, in step with w0..w3
   if constexpr (FP4) {
-    if (0 < nblk) s0 = __ldg(sc);
-    if (1 < nblk) s1 = __ldg(sc + sstep);
-    if (2 < nblk) s2 = __ldg(sc + 2 * sstep);
-    if (3 < nblk) s3 = __ldg(sc + 3 * sstep);
+    if (0 < nblk) s0 = __ldg(sc_addr(0));
+    if (1 < nblk) s1 = __ldg(sc_addr(1));
+    if (2 < nblk) s2 = __ldg(sc_addr(2));
+    if (3 < nblk) s3 = __ldg(sc_addr(3));
   }
 
   float acc[2 * NP][4];
@@ -290,13 +326,21 @@ __global__ void __launch_bounds__(kThreads, 2)
         s0 = s1;
         s1 = s2;
         s2 = s3;
-        if (i + kDepth < nblk) s3 = __ldg(sc + (i + kDepth) * sstep);
-        const uint32_t m00 = e8_to_bf16x2<0>(sv), m01 = e8_to_bf16x2<1>(sv);  // row gid, K blocks 0 / 1
-        const uint32_t m80 = e8_to_bf16x2<2>(sv), m81 = e8_to_bf16x2<3>(sv);  // row gid + 8
-        fp4x8_to_bf16(wv.x, m00, m80, af[0]);
-        fp4x8_to_bf16(wv.y, m00, m80, af[1]);
-        fp4x8_to_bf16(wv.z, m01, m81, af[2]);
-        fp4x8_to_bf16(wv.w, m01, m81, af[3]);
+        if (i + kDepth < nblk) s3 = __ldg(sc_addr(i + kDepth));
+        if constexpr (I4) {
+          const uint32_t m0 = __byte_perm(sv, 0u, 0x1010), m8 = __byte_perm(sv, 0u, 0x3232);
+          int4x8_to_bf16(wv.x, m0, m8, af[0]);
+          int4x8_to_bf16(wv.y, m0, m8, af[1]);
+          int4x8_to_bf16(wv.z, m0, m8, af[2]);
+          int4x8_to_bf16(wv.w, m0, m8, af[3]);
+        } else {
+          const uint32_t m00 = e8_to_bf16x2<0>(sv), m01 = e8_to_bf16x2<1>(sv);  // row gid, K blocks 0 / 1
+          const uint32_t m80 = e8_to_bf16x2<2>(sv), m81 = e8_to_bf16x2<3>(sv);  // row gid + 8
+          fp4x8_to_bf16(wv.x, m00, m80, af[0]);
+          fp4x8_to_bf16(wv.y, m00, m80, af[1]);
+          fp4x8_to_bf16(wv.z, m01, m81, af[2]);
+          fp4x8_to_bf16(wv.w, m01, m81, af[3]);
+        }
       } else if constexpr (I8) {
         i8x4_to_bf16(wv.x, af[0].x, af[0].y);
         i8x4_to_bf16(wv.y, af[0].z, af[0].w);
@@ -495,13 +539,13 @@ __global__ void __launch_bounds__(kThreads, 2)
 }
 
 template <int NP, int RW, int KW, bool ARGMAX = false, bool FP8 = false, bool FP4 = false, bool I8 = false,
-          bool BOUND = false, bool SILU = false>
+          bool BOUND = false, bool SILU = false, bool I4 = false>
 cudaError_t launch(const void* x, const void* wp, void* y, float* ws, unsigned* counters, int M, int N,
                    int K, int splits, cudaStream_t stream, unsigned long long* keys = nullptr,
                    const float* wscale = nullptr, BoundArgs bnd = {}) {
   constexpr int smem = 2 * NP * 16 * kRowBytes;
   const dim3 grid(N / (16 * RW), splits);
-  decode_gemm_kernel<NP, RW, KW, ARGMAX, FP8, FP4, I8, BOUND, SILU><<<grid, kThreads, smem, stream>>>(
+  decode_gemm_kernel<NP, RW, KW, ARGMAX, FP8, FP4, I8, BOUND, SILU, I4><<<grid, kThreads, smem, stream>>>(
       static_cast<const __nv_bfloat16*>(x), static_cast<const uint4*>(wp), static_cast<__nv_bfloat16*>(y),
       ws, counters, M, N, K, splits, keys, wscale, bnd);
   return cudaGetLastError();
@@ -509,16 +553,16 @@ cudaError_t launch(const void* x, const void* wp, void* y, float* ws, unsigned* 
 
 // Weight format (FP8 / FP4 / BF16) and epilogue for one decode GEMM; invalid row-group counts
 // for a format (it needs whole W loads per warp per chunk) are not instantiated.
-template <int NP, bool FP8, bool FP4, bool SILU>
+template <int NP, bool FP8, bool FP4, bool SILU, bool I4 = false>
 cudaError_t launch_fmt(int rw, const void* x, const void* wp, const float* sc, void* y, float* ws,
                        unsigned* counters, int M, int N, int K, int splits, cudaStream_t stream) {
   switch (rw) {
     case 8:
-      return launch<NP, 8, 1, false, FP8, FP4, false, false, SILU>(x, wp, y, ws, counters, M, N, K, splits, stream,
-                                                                   nullptr, sc);
+      return launch<NP, 8, 1, false, FP8, FP4, false, false, SILU, I4>(x, wp, y, ws, counters, M, N, K, splits,
+                                                                       stream, nullptr, sc);
     case 4:
-      return launch<NP, 4, 2, false, FP8, FP4, false, false, SILU>(x, wp, y, ws, counters, M, N, K, splits, stream,
-                                                                   nullptr, sc);
+      return launch<NP, 4, 2, false, FP8, FP4, false, false, SILU, I4>(x, wp, y, ws, counters, M, N, K, splits,
+                                                                       stream, nullptr, sc);
     case 2:
       if constexpr (!FP4)
         return launch<NP, 2, 4, false, FP8, FP4, false, false, SILU>(x, wp, y, ws, counters, M, N, K, splits,
@@ -534,17 +578,17 @@ cudaError_t launch_fmt(int rw, const void* x, const void* wp, const float* sc, v
   }
 }
 
-template <bool FP8, bool FP4>
+template <bool FP8, bool FP4, bool I4 = false>
 cudaError_t gemm_entry(const void* x, const void* wp, const float* sc, void* y, float* ws, unsigned* counters, int M,
                        int N, int K, int sms, int epilogue, cudaStream_t stream) {
   if (epilogue != 0 && epilogue != 1) return cudaErrorInvalidValue;
   const DecodeGemmPlan p = decode_gemm_plan(N, K, sms);
 #define CHANDRA_GEMM_CASE(NPV)                                                                                  \
   case NPV:                                                                                                    \
-    return epilogue ? launch_fmt<NPV, FP8, FP4, true>(p.row_groups, x, wp, sc, y, ws, counters, M, N, K, p.splits, \
-                                                      stream)                                                  \
-                    : launch_fmt<NPV, FP8, FP4, false>(p.row_groups, x, wp, sc, y, ws, counters, M, N, K,       \
-                                                       p.splits, stream);
+    return epilogue ? launch_fmt<NPV, FP8, FP4, true, I4>(p.row_groups, x, wp, sc, y, ws, counters, M, N, K,    \
+                                                          p.splits, stream)                                    \
+                    : launch_fmt<NPV, FP8, FP4, false, I4>(p.row_groups, x, wp, sc, y, ws, counters, M, N, K,   \
+                                                           p.splits, stream);
   switch ((M + 15) / 16) {
     CHANDRA_GEMM_CASE(1)
     CHANDRA_GEMM_CASE(2)
@@ -651,6 +695,13 @@ cudaError_t decode_gemm_fp4(const void* x, const void* wp, const void* scales, v
   if (M < 1 || M > 64 || N % 64 != 0 || K % kKC != 0) return cudaErrorInvalidValue;
   return gemm_entry<false, true>(x, wp, static_cast<const float*>(scales), y, workspace, counters, M, N, K, sms,
                                  epilogue, stream);
+}
+
+cudaError_t decode_gemm_int4(const void* x, const void* wp, const void* scales, void* y, float* workspace,
+                             unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream, int epilogue) {
+  if (M < 1 || M > 64 || N % 64 != 0 || K % kKC != 0) return cudaErrorInvalidValue;
+  return gemm_entry<false, true, true>(x, wp, static_cast<const float*>(scales), y, workspace, counters, M, N, K,
+                                       sms, epilogue, stream);
 }
 
 cudaError_t decode_gemm_fp8(const void* x, const void* wp, const float* wscale, void* y, float* workspace,

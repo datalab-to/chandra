@@ -192,15 +192,50 @@ def test_exact_lm_head_equals_bf16_head():
     print("mean candidate tiles per token:", [round(c, 1) for c in cands])
 
 
-@pytest.mark.parametrize("fmt", ["bf16", "fp8", "fp4"])
+@pytest.mark.parametrize("fmt", ["bf16", "fp8", "fp4", "int4"])
 @pytest.mark.parametrize("f,k", [(9216, 2560), (1024, 2560)])  # the MLP; a narrow one, split along K
 def test_silu_mul_epilogue_equals_separate_ops(fmt, f, k):
     torch.manual_seed(f + k)
     w = (torch.randn(2 * f, k, device="cuda") * 0.02).to(torch.bfloat16)
     cls = {"bf16": chandra_cuda.DecodeLinear, "fp8": chandra_cuda.DecodeLinearFP8,
-           "fp4": chandra_cuda.DecodeLinearFP4}[fmt]
+           "fp4": chandra_cuda.DecodeLinearFP4, "int4": chandra_cuda.DecodeLinearINT4}[fmt]
     plain, fused = cls(w), cls(w, epilogue="silu_mul")
     for m in (1, 9, 33, 64):
         x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
         assert torch.equal(fused(x), chandra_cuda.silu_mul(plain(x))), (fmt, m)
+
+
+@pytest.mark.parametrize("n,k", [s for s in SHAPES if s[0] % 64 == 0])
+def test_int4_matches_its_dequantized_weight(n, k):
+    torch.manual_seed(n * 5 + k)
+    w = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
+    lin = chandra_cuda.DecodeLinearINT4(w, keep_codes=True)
+    wd = lin.dequantized()
+    rel = ((wd - w.float()).norm() / w.float().norm()).item()
+    assert rel < 0.12, rel  # 16 levels over the group's range
+    for m in ROWS:
+        x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
+        ref = x.float() @ wd.T
+        got = lin(x).float()
+        assert (got - ref).abs().max().item() <= ref.abs().max().item() * 2**-7 + 1e-3, m
+
+
+def test_int4_quantizer_matches_the_checkpoint_writer():
+    """The engine's INT4 g128 weights are the ones vLLM is gated on (make_ct_checkpoint.py)."""
+    import importlib.util
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[2] / "bench" / "make_ct_checkpoint.py"
+    if not path.exists():
+        pytest.skip("bench/make_ct_checkpoint.py not in this checkout")
+    spec = importlib.util.spec_from_file_location("mkct", path)
+    mk = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mk)
+    torch.manual_seed(14)
+    w = (torch.randn(256, 2560, device="cuda") * 0.03).to(torch.bfloat16)
+    q, s = chandra_cuda.int4_g128_quantize(w)
+    packed, s2 = mk.quant_w4_g128(w)
+    assert torch.equal(s, s2)
+    unpacked = torch.stack([(packed >> (4 * i)) & 0xF for i in range(8)], dim=-1).reshape(256, 2560) - 8
+    assert torch.equal(q.to(torch.int32), unpacked.to(torch.int32))
 

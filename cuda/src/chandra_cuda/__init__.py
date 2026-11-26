@@ -10,7 +10,7 @@ import torch
 
 from . import _core
 
-__all__ = ["pack_weight", "pack_weight_fp8", "DecodeLinear", "DecodeLinearFP8", "DecodeLinearFP4", "mxfp4_quantize",
+__all__ = ["pack_weight", "pack_weight_fp8", "DecodeLinear", "DecodeLinearFP8", "DecodeLinearFP4", "DecodeLinearINT4", "mxfp4_quantize", "int4_g128_quantize",
            "pack_weight_fp4", "pack_weight_i8", "interleave_gate_up", "LMHead", "LMHeadFP8", "LMHeadExact", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul",
            "qk_norm_rope_kv", "vit_attn"]
 
@@ -618,4 +618,76 @@ class LMHeadExact:
         _core.lm_head_recheck(x.data_ptr(), self.bf16.packed.data_ptr(), self.tile_ub.data_ptr(), lb.data_ptr(),
                               keys.data_ptr(), m, self.n, self.k, torch.cuda.current_stream(self.device).cuda_stream)
         return 0xFFFFFFFF - (keys & 0xFFFFFFFF)
+
+
+def int4_g128_quantize(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric INT4 with one BF16 scale per 128 along K, as compressed-tensors' minmax observer
+    (and bench/make_ct_checkpoint.py --scheme w4a16): s = bf16(amax / 7.5), q = clamp(round(w / s),
+    -8, 7). Returns (q [N, K] int8, s [N, K / 128] BF16); the weight is bf16(q * s)."""
+    n, k = w.shape
+    if k % 128:
+        raise ValueError("K must be a multiple of 128")
+    q = torch.empty(n, k, dtype=torch.int8, device=w.device)
+    s = torch.empty(n, k // 128, dtype=torch.bfloat16, device=w.device)
+    for i in range(0, n, 8192):
+        wf = w[i : i + 8192].float().reshape(-1, k // 128, 128)
+        sc = (wf.abs().amax(dim=2) / 7.5).clamp_min(1e-12).to(torch.bfloat16)
+        q[i : i + 8192] = torch.round(wf / sc.float()[..., None]).clamp(-8, 7).to(torch.int8).reshape(-1, k)
+        s[i : i + 8192] = sc
+    return q, s
+
+
+def pack_weight_int4(q: torch.Tensor, s: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Lay out INT4 g128 weights for DecodeLinearINT4: per 16-row group, 64-wide K load and lane, four
+    words (one per k16 block) with a_j's two codes (q + 8) at bits 4j and 16 + 4j; scales per (group,
+    128-wide K group, gid) as one word s(gid) | s(gid + 8) << 16."""
+    n, k = q.shape
+    if n % 16 or k % 128:
+        raise ValueError("N must be a multiple of 16 and K of 128")
+    u = (q.to(torch.int64) + 8).reshape(n // 16, 2, 8, k // 64, 4, 2, 4, 2)  # g rh gid L bb kh tig e
+    j = torch.tensor([[0, 2], [1, 3]], device=q.device)  # [rh][kh] -> register a_j
+    shift = (4 * j[:, None, None, None, :, None, None] + torch.tensor([0, 16], device=q.device)).view(
+        1, 2, 1, 1, 1, 2, 1, 2)
+    word = (u << shift).sum(dim=(1, 5, 7))  # [g, gid, L, bb, tig]
+    packed = word.permute(0, 2, 1, 4, 3).contiguous()  # [g, L, gid, tig, bb]
+    packed = torch.where(packed >= 2**31, packed - 2**32, packed).to(torch.int32).reshape(-1)
+    sb = s.contiguous().view(torch.int16).to(torch.int64) & 0xFFFF  # [n, k / 128]
+    sb = sb.reshape(n // 16, 2, 8, k // 128)
+    sw = (sb[:, 0] | (sb[:, 1] << 16)).permute(0, 2, 1).contiguous()  # [g, G, gid]
+    sw = torch.where(sw >= 2**31, sw - 2**32, sw).to(torch.int32).reshape(-1)
+    return packed, sw
+
+
+class DecodeLinearINT4(DecodeLinear):
+    """DecodeLinear with INT4 weights, one BF16 scale per 128 along K (the W4A16 g128 format of
+    make_ct_checkpoint.py --scheme w4a16): 4.125 bits per weight. Approximate (class G):
+    y = x @ bf16(q * s).T. N must be a multiple of 64."""
+
+    def __init__(self, weight: torch.Tensor, keep_codes: bool = False, epilogue: str | None = None):
+        if weight.shape[0] % 64:
+            raise ValueError("N must be a multiple of 64")
+        super().__init__(weight, _pack=False, epilogue=epilogue)
+        w, self._prep = self._prep, None
+        q, s = int4_g128_quantize(w)
+        self.q, self.s = (q, s) if keep_codes else (None, None)
+        self.packed, self.scales = pack_weight_int4(q, s)
+
+    def dequantized(self) -> torch.Tensor:
+        if self.q is None:
+            raise ValueError("built without keep_codes=True")
+        return (self.q.float() * self.s.float().repeat_interleave(128, dim=1)).to(torch.bfloat16).float()
+
+    def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != self.k:
+            raise ValueError(f"expected a [M, {self.k}] bfloat16 input")
+        m = x.shape[0]
+        if not 1 <= m <= 64:
+            raise ValueError("M must be between 1 and 64")
+        x = x.contiguous()
+        if out is None:
+            out = torch.empty(m, self.n_out, dtype=torch.bfloat16, device=self.device)
+        _core.decode_gemm_int4(x.data_ptr(), self.packed.data_ptr(), self.scales.data_ptr(), out.data_ptr(),
+                               self.workspace.data_ptr(), self.counters.data_ptr(), m, self.n, self.k, self.sms,
+                               torch.cuda.current_stream(self.device).cuda_stream, self.epilogue)
+        return out
 
