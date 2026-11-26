@@ -125,6 +125,13 @@ pip install "chandra-ocr[all]"
 
 If you're using the HuggingFace method, we also recommend installing [flash attention](https://github.com/Dao-AILab/flash-attention) for better performance.
 
+Chandra 2's linear-attention (Gated DeltaNet) layers use fast kernels from [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) and [causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) when they are installed; without them transformers falls back to a much slower PyTorch path:
+
+```bash
+pip install flash-linear-attention   # needs transformers>=5.6.2
+pip install causal-conv1d --no-build-isolation   # builds against your torch and CUDA
+```
+
 ### From Source
 
 ```bash
@@ -168,7 +175,7 @@ chandra --install-skill
 - `--vllm-api-base TEXT`: Override `VLLM_API_BASE` URL
 - `--vllm-api-key TEXT`: Override `VLLM_API_KEY`
 - `--vllm-model-name TEXT`: Override `VLLM_MODEL_NAME`
-- `--batch-size INTEGER`: Pages per batch (default: 28 for vllm, 1 for hf)
+- `--batch-size INTEGER`: Pages per batch (default: 28 for vllm; for hf, 8 on GPUs with 40 GB or more, 4 on 24 GB, else 1)
 - `--skill` / `--install-skill`: Print or install the bundled Chandra AI agent skill
 
 **Output Structure:**

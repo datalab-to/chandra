@@ -212,7 +212,7 @@ def save_merged_output(
     "--batch-size",
     type=int,
     default=None,
-    help="Number of pages to process in a batch.",
+    help="Number of pages to process in a batch (default: 28 for vllm; for hf, 8 on GPUs with 40 GB or more, 4 on 24 GB, else 1).",
 )
 @click.option(
     "--paginate_output",
@@ -286,12 +286,14 @@ def main(
 
     method = method.lower()
     if method == "hf":
+        if batch_size is None:
+            from chandra.model.hf import default_batch_size
+
+            batch_size = default_batch_size()
         if not stdout:
             click.echo(
-                "When using '--method hf', ensure that the batch size is set correctly. We will default to batch size of 1."
+                f"Using batch size {batch_size} for '--method hf' (set --batch-size to change)."
             )
-        if batch_size is None:
-            batch_size = 1
     elif method == "vllm":
         if batch_size is None:
             batch_size = 28

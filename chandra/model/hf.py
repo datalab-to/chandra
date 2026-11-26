@@ -20,6 +20,29 @@ def resolve_device(torch_mod, model=None) -> str:
     return "cpu"
 
 
+def default_batch_size() -> int:
+    """Pages per `generate` call for the HF backend, from the GPU's memory.
+
+    At batch 1, decoding is bound by per-step overhead (Python and kernel
+    launches), so batching pages gives several times the pages per second.
+    Peak memory with full-size pages (~6 MP) is ~18 GB at 4 pages and ~27 GB
+    at 8.
+    """
+    try:
+        import torch
+    except ImportError:
+        return 1
+    device = resolve_device(torch)
+    if not device.startswith("cuda"):
+        return 1
+    total_gb = torch.cuda.get_device_properties(torch.device(device)).total_memory / 2**30
+    if total_gb >= 40:
+        return 8
+    if total_gb >= 22:
+        return 4
+    return 1
+
+
 def generate_hf(
     batch: List[BatchInputItem],
     model,
@@ -74,8 +97,21 @@ def generate_hf(
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     )
+    # In a batch, pages that finish early are padded to the longest one;
+    # count each page's tokens up to and including its first stop token.
+    stop_ids = set(eos_token_id)
+    pad_id = model.processor.tokenizer.pad_token_id
+    if pad_id is not None:
+        stop_ids.add(pad_id)
+
+    def generated_len(ids) -> int:
+        for i, tok in enumerate(ids.tolist()):
+            if tok in stop_ids:
+                return i + 1
+        return len(ids)
+
     results = [
-        GenerationResult(raw=out, token_count=len(ids), error=False)
+        GenerationResult(raw=out, token_count=generated_len(ids), error=False)
         for out, ids in zip(output_text, generated_ids_trimmed)
     ]
     return results
