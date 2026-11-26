@@ -212,7 +212,7 @@ def save_merged_output(
     "--batch-size",
     type=int,
     default=None,
-    help="Number of pages to process in a batch.",
+    help="Number of pages to process in a batch (default: all pages of a file for vllm, 1 for hf).",
 )
 @click.option(
     "--paginate_output",
@@ -292,9 +292,9 @@ def main(
             )
         if batch_size is None:
             batch_size = 1
-    elif method == "vllm":
-        if batch_size is None:
-            batch_size = 28
+    # For vllm, batch_size None sends all of a file's pages at once: the client
+    # keeps --max-workers of them in flight and sends the next page as soon as
+    # one finishes, instead of waiting for each batch's slowest page.
 
     if not stdout:
         click.echo("Chandra CLI - Starting OCR processing")
@@ -331,8 +331,9 @@ def main(
                 click.echo(f"  Loaded {len(images)} page(s)")
 
             all_results = []
-            for batch_start in range(0, len(images), batch_size):
-                batch_end = min(batch_start + batch_size, len(images))
+            step = batch_size or max(1, len(images))
+            for batch_start in range(0, len(images), step):
+                batch_end = min(batch_start + step, len(images))
                 batch_images = images[batch_start:batch_end]
                 batch = [
                     BatchInputItem(image=img, prompt_type="ocr_layout")
