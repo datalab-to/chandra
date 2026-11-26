@@ -10,7 +10,7 @@ import torch
 
 from . import _core
 
-__all__ = ["pack_weight", "pack_weight_fp8", "DecodeLinear", "DecodeLinearFP8", "LMHead", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul",
+__all__ = ["pack_weight", "pack_weight_fp8", "DecodeLinear", "DecodeLinearFP8", "LMHead", "LMHeadFP8", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul",
            "qk_norm_rope_kv", "vit_attn"]
 
 
@@ -179,7 +179,7 @@ class DecodeLinear:
     once (its workspace is shared).
     """
 
-    def __init__(self, weight: torch.Tensor):
+    def __init__(self, weight: torch.Tensor, _pack: bool = True):
         if not weight.is_cuda:
             raise ValueError("weight must be on a CUDA device")
         self.n, self.k = weight.shape
@@ -187,7 +187,7 @@ class DecodeLinear:
         self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         if self.k % 128:
             raise ValueError("K must be a multiple of 128")
-        self.packed = pack_weight(weight)
+        self.packed = pack_weight(weight) if _pack else None
         ws = _core.decode_gemm_workspace_bytes(self.n, self.k, self.sms)
         self.workspace = torch.empty(max(ws // 4, 1), dtype=torch.float32, device=self.device)
         self.counters = torch.zeros(
@@ -300,9 +300,13 @@ def pack_weight_fp8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     n, k = w.shape
     if n % 16 or k % 32:
         raise ValueError(f"weight shape {tuple(w.shape)}: N must be a multiple of 16 and K of 32")
-    wf = w.float()
-    scale = (wf.abs().amax(dim=1) / 448.0).clamp_min(1e-12)
-    q = (wf / scale[:, None]).to(torch.float8_e4m3fn).view(torch.uint8)
+    scale = torch.empty(n, dtype=torch.float32, device=w.device)
+    q = torch.empty(n, k, dtype=torch.uint8, device=w.device)
+    for i in range(0, n, 16384):  # in row blocks: an FP32 copy of an LM head would be 2.5 GB
+        wf = w[i : i + 16384].float()
+        scale[i : i + 16384] = (wf.abs().amax(dim=1) / 448.0).clamp_min(1e-12)
+        q[i : i + 16384] = (wf / scale[i : i + 16384, None]).to(torch.float8_e4m3fn).view(torch.uint8)
+        del wf
     # q[g*16 + rh*8 + gid][kb2*32 + kbp*16 + kh*8 + tig*2 + e] -> [g][kb2][gid][tig][kbp][kh][rh][e]
     packed = (
         q.reshape(n // 16, 2, 8, k // 32, 2, 2, 4, 2)
@@ -320,7 +324,7 @@ class DecodeLinearFP8(DecodeLinear):
     def __init__(self, weight: torch.Tensor):
         if weight.shape[0] % 32:
             raise ValueError("N must be a multiple of 32")
-        super().__init__(weight)
+        super().__init__(weight, _pack=False)  # shapes and the split workspace only
         self.packed, self.scale = pack_weight_fp8(weight)
 
     def dequantized(self) -> torch.Tensor:
@@ -375,3 +379,36 @@ def vit_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens: torc
                    0 if k8 is None else k8.data_ptr(), 0 if k_scale is None else k_scale.data_ptr(),
                    0 if k_mean is None else k_mean.data_ptr(), _stream(q))
     return out
+
+
+class LMHeadFP8:
+    """Greedy tokens from FP8 e4m3 weights (per-row scales, pack_weight_fp8): half an LM head's
+    bytes, for MTP drafts (the verify step decides what is kept, so drafts may be approximate).
+    rows: optional token ids to keep (a draft vocabulary); returned ids are always vocabulary ids.
+    The kept rows are padded to a multiple of 128 by repeating the first (ties go to the lowest)."""
+
+    def __init__(self, weight: torch.Tensor, rows: torch.Tensor | None = None):
+        self.device = weight.device
+        if rows is not None:
+            rows = rows.to(self.device, torch.int64)
+            pad = (-rows.numel()) % 128
+            if pad:
+                rows = torch.cat([rows, rows[:1].expand(pad)])
+            weight = weight[rows]
+        self.rows = rows
+        self.n, self.k = weight.shape
+        if self.n % 128 or self.k % 128:
+            raise ValueError("vocabulary and K must be multiples of 128")
+        self.packed, self.scale = pack_weight_fp8(weight)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        m = x.shape[0]
+        if x.dtype != torch.bfloat16 or x.shape[1] != self.k or not 1 <= m <= 64:
+            raise ValueError(f"expected a [1..64, {self.k}] bfloat16 input")
+        x = x.contiguous()
+        keys = torch.zeros(m, dtype=torch.int64, device=self.device)
+        _core.decode_gemm_argmax_fp8(x.data_ptr(), self.packed.data_ptr(), self.scale.data_ptr(), keys.data_ptr(),
+                                     m, self.n, self.k, torch.cuda.current_stream(self.device).cuda_stream)
+        idx = 0xFFFFFFFF - (keys & 0xFFFFFFFF)
+        return idx if self.rows is None else self.rows[idx]
+

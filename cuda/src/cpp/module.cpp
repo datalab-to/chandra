@@ -55,6 +55,14 @@ NB_MODULE(_core, m) {
                                           reinterpret_cast<unsigned long long*>(keys), M, N, K, sms,
                                           reinterpret_cast<cudaStream_t>(stream)));
       });
+  m.def(
+      "decode_gemm_argmax_fp8",
+      [](uintptr_t x, uintptr_t wp, uintptr_t wscale, uintptr_t keys, int M, int N, int K, uintptr_t stream) {
+        check(chandra::decode_gemm_argmax_fp8(reinterpret_cast<const void*>(x), reinterpret_cast<const void*>(wp),
+                                              reinterpret_cast<const float*>(wscale),
+                                              reinterpret_cast<unsigned long long*>(keys), M, N, K,
+                                              reinterpret_cast<cudaStream_t>(stream)));
+      });
   m.def("decode_gemm_workspace_bytes", &chandra::decode_gemm_workspace_bytes, nb::arg("N"), nb::arg("K"),
         nb::arg("sms"));
   m.def("decode_gemm_counters", &chandra::decode_gemm_counters, nb::arg("N"), nb::arg("K"), nb::arg("sms"));

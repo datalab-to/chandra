@@ -102,3 +102,28 @@ def test_fp8_same_result_at_every_batch_size():
     for m in ROWS:
         assert torch.equal(lin(x[:m]), full[:m]), m
 
+
+def test_fp8_lm_head_matches_fp8_logits():
+    torch.manual_seed(8)
+    n, k = 248320, 2560
+    w = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
+    head = chandra_cuda.LMHeadFP8(w)
+    lin = chandra_cuda.DecodeLinearFP8(w)  # one split at this N: the same accumulation
+    for m in (1, 9, 33, 64):
+        x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
+        assert torch.equal(head(x), lin(x).float().argmax(dim=-1)), m
+
+
+def test_fp8_lm_head_subset_returns_vocabulary_ids():
+    torch.manual_seed(9)
+    w = (torch.randn(8192, 2560, device="cuda") * 0.02).to(torch.bfloat16)
+    rows = torch.randperm(8192, device="cuda")[:1000].sort().values  # not a multiple of 128
+    head = chandra_cuda.LMHeadFP8(w, rows=rows)
+    x = torch.randn(16, 2560, device="cuda").to(torch.bfloat16)
+    got = head(x)
+    assert bool(torch.isin(got, rows).all())
+    ref = torch.nn.functional.linear(x, w[rows]).float()
+    best = ref.max(dim=-1).values
+    picked = ref.gather(1, torch.searchsorted(rows, got)[:, None])[:, 0]
+    assert ((best - picked) <= 0.05 * best.abs() + 0.05).all()  # FP8 weights: near the BF16 best
+

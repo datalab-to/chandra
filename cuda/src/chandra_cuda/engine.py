@@ -22,7 +22,8 @@ import os
 
 import torch
 
-from . import _core, DecodeLinear, LMHead, attn_decode, gdn_decode, qk_norm_rope_kv, rmsnorm_add, silu_mul
+from . import (_core, DecodeLinear, LMHead, LMHeadFP8, attn_decode, gdn_decode, qk_norm_rope_kv, rmsnorm_add,
+               silu_mul)
 
 PAGE = 64
 ROWS = 64  # the decode GEMMs take up to 64 rows per call
@@ -44,6 +45,7 @@ class Decoder:
         self.layer_types = cfg["layer_types"]
         self.rope_theta = float(cfg["rope_parameters"]["rope_theta"])
         self.device = torch.device(device)
+        self.ckpt_dir = ckpt_dir
         self.max_seqs, self.max_ctx = max_seqs, max_ctx
         self.k = draft_tokens if mtp else 0
         self.t_max = self.k + 1  # query rows per sequence in a verify step
@@ -53,6 +55,7 @@ class Decoder:
         self.embed = g(P + "embed_tokens.weight")
         self.final_w = g(P + "norm.weight")
         self.lm_head = LMHead(g("lm_head.weight"))
+        self.draft_head = self.lm_head
 
         def attn_layer(p):
             a = p + "self_attn."
@@ -265,7 +268,21 @@ class Decoder:
         xn, res = rmsnorm_add(res, M["w_post"], x=y)
         z = _rows(M["down"], silu_mul(_rows(M["gate_up"], xn)))
         h, _ = rmsnorm_add(res, M["w_norm"], x=z)
-        return h, _rows(self.lm_head, h)
+        return h, _rows(self.draft_head, h)
+
+    def set_draft_head(self, kind: str = "bf16", rows: torch.Tensor | None = None):
+        """The LM head the MTP drafts use: "bf16" (the main model's), or "fp8" with an optional
+        draft vocabulary (token ids). Drafts only change how many tokens a step keeps, never which."""
+        if kind == "bf16":
+            self.draft_head = self.lm_head
+        elif kind == "fp8":
+            from safetensors import safe_open
+
+            f = safe_open(os.path.join(self.ckpt_dir, "model.safetensors"), "pt", device=str(self.device))
+            self.draft_head = LMHeadFP8(f.get_tensor("lm_head.weight"), rows=rows)
+            torch.cuda.empty_cache()
+        else:
+            raise ValueError(kind)
 
     @torch.no_grad()
     def generate_mtp(self, seqs: list[int], first: torch.Tensor, h_last: torch.Tensor, max_new: int,

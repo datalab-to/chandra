@@ -406,6 +406,17 @@ cudaError_t decode_gemm_argmax(const void* x, const void* wp, unsigned long long
   }
 }
 
+cudaError_t decode_gemm_argmax_fp8(const void* x, const void* wp, const float* wscale, unsigned long long* keys,
+                                   int M, int N, int K, cudaStream_t stream) {
+  if (M < 1 || M > 64 || N % 128 != 0 || K % kKC != 0) return cudaErrorInvalidValue;
+  switch ((M + 15) / 16) {
+    case 1: return launch<1, 8, 1, true, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys, wscale);
+    case 2: return launch<2, 8, 1, true, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys, wscale);
+    case 3: return launch<3, 8, 1, true, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys, wscale);
+    default: return launch<4, 8, 1, true, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys, wscale);
+  }
+}
+
 cudaError_t decode_gemm_fp8(const void* x, const void* wp, const float* wscale, void* y, float* workspace,
                             unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream) {
   if (M < 1 || M > 64 || N % 32 != 0 || K % kKC != 0) return cudaErrorInvalidValue;

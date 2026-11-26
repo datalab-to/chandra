@@ -36,6 +36,8 @@ def main():
     ap.add_argument("--pages", type=int, default=4)
     ap.add_argument("--steps", type=int, default=256)
     ap.add_argument("--k", type=int, default=3)
+    ap.add_argument("--draft-heads", default="bf16,fp8,fp8:32768,fp8:65536",
+                    help="draft LM heads to try: bf16, fp8, or fp8:N (token ids below N plus the added tokens)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     ckpt = glob.glob(os.path.expanduser(
@@ -91,15 +93,28 @@ def main():
         torch.cuda.synchronize()
         t_plain = time.perf_counter() - t0
 
-        # MTP drafts + verify, from the same prefill state (the MTP KV over the prompt is unchanged).
-        for i, (cache, n, delta) in enumerate(saved):
-            dec.load_from_hf_cache(i, cache, 0, n, delta)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        spec, steps = dec.generate_mtp(seqs, torch.tensor(firsts, device="cuda"), torch.stack(h_last), a.steps,
+        # MTP drafts + verify, from the same prefill state (the MTP KV over the prompt is unchanged),
+        # once per draft head; the first is reported in full.
+        added = sorted(int(i) for i in tok.added_tokens_decoder)
+        runs = []
+        for head in a.draft_heads.split(","):
+            if head == "bf16":
+                dec.set_draft_head("bf16")
+            elif head == "fp8":
+                dec.set_draft_head("fp8")
+            else:
+                lim = int(head.split(":")[1])
+                rows = torch.tensor(sorted(set(range(lim)) | set(added) | eos), device="cuda")
+                dec.set_draft_head("fp8", rows=rows)
+            for i, (cache, n, delta) in enumerate(saved):
+                dec.load_from_hf_cache(i, cache, 0, n, delta)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            out, st = dec.generate_mtp(seqs, torch.tensor(firsts, device="cuda"), torch.stack(h_last), a.steps,
                                        eos=eos)
-        torch.cuda.synchronize()
-        t_spec = time.perf_counter() - t0
+            torch.cuda.synchronize()
+            runs.append((head, out, st, time.perf_counter() - t0))
+        spec, steps, t_spec = runs[0][1], runs[0][2], runs[0][3]
 
     report = []
     for i in range(len(pick)):
@@ -121,6 +136,11 @@ def main():
     print(f"plain: {t_plain / (a.steps - 1) * 1e3:.1f} ms per step, {tps_plain:.0f} tokens/s; spec: "
           f"{t_spec / max(1, steps) * 1e3:.1f} ms per verify step incl. {a.k} draft passes, {tps_spec:.0f} tokens/s "
           f"({tps_spec / tps_plain:.2f}x, eager Python, no CUDA graph)")
+    for head, out, st, t in runs:
+        g = sum(len(s) - 1 for s in out)
+        same = sum(lead(plain[i][: len(out[i])], out[i])[0] == len(out[i]) for i in range(len(pick)))
+        print(f"draft head {head}: {g / max(1, st * len(pick)):.2f} tokens per sequence-step, {st} steps, "
+              f"{g / t:.0f} tokens/s, {same}/{len(pick)} pages identical to plain")
     if a.out:
         json.dump(report, open(a.out, "w"), indent=1)
 

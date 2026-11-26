@@ -38,4 +38,9 @@ cudaError_t decode_gemm_fp8(const void* x, const void* wp, const float* wscale, 
 cudaError_t decode_gemm_argmax(const void* x, const void* wp, unsigned long long* keys, int M, int N, int K,
                                int sms, cudaStream_t stream);
 
+// The same with FP8 e4m3 weights and per-row scales (decode_gemm_fp8's layout): half the
+// bytes of an LM head, for draft tokens that a verify step checks anyway.
+cudaError_t decode_gemm_argmax_fp8(const void* x, const void* wp, const float* wscale, unsigned long long* keys,
+                                   int M, int N, int K, cudaStream_t stream);
+
 }  // namespace chandra
