@@ -22,18 +22,23 @@ def main():
     ap.add_argument("--lm-head", default="bf16")
     ap.add_argument("--state", default="fp32", choices=["fp32", "fp16"])
     ap.add_argument("--reps", type=int, default=20)
+    ap.add_argument("--verify", type=int, default=1, help="rows per sequence: 1 = plain decode, k + 1 = an MTP verify step")
+    ap.add_argument("--kv", default="bf16", choices=["bf16", "int8"])
     a = ap.parse_args()
     ckpt = glob.glob(os.path.expanduser("~/.cache/huggingface/hub/models--datalab-to--chandra-ocr-2/snapshots/*/"))[0]
     bmax = max(a.batch)
     for wf in a.weights:
-        dec = Decoder(ckpt, max_seqs=bmax, max_ctx=a.ctx + 64, weights=wf, lm_head=a.lm_head,
-                      state_dtype=torch.float16 if a.state == "fp16" else torch.float32)
+        dec = Decoder(ckpt, max_seqs=bmax, max_ctx=a.ctx + 64, weights=wf, lm_head=a.lm_head, kv=a.kv,
+                      state_dtype=torch.float16 if a.state == "fp16" else torch.float32,
+                      draft_tokens=max(1, a.verify - 1), mtp=a.verify > 1)
         for b in a.batch:
             seqs = list(range(b))
             for s in seqs:
                 dec.length[s] = a.ctx
-            gs = dec.graph_step(seqs)
-            tok = torch.zeros(b, dtype=torch.int64, device="cuda")
+            if b * a.verify > 64 * 4:
+                continue
+            gs = dec.graph_step(seqs, T=a.verify, commit=a.verify > 1)
+            tok = torch.zeros(b * a.verify, dtype=torch.int64, device="cuda")
             for _ in range(3):
                 gs(tok)
             torch.cuda.synchronize()
@@ -44,8 +49,9 @@ def main():
             en.record()
             torch.cuda.synchronize()
             ms = st.elapsed_time(en) / a.reps
-            print(f"weights {wf:6s} lm_head {a.lm_head:5s} state {a.state} B={b:3d} ctx {a.ctx}: "
-                  f"{ms:7.2f} ms per step, {b / ms * 1e3:7.0f} tokens/s", flush=True)
+            what = "step" if a.verify == 1 else f"verify step ({a.verify} rows/seq)"
+            print(f"weights {wf:6s} lm_head {a.lm_head:5s} state {a.state} kv {a.kv} B={b:3d} ctx {a.ctx}: "
+                  f"{ms:7.2f} ms per {what}, {b / ms * 1e3:7.0f} sequence-steps/s", flush=True)
             del gs
         del dec
         torch.cuda.empty_cache()
