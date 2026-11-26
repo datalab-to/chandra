@@ -5,6 +5,7 @@
 
 #include "attn_decode.h"
 #include "decode_gemm.h"
+#include "gdn_decode.h"
 
 namespace nb = nanobind;
 
@@ -77,4 +78,36 @@ NB_MODULE(_core, m) {
     chandra::attn_decode_split(B, max_ctx, sms, &sps, &ms);
     return nb::make_tuple(sps, ms);
   });
+
+  m.def(
+      "gdn_decode",
+      [](uintptr_t qkv, int64_t qkv_stride, uintptr_t z, int64_t z_stride, uintptr_t b, uintptr_t a,
+         int64_t ab_stride, uintptr_t A_log, uintptr_t dt_bias, uintptr_t conv_w, uintptr_t norm_w,
+         uintptr_t state, bool state_fp16, uintptr_t slot_in, uintptr_t slot_out, uintptr_t conv_ring, int ring,
+         uintptr_t conv_slot, uintptr_t pos, uintptr_t out, int64_t out_stride, int B, uintptr_t stream) {
+        chandra::GdnDecodeArgs g{};
+        g.qkv = reinterpret_cast<const void*>(qkv);
+        g.qkv_stride = qkv_stride;
+        g.z = reinterpret_cast<const void*>(z);
+        g.z_stride = z_stride;
+        g.b = reinterpret_cast<const void*>(b);
+        g.a = reinterpret_cast<const void*>(a);
+        g.ab_stride = ab_stride;
+        g.A_log = reinterpret_cast<const float*>(A_log);
+        g.dt_bias = reinterpret_cast<const void*>(dt_bias);
+        g.conv_w = reinterpret_cast<const void*>(conv_w);
+        g.norm_w = reinterpret_cast<const void*>(norm_w);
+        g.state = reinterpret_cast<void*>(state);
+        g.state_fp16 = state_fp16;
+        g.slot_in = reinterpret_cast<const int*>(slot_in);
+        g.slot_out = reinterpret_cast<const int*>(slot_out);
+        g.conv_ring = reinterpret_cast<void*>(conv_ring);
+        g.ring = ring;
+        g.conv_slot = reinterpret_cast<const int*>(conv_slot);
+        g.pos = reinterpret_cast<const int*>(pos);
+        g.out = reinterpret_cast<void*>(out);
+        g.out_stride = out_stride;
+        g.B = B;
+        check(chandra::gdn_decode(g, reinterpret_cast<cudaStream_t>(stream)));
+      });
 }

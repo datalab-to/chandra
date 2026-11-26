@@ -10,7 +10,53 @@ import torch
 
 from . import _core
 
-__all__ = ["pack_weight", "DecodeLinear", "attn_decode"]
+__all__ = ["pack_weight", "DecodeLinear", "attn_decode", "gdn_decode"]
+
+
+def gdn_decode(
+    qkv: torch.Tensor,
+    z: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    conv_w: torch.Tensor,
+    norm_w: torch.Tensor,
+    state: torch.Tensor,
+    slot_in: torch.Tensor,
+    slot_out: torch.Tensor,
+    conv_ring: torch.Tensor,
+    conv_slot: torch.Tensor,
+    pos: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """One Gated DeltaNet decode step of one layer, for B sequences.
+
+    qkv: [B, 8192] BF16 (in_proj_qkv output, before the conv); z: [B, 4096] BF16;
+    b, a: [B, 32] BF16 views (same row stride); A_log: [32] FP32; dt_bias: [32] BF16;
+    conv_w: [8192, 4] BF16; norm_w: [128] BF16.
+    state: [slots, 32, 128, 128] FP32 or FP16, read from slot_in and written to slot_out ([B] int32).
+    conv_ring: [slots, ring >= 4, 8192] BF16 raw inputs by position % ring; conv_slot, pos: [B] int32,
+    pos = tokens of the sequence before this one. Returns [B, 4096] BF16, the out_proj input.
+    """
+    n = qkv.shape[0]
+    if b.stride(0) != a.stride(0):
+        raise ValueError("a and b must share a row stride")
+    if state.dtype not in (torch.float32, torch.float16):
+        raise ValueError("state must be float32 or float16")
+    for t in (qkv, z, b, a):
+        if t.stride(-1) != 1:
+            raise ValueError("the last dimension must be contiguous")
+    if out is None:
+        out = torch.empty(n, 4096, dtype=torch.bfloat16, device=qkv.device)
+    _core.gdn_decode(
+        qkv.data_ptr(), qkv.stride(0), z.data_ptr(), z.stride(0), b.data_ptr(), a.data_ptr(), a.stride(0),
+        A_log.data_ptr(), dt_bias.data_ptr(), conv_w.data_ptr(), norm_w.data_ptr(),
+        state.data_ptr(), state.dtype == torch.float16, slot_in.data_ptr(), slot_out.data_ptr(),
+        conv_ring.data_ptr(), conv_ring.shape[1], conv_slot.data_ptr(), pos.data_ptr(),
+        out.data_ptr(), out.stride(0), n, torch.cuda.current_stream(qkv.device).cuda_stream,
+    )
+    return out
 
 HEADS, KV_HEADS, HEAD_DIM, PAGE_TOKENS = 16, 4, 256, 64
 
