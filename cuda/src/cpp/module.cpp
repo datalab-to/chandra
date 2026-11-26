@@ -62,6 +62,21 @@ NB_MODULE(_core, m) {
                                    reinterpret_cast<float*>(workspace), reinterpret_cast<unsigned*>(counters), M, N,
                                    K, sms, reinterpret_cast<cudaStream_t>(stream)));
   });
+  m.def("lm_head_bound_i8", [](uintptr_t x, uintptr_t wp, uintptr_t wscale, uintptr_t rowc, uintptr_t xnorm,
+                               uintptr_t tile_ub, uintptr_t lb_key, int M, int N, int K, uintptr_t stream) {
+    check(chandra::lm_head_bound_i8(reinterpret_cast<const void*>(x), reinterpret_cast<const void*>(wp),
+                                    reinterpret_cast<const float*>(wscale), reinterpret_cast<const float*>(rowc),
+                                    reinterpret_cast<const float*>(xnorm), reinterpret_cast<float*>(tile_ub),
+                                    reinterpret_cast<unsigned*>(lb_key), M, N, K,
+                                    reinterpret_cast<cudaStream_t>(stream)));
+  });
+  m.def("lm_head_recheck", [](uintptr_t x, uintptr_t wp, uintptr_t tile_ub, uintptr_t lb_key, uintptr_t keys, int M,
+                              int N, int K, uintptr_t stream) {
+    check(chandra::lm_head_recheck(reinterpret_cast<const void*>(x), reinterpret_cast<const void*>(wp),
+                                   reinterpret_cast<const float*>(tile_ub), reinterpret_cast<const unsigned*>(lb_key),
+                                   reinterpret_cast<unsigned long long*>(keys), M, N, K,
+                                   reinterpret_cast<cudaStream_t>(stream)));
+  });
   m.def(
       "decode_gemm_argmax_fp8",
       [](uintptr_t x, uintptr_t wp, uintptr_t wscale, uintptr_t keys, int M, int N, int K, uintptr_t stream) {

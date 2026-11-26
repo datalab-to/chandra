@@ -11,7 +11,7 @@ import torch
 from . import _core
 
 __all__ = ["pack_weight", "pack_weight_fp8", "DecodeLinear", "DecodeLinearFP8", "DecodeLinearFP4", "mxfp4_quantize",
-           "pack_weight_fp4", "LMHead", "LMHeadFP8", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul",
+           "pack_weight_fp4", "pack_weight_i8", "LMHead", "LMHeadFP8", "LMHeadExact", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul",
            "qk_norm_rope_kv", "vit_attn"]
 
 
@@ -516,4 +516,83 @@ class DecodeLinearFP4(DecodeLinear):
                               self.workspace.data_ptr(), self.counters.data_ptr(), m, self.n, self.k, self.sms,
                               torch.cuda.current_stream(self.device).cuda_stream)
         return out
+
+
+def pack_weight_i8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """INT8 per-row weights for the exact LM head: q = round(w / s), s = absmax / 127, stored as
+    sign-magnitude bytes in pack_weight_fp8's layout. Also returns, per row, c_n with
+    |x . w_n - s_n (x . q_n)| + (both FP32 accumulations' error) <= ||x||_2 c_n:
+    c_n = ||w_n - s_n q_n||_2 (Cauchy-Schwarz, from FP64) + 1e-3 ||w_n||_2 (accumulation; 2 K u
+    per sum is 3.1e-4 at K = 2,560, covering truncating accumulators), rounded up."""
+    n, k = w.shape
+    if n % 16 or k % 32:
+        raise ValueError(f"weight shape {tuple(w.shape)}: N must be a multiple of 16 and K of 32")
+    scale = torch.empty(n, dtype=torch.float32, device=w.device)
+    rowc = torch.empty(n, dtype=torch.float32, device=w.device)
+    q8 = torch.empty(n, k, dtype=torch.uint8, device=w.device)
+    for i in range(0, n, 16384):
+        wf = w[i : i + 16384].double()
+        s = (wf.abs().amax(dim=1) / 127.0).float().clamp_min(1e-30)
+        q = torch.round(wf / s.double()[:, None]).clamp(-127, 127)
+        r = wf - q * s.double()[:, None]
+        c = r.norm(dim=1) * (1 + 1e-6) + 1e-3 * wf.norm(dim=1) + 1e-30
+        scale[i : i + 16384] = s
+        rowc[i : i + 16384] = c.float() * (1 + 2**-20)
+        qi = q.to(torch.int16)
+        q8[i : i + 16384] = torch.where(qi < 0, 128 - qi, qi).to(torch.uint8)
+        del wf, q, r, qi
+    packed = (
+        q8.reshape(n // 16, 2, 8, k // 32, 2, 2, 4, 2)
+        .permute(0, 3, 2, 6, 4, 5, 1, 7)
+        .contiguous()
+        .reshape(-1)
+    )
+    return packed, scale, rowc
+
+
+class LMHeadExact:
+    """The greedy pick of LMHead (BF16 logits, ties to the lowest index), bit for bit, reading
+    INT8 weights for the whole vocabulary and BF16 weights only for the 128-row tiles that a
+    rigorous error bound cannot exclude (usually one or a few per token). The BF16 packed
+    weight stays in memory for those re-checks."""
+
+    def __init__(self, weight: torch.Tensor, bf16_head: LMHead | None = None):
+        self.n, self.k = weight.shape
+        if self.n % 128 or self.k % 128:
+            raise ValueError("vocabulary and K must be multiples of 128")
+        self.device = weight.device
+        self.bf16 = bf16_head if bf16_head is not None else LMHead(weight)
+        self.packed8, self.scale, self.rowc = pack_weight_i8(weight)
+        self.tile_ub = torch.empty(self.n // 128, 64, dtype=torch.float32, device=self.device)
+
+    def bounds(self, x: torch.Tensor):
+        """First pass only: (tile_ub [tiles, M], best lower bound [M]) as FP32."""
+        m = x.shape[0]
+        if x.dtype != torch.bfloat16 or x.shape[1] != self.k or not 1 <= m <= 64:
+            raise ValueError(f"expected a [1..64, {self.k}] bfloat16 input")
+        x = x.contiguous()
+        xnorm = (x.float().norm(dim=1) * (1 + 1e-3)).contiguous()
+        lb = torch.zeros(m, dtype=torch.int32, device=self.device)
+        _core.lm_head_bound_i8(x.data_ptr(), self.packed8.data_ptr(), self.scale.data_ptr(), self.rowc.data_ptr(),
+                               xnorm.data_ptr(), self.tile_ub.data_ptr(), lb.data_ptr(), m, self.n, self.k,
+                               torch.cuda.current_stream(self.device).cuda_stream)
+        return x, lb
+
+    def candidate_tiles(self, x: torch.Tensor) -> torch.Tensor:
+        """Per token, how many tiles the re-check reads (for measurements)."""
+        x, lb = self.bounds(x)
+        m = x.shape[0]
+        lbu = lb.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+        bits = torch.where(lbu >= 2**31, lbu - 2**31, 0xFFFFFFFF - lbu)  # ord -> float bits
+        lbf = bits.to(torch.int64).to(torch.int32).view(torch.float32)
+        ub = self.tile_ub[:, :m]
+        return (~(ub.to(torch.bfloat16).float() < lbf.to(torch.bfloat16).float()[None, :])).sum(dim=0)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        x, lb = self.bounds(x)
+        m = x.shape[0]
+        keys = torch.zeros(m, dtype=torch.int64, device=self.device)
+        _core.lm_head_recheck(x.data_ptr(), self.bf16.packed.data_ptr(), self.tile_ub.data_ptr(), lb.data_ptr(),
+                              keys.data_ptr(), m, self.n, self.k, torch.cuda.current_stream(self.device).cuda_stream)
+        return 0xFFFFFFFF - (keys & 0xFFFFFFFF)
 

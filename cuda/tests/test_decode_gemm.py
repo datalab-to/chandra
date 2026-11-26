@@ -168,3 +168,26 @@ def test_mxfp4_quantize_matches_vllm():
     assert torch.equal(exps, vs.view(torch.uint8).reshape(512, -1))
     assert torch.equal(codes, vcodes)
 
+
+def test_exact_lm_head_equals_bf16_head():
+    torch.manual_seed(13)
+    n, k = 65536, 2560
+    w = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
+    head = chandra_cuda.LMHead(w)
+    ex = chandra_cuda.LMHeadExact(w, head)
+    cands = []
+    for m in (1, 7, 16, 33, 64):
+        for scale in (1.0, 4.0):  # flat logits (many near-ties) and peaked ones
+            x = (torch.randn(m, k, device="cuda") * scale).to(torch.bfloat16)
+            assert torch.equal(ex(x), head(x)), (m, scale)
+            cands.append(ex.candidate_tiles(x).float().mean().item())
+    # Rows that tie in BF16 with a later copy: the re-check keeps the lowest index.
+    x = torch.randn(4, k, device="cuda").to(torch.bfloat16)
+    best = head(x)
+    w2 = w.clone()
+    w2[n - 1] = w[int(best[0])]
+    w2[100] = w[int(best[0])]
+    h2 = chandra_cuda.LMHead(w2)
+    assert torch.equal(chandra_cuda.LMHeadExact(w2, h2)(x), h2(x))
+    print("mean candidate tiles per token:", [round(c, 1) for c in cands])
+

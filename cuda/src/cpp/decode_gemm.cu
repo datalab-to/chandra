@@ -124,17 +124,61 @@ __device__ __forceinline__ uint32_t e8_to_bf16x2(uint32_t s) {
   return __byte_perm(s, 0u, 0x0404 | (B << 4) | (B << 12)) >> 1;
 }
 
+// Four INT8 weights in sign-magnitude form (s << 7 | |q|, |q| <= 127) -> two BF16 pairs,
+// exactly: PRMT puts each byte in the low byte of a 16-bit lane and its sign (replicated) in
+// the high byte; with 0x4300 or'ed in a lane is +-(128 + |q|), and subtracting its own
+// sign-and-exponent (+-128) leaves +-|q|.
+__device__ __forceinline__ void i8x4_to_bf16(uint32_t w, uint32_t& lo, uint32_t& hi) {
+  const uint32_t t01 = (__byte_perm(w, 0u, 0x9180) & 0x807F807Fu) | 0x43004300u;
+  const uint32_t t23 = (__byte_perm(w, 0u, 0xB3A2) & 0x807F807Fu) | 0x43004300u;
+  const uint32_t c01 = t01 & 0xFF80FF80u, c23 = t23 & 0xFF80FF80u;
+  const __nv_bfloat162 r01 = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&t01),
+                                     *reinterpret_cast<const __nv_bfloat162*>(&c01));
+  const __nv_bfloat162 r23 = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&t23),
+                                     *reinterpret_cast<const __nv_bfloat162*>(&c23));
+  lo = *reinterpret_cast<const uint32_t*>(&r01);
+  hi = *reinterpret_cast<const uint32_t*>(&r23);
+}
+
+// Order-preserving float <-> uint (for atomicMax on floats).
+__device__ __forceinline__ unsigned f2ord(float v) {
+  const unsigned u = __float_as_uint(v);
+  return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__device__ __forceinline__ float ord2f(unsigned o) {
+  return __uint_as_float((o & 0x80000000u) ? (o & 0x7fffffffu) : ~o);
+}
+__device__ __forceinline__ float bf16r(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
+
 // NP: pairs of n8 token tiles (M <= 16 * NP). RW x KW = kWarps. ARGMAX: instead of
 // writing y, reduce each token's greedy pick into keys[token] (an LM head that never
 // writes its logits); needs splits == 1. FP8: W holds e4m3 bytes (one 16-byte load per
 // lane covers two k16 blocks) and wscale[row] scales each output row.
-template <int NP, int RW, int KW, bool ARGMAX = false, bool FP8 = false, bool FP4 = false>
+// I8: INT8 sign-magnitude weights with per-row scales (the FP8 layout and scaling).
+// BOUND (with I8, the exact LM head's first pass): instead of y, per token the max over this
+// tile's rows of an upper bound of the BF16 head's logit goes to bnd.tile_ub[tile][token],
+// and the max lower bound over the vocabulary to bnd.lb_key[token] (f2ord). ARGMAX with
+// bnd.tile_ub set (the re-check): a tile whose upper bound rounds (BF16) below the best
+// lower bound cannot hold the pick (not even a tie) and returns at once; the others run
+// exactly as the plain BF16 argmax kernel does.
+struct BoundArgs {
+  const float* xnorm;  // [M] ||x_m||_2, rounded up
+  const float* rowc;   // [N] c_n: |x . (w_n - w8_n)| <= ||x|| c_n, accumulation error included
+  float* tile_ub;      // [N / 128][64]
+  unsigned* lb_key;    // [M]
+};
+
+template <int NP, int RW, int KW, bool ARGMAX = false, bool FP8 = false, bool FP4 = false, bool I8 = false,
+          bool BOUND = false>
 __global__ void __launch_bounds__(kThreads, 2)
     decode_gemm_kernel(const __nv_bfloat16* __restrict__ x, const uint4* __restrict__ wp,
                        __nv_bfloat16* __restrict__ y, float* __restrict__ partial,
                        unsigned* __restrict__ counters, int M, int N, int K, int splits,
-                       unsigned long long* __restrict__ keys, const float* __restrict__ wscale) {
-  constexpr int BPL = FP8 ? 2 : FP4 ? 4 : 1;  // k16 blocks per 16-byte W load
+                       unsigned long long* __restrict__ keys, const float* __restrict__ wscale,
+                       const BoundArgs bnd) {
+  constexpr int BPL = (FP8 || I8) ? 2 : FP4 ? 4 : 1;  // k16 blocks per 16-byte W load
+  static_assert(!I8 || !(FP8 || FP4), "one weight format");
+  static_assert(!BOUND || (I8 && !ARGMAX), "the bound pass is INT8, without the argmax epilogue");
   static_assert(!FP8 || KW <= 4, "FP8 needs at least one W load per warp per chunk");
   static_assert(!FP4 || KW <= 2, "FP4 needs at least one W load per warp per chunk");
   static_assert(!(FP8 && FP4), "one weight format");
@@ -145,8 +189,20 @@ __global__ void __launch_bounds__(kThreads, 2)
   extern __shared__ __align__(16) unsigned char smem[];
   __shared__ int s_last;
   __shared__ unsigned long long s_best[64];
+  __shared__ unsigned s_ub[64], s_lb[64];
+  __shared__ bool s_cand[64];
   if constexpr (ARGMAX) {
     if (threadIdx.x < 64) s_best[threadIdx.x] = 0ull;  // the main loop's barriers order this
+    if (bnd.tile_ub != nullptr) {  // re-check: only tiles that can hold some token's pick
+      bool c = false;
+      if (threadIdx.x < M)
+        c = !(bf16r(bnd.tile_ub[blockIdx.x * 64 + threadIdx.x]) < bf16r(ord2f(bnd.lb_key[threadIdx.x])));
+      if (threadIdx.x < 64) s_cand[threadIdx.x] = c;
+      if (!__syncthreads_or(c)) return;
+    }
+  }
+  if constexpr (BOUND) {
+    if (threadIdx.x < 64) s_ub[threadIdx.x] = s_lb[threadIdx.x] = 0u;
   }
 
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -233,6 +289,11 @@ __global__ void __launch_bounds__(kThreads, 2)
         fp4x8_to_bf16(wv.y, m00, m80, af[1]);
         fp4x8_to_bf16(wv.z, m01, m81, af[2]);
         fp4x8_to_bf16(wv.w, m01, m81, af[3]);
+      } else if constexpr (I8) {
+        i8x4_to_bf16(wv.x, af[0].x, af[0].y);
+        i8x4_to_bf16(wv.y, af[0].z, af[0].w);
+        i8x4_to_bf16(wv.z, af[1].x, af[1].y);
+        i8x4_to_bf16(wv.w, af[1].z, af[1].w);
       } else if constexpr (FP8) {
         fp8x4_to_bf16(wv.x, af[0].x, af[0].y);
         fp8x4_to_bf16(wv.y, af[0].z, af[0].w);
@@ -256,7 +317,7 @@ __global__ void __launch_bounds__(kThreads, 2)
     __syncthreads();
   }
 
-  if constexpr (FP8) {  // per-row weight scales (linear, so before the K-slice sum)
+  if constexpr (FP8 || I8) {  // per-row weight scales (linear, so before the K-slice sum)
     const float s0 = wscale[g * 16 + (lane >> 2)], s8 = wscale[g * 16 + (lane >> 2) + 8];
 #pragma unroll
     for (int t = 0; t < 2 * NP; ++t) {
@@ -313,11 +374,44 @@ __global__ void __launch_bounds__(kThreads, 2)
           const unsigned long long o = __shfl_xor_sync(0xffffffffu, kk, off);
           kk = kk > o ? kk : o;
         }
-        if (gid == 0 && tok < M) atomicMax(&s_best[tok], kk);
+        if (gid == 0 && tok < M && (bnd.tile_ub == nullptr || s_cand[tok])) atomicMax(&s_best[tok], kk);
       }
     }
     __syncthreads();
     if (threadIdx.x < M) atomicMax(keys + threadIdx.x, s_best[threadIdx.x]);
+    return;
+  }
+
+  if constexpr (BOUND) {
+    static_assert(KW == 1, "the bound epilogue needs every warp");
+    const float c0 = bnd.rowc[row], c8 = bnd.rowc[row + 8];
+#pragma unroll
+    for (int t = 0; t < 2 * NP; ++t) {
+#pragma unroll
+      for (int c = 0; c < 2; ++c) {
+        const int tok = t * 8 + tig * 2 + c;
+        const float xn = tok < M ? bnd.xnorm[tok] : 0.f;
+        const float l0 = acc[t][c], l8 = acc[t][c + 2];
+        // |l| * 2^-20 covers the rounding of l, l * scale and l +- b (a few ulps each).
+        const float b0 = fmaf(xn, c0, fmaf(fabsf(l0), 1e-6f, 1e-30f));
+        const float b8 = fmaf(xn, c8, fmaf(fabsf(l8), 1e-6f, 1e-30f));
+        float ub = fmaxf(l0 + b0, l8 + b8), lb = fmaxf(l0 - b0, l8 - b8);
+#pragma unroll
+        for (int off = 4; off < 32; off <<= 1) {
+          ub = fmaxf(ub, __shfl_xor_sync(0xffffffffu, ub, off));
+          lb = fmaxf(lb, __shfl_xor_sync(0xffffffffu, lb, off));
+        }
+        if (gid == 0 && tok < M) {
+          atomicMax(&s_ub[tok], f2ord(ub));
+          atomicMax(&s_lb[tok], f2ord(lb));
+        }
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x < M) {
+      bnd.tile_ub[tile * 64 + threadIdx.x] = ord2f(s_ub[threadIdx.x]);
+      atomicMax(bnd.lb_key + threadIdx.x, s_lb[threadIdx.x]);
+    }
     return;
   }
 
@@ -368,15 +462,16 @@ __global__ void __launch_bounds__(kThreads, 2)
   if (tid == 0) counters[tile] = 0;
 }
 
-template <int NP, int RW, int KW, bool ARGMAX = false, bool FP8 = false, bool FP4 = false>
+template <int NP, int RW, int KW, bool ARGMAX = false, bool FP8 = false, bool FP4 = false, bool I8 = false,
+          bool BOUND = false>
 cudaError_t launch(const void* x, const void* wp, void* y, float* ws, unsigned* counters, int M, int N,
                    int K, int splits, cudaStream_t stream, unsigned long long* keys = nullptr,
-                   const float* wscale = nullptr) {
+                   const float* wscale = nullptr, BoundArgs bnd = {}) {
   constexpr int smem = 2 * NP * 16 * kRowBytes;
   const dim3 grid(N / (16 * RW), splits);
-  decode_gemm_kernel<NP, RW, KW, ARGMAX, FP8, FP4><<<grid, kThreads, smem, stream>>>(
+  decode_gemm_kernel<NP, RW, KW, ARGMAX, FP8, FP4, I8, BOUND><<<grid, kThreads, smem, stream>>>(
       static_cast<const __nv_bfloat16*>(x), static_cast<const uint4*>(wp), static_cast<__nv_bfloat16*>(y),
-      ws, counters, M, N, K, splits, keys, wscale);
+      ws, counters, M, N, K, splits, keys, wscale, bnd);
   return cudaGetLastError();
 }
 
@@ -472,6 +567,31 @@ cudaError_t decode_gemm_argmax(const void* x, const void* wp, unsigned long long
     case 2: return launch<2, 8, 1, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys);
     case 3: return launch<3, 8, 1, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys);
     default: return launch<4, 8, 1, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys);
+  }
+}
+
+cudaError_t lm_head_bound_i8(const void* x, const void* wp, const float* wscale, const float* rowc,
+                             const float* xnorm, float* tile_ub, unsigned* lb_key, int M, int N, int K,
+                             cudaStream_t stream) {
+  if (M < 1 || M > 64 || N % 128 != 0 || K % kKC != 0) return cudaErrorInvalidValue;
+  const BoundArgs b{xnorm, rowc, tile_ub, lb_key};
+  switch ((M + 15) / 16) {
+    case 1: return launch<1, 8, 1, false, false, false, true, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, nullptr, wscale, b);
+    case 2: return launch<2, 8, 1, false, false, false, true, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, nullptr, wscale, b);
+    case 3: return launch<3, 8, 1, false, false, false, true, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, nullptr, wscale, b);
+    default: return launch<4, 8, 1, false, false, false, true, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, nullptr, wscale, b);
+  }
+}
+
+cudaError_t lm_head_recheck(const void* x, const void* wp, const float* tile_ub, const unsigned* lb_key,
+                            unsigned long long* keys, int M, int N, int K, cudaStream_t stream) {
+  if (M < 1 || M > 64 || N % 128 != 0 || K % kKC != 0) return cudaErrorInvalidValue;
+  const BoundArgs b{nullptr, nullptr, const_cast<float*>(tile_ub), const_cast<unsigned*>(lb_key)};
+  switch ((M + 15) / 16) {
+    case 1: return launch<1, 8, 1, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys, nullptr, b);
+    case 2: return launch<2, 8, 1, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys, nullptr, b);
+    case 3: return launch<3, 8, 1, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys, nullptr, b);
+    default: return launch<4, 8, 1, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys, nullptr, b);
   }
 }
 

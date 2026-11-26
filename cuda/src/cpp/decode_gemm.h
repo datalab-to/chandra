@@ -37,6 +37,18 @@ cudaError_t decode_gemm_fp8(const void* x, const void* wp, const float* wscale, 
 cudaError_t decode_gemm_fp4(const void* x, const void* wp, const void* scales, void* y, float* workspace,
                             unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream);
 
+// The exact LM head from INT8 weights. lm_head_bound_i8: INT8 sign-magnitude weights in the
+// FP8 layout with per-row scales; per 128-row tile and token an upper bound of the BF16 head's
+// logits into tile_ub [N / 128][64], and the best lower bound per token into lb_key [M]
+// (zeroed first; order-preserving float bits). lm_head_recheck: the BF16 argmax kernel on the
+// tiles whose bound does not exclude them; keys as decode_gemm_argmax. Together: the same pick
+// as decode_gemm_argmax, reading ~half the bytes.
+cudaError_t lm_head_bound_i8(const void* x, const void* wp, const float* wscale, const float* rowc,
+                             const float* xnorm, float* tile_ub, unsigned* lb_key, int M, int N, int K,
+                             cudaStream_t stream);
+cudaError_t lm_head_recheck(const void* x, const void* wp, const float* tile_ub, const unsigned* lb_key,
+                            unsigned long long* keys, int M, int N, int K, cudaStream_t stream);
+
 // LM head with the greedy pick fused: for each token m, keys[m] (zeroed before the call)
 // becomes the max over rows n of key(bf16(y[m][n]), n); the picked row is
 // 0xffffffff - (keys[m] & 0xffffffff). Ties go to the lowest row. y is never written.
