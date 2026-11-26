@@ -17,7 +17,10 @@ from chandra.settings import settings
 def image_to_base64(image: Image.Image) -> str:
     """Convert PIL Image to base64 string."""
     buffered = io.BytesIO()
-    image.save(buffered, format="PNG")
+    # PNG is lossless at every level, so the server gets the same pixels.
+    # Level 1 encodes in about half the time of the default (6) on rendered
+    # pages, and the server decodes it faster too.
+    image.save(buffered, format="PNG", compress_level=1)
     return base64.b64encode(buffered.getvalue()).decode()
 
 
