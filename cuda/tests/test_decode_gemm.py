@@ -259,7 +259,10 @@ def test_stream_k_plan(fmt, n, k, ctas):
         silu = (chandra_cuda.DecodeLinear(w, epilogue="silu_mul") if fmt == "bf16"
                 else chandra_cuda.DecodeLinearFP4(w, epilogue="silu_mul"))
         plain = lin if fmt == "bf16" else chandra_cuda.DecodeLinearFP4(w)
-        assert torch.equal(silu(x[:17]), chandra_cuda.silu_mul(plain(x[:17])))
+        # The interleaved rows sit in other tiles, whose K split points differ under stream-K: equal
+        # within rounding (the classic plans split every tile alike and match bit for bit).
+        a, b = silu(x[:17]).float(), chandra_cuda.silu_mul(plain(x[:17])).float()
+        assert (a - b).abs().max().item() <= b.abs().max().item() * 2**-6 + 1e-2
     finally:
         chandra_cuda._core.set_decode_gemm_plan(n, k, 0, 0)
 
