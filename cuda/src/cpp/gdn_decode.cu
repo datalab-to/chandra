@@ -254,9 +254,140 @@ __global__ void __launch_bounds__(256, 2) gdn_step_kernel(const GdnDecodeArgs a)
   }
 }
 
+// Plain decode (T = 1, no replay, no history): the state stays packed in registers and each row
+// is unpacked, updated and stored by itself. An FP16 state then needs 32 registers per thread
+// instead of 64 + 32, so twice as many CTAs fit per SM and one CTA's state reads overlap other
+// CTAs' writes. Same arithmetic, in the same order, as gdn_step_kernel<ST, 1>.
+template <typename ST, int MINB>
+__global__ void __launch_bounds__(256, MINB) gdn_step1_kernel(const GdnDecodeArgs a) {
+  constexpr int E = SV<ST>::E;
+  constexpr int LPR = kGdnDim / E;
+  constexpr int RPI = 32 / LPR;
+  constexpr int RPW = kGdnDim / 8;
+  constexpr int IT = RPW / RPI;
+  __shared__ float xs[3 * kGdnDim];
+  __shared__ float o_s[kGdnDim];
+
+  const int hv = blockIdx.x, n = blockIdx.y, h = hv >> 1;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int sub = lane / LPR, kl = lane % LPR;
+  const int rbase = warp * RPW + sub;
+  constexpr size_t kHead = static_cast<size_t>(kGdnDim) * kGdnDim;
+  const ST* s_in = static_cast<const ST*>(a.state) + (static_cast<size_t>(a.slot_in[n]) * kGdnValueHeads + hv) * kHead;
+  ST* s_out = static_cast<ST*>(a.state) + (static_cast<size_t>(a.slot_out[n]) * kGdnValueHeads + hv) * kHead;
+  const int cslot = a.conv_slot[n];
+
+  uint4 sv[IT];
+#pragma unroll
+  for (int i = 0; i < IT; ++i)
+    sv[i] = __ldcs(reinterpret_cast<const uint4*>(s_in + static_cast<size_t>(rbase + i * RPI) * kGdnDim + kl * E));
+
+  {
+    const bf16* x = static_cast<const bf16*>(a.qkv);
+    bf16* ring = static_cast<bf16*>(a.conv_ring) + static_cast<size_t>(cslot) * a.ring * kGdnChannels;
+    const bf16* cw = static_cast<const bf16*>(a.conv_w);
+    const int p0 = a.pos[n];
+    for (int c = threadIdx.x; c < 3 * kGdnDim; c += blockDim.x) {
+      const int ch = c < kGdnDim ? h * kGdnDim + c
+                     : c < 2 * kGdnDim ? 2048 + h * kGdnDim + (c - kGdnDim)
+                                       : 4096 + hv * kGdnDim + (c - 2 * kGdnDim);
+      const bf16 xt = x[static_cast<int64_t>(n) * a.qkv_stride + ch];
+      float acc = __bfloat162float(cw[ch * 4 + 3]) * __bfloat162float(xt);
+#pragma unroll
+      for (int j = 1; j <= 3; ++j) {
+        const int pp = p0 - j;
+        const float xv = pp >= 0 ? bf(ring + static_cast<size_t>(pp % a.ring) * kGdnChannels + ch) : 0.f;
+        acc += __bfloat162float(cw[ch * 4 + 3 - j]) * xv;
+      }
+      xs[c] = round_bf16(silu(acc));
+      if (c >= 2 * kGdnDim || (hv & 1) == 0) ring[static_cast<size_t>(p0 % a.ring) * kGdnChannels + ch] = xt;
+    }
+  }
+  __syncthreads();
+
+  float q[E], k[E];
+#pragma unroll
+  for (int e = 0; e < E; ++e) {
+    q[e] = xs[kl * E + e];
+    k[e] = xs[kGdnDim + kl * E + e];
+  }
+  float sq = 0.f, sk = 0.f;
+#pragma unroll
+  for (int e = 0; e < E; ++e) {
+    sq = fmaf(q[e], q[e], sq);
+    sk = fmaf(k[e], k[e], sk);
+  }
+  sq = rsum<LPR>(sq);
+  sk = rsum<LPR>(sk);
+  const float rq = rsqrtf(sq + 1e-6f) * 0.08838834764831845f, rk = rsqrtf(sk + 1e-6f);
+  float kq = 0.f;
+#pragma unroll
+  for (int e = 0; e < E; ++e) {
+    q[e] *= rq;
+    k[e] *= rk;
+    kq = fmaf(q[e], k[e], kq);
+  }
+  kq = rsum<LPR>(kq);
+  const bf16* ap = static_cast<const bf16*>(a.a) + static_cast<int64_t>(n) * a.ab_stride;
+  const bf16* bp = static_cast<const bf16*>(a.b) + static_cast<int64_t>(n) * a.ab_stride;
+  const float xa = bf(ap + hv) + bf(static_cast<const bf16*>(a.dt_bias) + hv);
+  const float sp = xa <= 20.f ? log1pf(__expf(xa)) : xa;
+  const float decay = __expf(-__expf(a.A_log[hv]) * sp);
+  const float beta = 1.f / (1.f + __expf(-bf(bp + hv)));
+
+#pragma unroll
+  for (int i = 0; i < IT; ++i) {
+    const int r = rbase + i * RPI;
+    float st[E];
+    SV<ST>::unpack(sv[i], st);
+    float dk = 0.f, dq = 0.f;
+#pragma unroll
+    for (int e = 0; e < E; ++e) {
+      dk = fmaf(st[e], k[e], dk);
+      dq = fmaf(st[e], q[e], dq);
+    }
+    dk = rsum<LPR>(dk);
+    dq = rsum<LPR>(dq);
+    const float vp = beta * (xs[2 * kGdnDim + r] - decay * dk);
+    const float o = fmaf(vp, kq, decay * dq);
+#pragma unroll
+    for (int e = 0; e < E; ++e) st[e] = fmaf(decay, st[e], vp * k[e]);
+    __stcs(reinterpret_cast<uint4*>(s_out + static_cast<size_t>(r) * kGdnDim + kl * E), SV<ST>::pack(st));
+    if (kl == 0) o_s[r] = round_bf16(o);
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    float ov[4], ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      ov[j] = o_s[lane * 4 + j];
+      ss = fmaf(ov[j], ov[j], ss);
+    }
+    ss = rsum<32>(ss);
+    const float rstd = rsqrtf(ss * (1.f / kGdnDim) + 1e-6f);
+    const bf16* zr = static_cast<const bf16*>(a.z) + static_cast<int64_t>(n) * a.z_stride + hv * kGdnDim + lane * 4;
+    const bf16* w = static_cast<const bf16*>(a.norm_w) + lane * 4;
+    bf16* out = static_cast<bf16*>(a.out) + static_cast<int64_t>(n) * a.out_stride + hv * kGdnDim + lane * 4;
+    const __nv_bfloat162 r01 = __floats2bfloat162_rn(ov[0] * rstd * bf(w) * silu(bf(zr)),
+                                                     ov[1] * rstd * bf(w + 1) * silu(bf(zr + 1)));
+    const __nv_bfloat162 r23 = __floats2bfloat162_rn(ov[2] * rstd * bf(w + 2) * silu(bf(zr + 2)),
+                                                     ov[3] * rstd * bf(w + 3) * silu(bf(zr + 3)));
+    uint2 stv;
+    stv.x = *reinterpret_cast<const unsigned*>(&r01);
+    stv.y = *reinterpret_cast<const unsigned*>(&r23);
+    *reinterpret_cast<uint2*>(out) = stv;
+  }
+}
+
 template <typename ST>
 cudaError_t launch_t(const GdnDecodeArgs& a, cudaStream_t stream) {
   const dim3 grid(kGdnValueHeads, a.B);
+  if (a.T == 1 && !a.n_replay && !a.hist_in && !a.hist_out && !a.commit) {
+    constexpr int kMinBlocks = sizeof(ST) == 2 ? 4 : 2;  // FP16: the packed state is 32 registers
+    gdn_step1_kernel<ST, kMinBlocks><<<grid, 256, 0, stream>>>(a);
+    return cudaGetLastError();
+  }
   switch (a.T) {
     case 1: gdn_step_kernel<ST, 1><<<grid, 256, 0, stream>>>(a); break;
     case 2: gdn_step_kernel<ST, 2><<<grid, 256, 0, stream>>>(a); break;
