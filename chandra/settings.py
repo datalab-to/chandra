@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     VLLM_MODEL_NAME: str = "chandra"
     VLLM_GPUS: str = "0"
     MAX_VLLM_RETRIES: int = 6
+    VLLM_TIMEOUT: float = 3600.0  # seconds per request
 
     model_config = SettingsConfigDict(
         env_file=find_dotenv("local.env"),
