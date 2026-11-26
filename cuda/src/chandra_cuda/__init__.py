@@ -348,7 +348,7 @@ class DecodeLinearFP8(DecodeLinear):
 
 
 def vit_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens: torch.Tensor, max_len: int,
-             out: torch.Tensor | None = None) -> torch.Tensor:
+             out: torch.Tensor | None = None, version: int = 2) -> torch.Tensor:
     """Non-causal attention of the vision tower over packed images: q, k, v [N, 16, 64] BF16 views
     sharing a row stride (e.g. the thirds of the fused qkv GEMM output), cu_seqlens [n + 1] int32.
     Returns [N, 16, 64] BF16 (scale 1/8)."""
@@ -360,5 +360,5 @@ def vit_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens: torc
     if out is None:
         out = torch.empty(n, 16, 64, dtype=torch.bfloat16, device=q.device)
     _core.vit_attn(q.data_ptr(), k.data_ptr(), v.data_ptr(), q.stride(0), out.data_ptr(), out.stride(0),
-                   cu_seqlens.data_ptr(), cu_seqlens.shape[0] - 1, int(max_len), _stream(q))
+                   cu_seqlens.data_ptr(), cu_seqlens.shape[0] - 1, int(max_len), int(version), _stream(q))
     return out

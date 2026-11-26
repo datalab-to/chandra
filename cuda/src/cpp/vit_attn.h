@@ -19,6 +19,7 @@ struct VitAttnArgs {
   const int* cu_seqlens;  // [n_seq + 1] row offsets of the images
   int n_seq;
   int max_len;
+  int version;  // 1: plain loop; 2 (default): QK of the next tile overlapped with softmax
 };
 
 cudaError_t vit_attn(const VitAttnArgs& a, cudaStream_t stream);

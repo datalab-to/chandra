@@ -220,17 +220,190 @@ __global__ void __launch_bounds__(kThreads, 2) vit_attn_kernel(const VitAttnArgs
   }
 }
 
+// v2: the next tile's S = Q K^T is issued before this tile's softmax, so the tensor
+// pipe has HMMA work while the FP32/SFU units run the softmax (one basic block, no
+// dependency between them). Tiles t and t+1 are resident, t+2 and t+3 in flight.
+// Lazy rescale: O and l are rescaled only when a row's max grows by more than 8 (log2),
+// exact after the final 1/l; P values then stay below 2^8, fine for BF16 and FP32 O.
+__device__ __forceinline__ void qk_tile(float (&s)[8][4], const uint32_t (&qf)[4][4], const unsigned char* sk,
+                                        int lq, int lr) {
+#pragma unroll
+  for (int n = 0; n < 8; ++n) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.f;
+#pragma unroll
+  for (int np = 0; np < 4; ++np) {
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+      uint32_t b[4];
+      ldsm_x4(b, sk + swz(16 * np + 8 * (lq >> 1) + lr, 2 * kk + (lq & 1)));
+      mma(s[2 * np], qf[kk], b[0], b[1]);
+      mma(s[2 * np + 1], qf[kk], b[2], b[3]);
+    }
+  }
+}
+
+__global__ void __launch_bounds__(kThreads, 1) vit_attn_kernel_v2(const VitAttnArgs a) {
+  extern __shared__ __align__(128) unsigned char smem[];
+  const int tile = blockIdx.x, h = blockIdx.y, seq = blockIdx.z;
+  const int start = a.cu_seqlens[seq], len = a.cu_seqlens[seq + 1] - start;
+  if (tile * kQTile >= len) return;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
+  const __nv_bfloat16* kg = static_cast<const __nv_bfloat16*>(a.k) + static_cast<int64_t>(start) * a.qkv_stride + h * kDim;
+  const __nv_bfloat16* vg = static_cast<const __nv_bfloat16*>(a.v) + static_cast<int64_t>(start) * a.qkv_stride + h * kDim;
+  const int n_tiles = (len + kKTile - 1) / kKTile;
+
+  auto load = [&](int t) {
+    unsigned char* sk = smem + (t % kStages) * kStage;
+    unsigned char* sv = sk + kHalf;
+#pragma unroll
+    for (int i = threadIdx.x; i < kKTile * 8; i += kThreads) {
+      const int key = i >> 3, c = i & 7, row = t * kKTile + key;
+      const bool valid = row < len;
+      const int64_t off = static_cast<int64_t>(valid ? row : 0) * a.qkv_stride + c * 8;
+      cp_async16(sk + swz(key, c), kg + off, valid);
+      cp_async16(sv + swz(key, c), vg + off, valid);
+    }
+  };
+  // Groups: tile 0, 1, 2 in the prologue, then tile t + 3 at the end of iteration t
+  // (always committed, possibly empty), so "tile j landed" is wait_group(<groups after j>).
+  load(0);
+  cp_async_commit();
+  if (n_tiles > 1) load(1);
+  cp_async_commit();
+  if (n_tiles > 2) load(2);
+  cp_async_commit();
+
+  uint32_t qf[4][4];
+  {
+    const int r0 = tile * kQTile + warp * 16 + gid;
+    const __nv_bfloat16* qg = static_cast<const __nv_bfloat16*>(a.q) + static_cast<int64_t>(start) * a.qkv_stride + h * kDim;
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      const int r = r0 + half * 8;
+      const bool live = r < len;
+      const __nv_bfloat16* qr = qg + static_cast<int64_t>(live ? r : 0) * a.qkv_stride + tig * 2;
+#pragma unroll
+      for (int kk = 0; kk < 4; ++kk) {
+        qf[kk][half] = live ? *reinterpret_cast<const uint32_t*>(qr + kk * 16) : 0u;
+        qf[kk][half + 2] = live ? *reinterpret_cast<const uint32_t*>(qr + kk * 16 + 8) : 0u;
+      }
+    }
+  }
+  const int lq = lane >> 3, lr = lane & 7;
+
+  float o[8][4];
+#pragma unroll
+  for (int d = 0; d < 8; ++d) o[d][0] = o[d][1] = o[d][2] = o[d][3] = 0.f;
+  float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
+
+  float s[8][4], sn[8][4];
+  cp_async_wait<2>();  // tile 0
+  __syncthreads();
+  qk_tile(s, qf, smem, lq, lr);
+
+  for (int t = 0; t < n_tiles; ++t) {
+    if (t + 1 < n_tiles) {
+      cp_async_wait<1>();  // tile t + 1 (its group is the second newest)
+      __syncthreads();
+      qk_tile(sn, qf, smem + ((t + 1) % kStages) * kStage, lq, lr);
+    }
+    const unsigned char* sv = smem + (t % kStages) * kStage + kHalf;
+
+    // Softmax of tile t (independent of sn: the compiler interleaves it with the HMMAs).
+    const int key0 = t * kKTile + tig * 2;
+    float mx0 = -INFINITY, mx1 = -INFINITY;
+#pragma unroll
+    for (int n = 0; n < 8; ++n) {
+      const bool v0 = key0 + n * 8 < len, v1 = key0 + n * 8 + 1 < len;
+      s[n][0] = v0 ? s[n][0] * kScaleLog2 : -INFINITY;
+      s[n][1] = v1 ? s[n][1] * kScaleLog2 : -INFINITY;
+      s[n][2] = v0 ? s[n][2] * kScaleLog2 : -INFINITY;
+      s[n][3] = v1 ? s[n][3] * kScaleLog2 : -INFINITY;
+      mx0 = fmaxf(mx0, fmaxf(s[n][0], s[n][1]));
+      mx1 = fmaxf(mx1, fmaxf(s[n][2], s[n][3]));
+    }
+    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+    // Lazy rescale: move a row's reference max only when this tile exceeds it by > 8.
+    if (mx0 > m0 + 8.f) {
+      const float al = ex2(m0 - mx0);  // 0 on the first tile (m0 = -inf)
+      l0 *= al;
+#pragma unroll
+      for (int d = 0; d < 8; ++d) o[d][0] *= al, o[d][1] *= al;
+      m0 = mx0;
+    }
+    if (mx1 > m1 + 8.f) {
+      const float al = ex2(m1 - mx1);
+      l1 *= al;
+#pragma unroll
+      for (int d = 0; d < 8; ++d) o[d][2] *= al, o[d][3] *= al;
+      m1 = mx1;
+    }
+    uint32_t pf[4][4];
+#pragma unroll
+    for (int n = 0; n < 8; ++n) {
+      const float e0 = ex2(s[n][0] - m0), e1 = ex2(s[n][1] - m0);
+      const float e2 = ex2(s[n][2] - m1), e3 = ex2(s[n][3] - m1);
+      l0 += e0 + e1;
+      l1 += e2 + e3;
+      pf[n >> 1][(n & 1) * 2] = pack_bf16(e0, e1);
+      pf[n >> 1][(n & 1) * 2 + 1] = pack_bf16(e2, e3);
+    }
+
+    // O += P V for tile t.
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+#pragma unroll
+      for (int dp = 0; dp < 4; ++dp) {
+        uint32_t b[4];
+        ldsm_x4_t(b, sv + swz(16 * kk + 8 * (lq & 1) + lr, 2 * dp + (lq >> 1)));
+        mma(o[2 * dp], pf[kk], b[0], b[1]);
+        mma(o[2 * dp + 1], pf[kk], b[2], b[3]);
+      }
+    }
+    __syncthreads();  // every warp is done with tile t's buffer
+    if (t + 3 < n_tiles) load(t + 3);
+    cp_async_commit();
+#pragma unroll
+    for (int n = 0; n < 8; ++n) s[n][0] = sn[n][0], s[n][1] = sn[n][1], s[n][2] = sn[n][2], s[n][3] = sn[n][3];
+  }
+  cp_async_wait<0>();
+
+  l0 += __shfl_xor_sync(0xffffffffu, l0, 1);
+  l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
+  l1 += __shfl_xor_sync(0xffffffffu, l1, 1);
+  l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
+  const float i0 = 1.f / l0, i1 = 1.f / l1;
+  const int r0 = tile * kQTile + warp * 16 + gid;
+  __nv_bfloat16* og = static_cast<__nv_bfloat16*>(a.out) + static_cast<int64_t>(start) * a.out_stride + h * kDim;
+#pragma unroll
+  for (int d = 0; d < 8; ++d) {
+    const int col = d * 8 + tig * 2;
+    if (r0 < len)
+      *reinterpret_cast<uint32_t*>(og + static_cast<int64_t>(r0) * a.out_stride + col) = pack_bf16(o[d][0] * i0, o[d][1] * i0);
+    if (r0 + 8 < len)
+      *reinterpret_cast<uint32_t*>(og + static_cast<int64_t>(r0 + 8) * a.out_stride + col) =
+          pack_bf16(o[d][2] * i1, o[d][3] * i1);
+  }
+}
+
 }  // namespace
 
 cudaError_t vit_attn(const VitAttnArgs& a, cudaStream_t stream) {
   static bool configured = false;
   if (!configured) {
-    const cudaError_t e = cudaFuncSetAttribute(vit_attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+    cudaError_t e = cudaFuncSetAttribute(vit_attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+    if (e == cudaSuccess)
+      e = cudaFuncSetAttribute(vit_attn_kernel_v2, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
     if (e != cudaSuccess) return e;
     configured = true;
   }
   const dim3 grid((a.max_len + kQTile - 1) / kQTile, 16, a.n_seq);
-  vit_attn_kernel<<<grid, kThreads, kSmem, stream>>>(a);
+  if (a.version == 1)
+    vit_attn_kernel<<<grid, kThreads, kSmem, stream>>>(a);
+  else
+    vit_attn_kernel_v2<<<grid, kThreads, kSmem, stream>>>(a);
   return cudaGetLastError();
 }
 

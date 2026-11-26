@@ -9,14 +9,15 @@ if not torch.cuda.is_available():
     pytest.skip("needs a CUDA GPU", allow_module_level=True)
 
 
+@pytest.mark.parametrize("version", [1, 2])
 @pytest.mark.parametrize("lens", [[1], [64], [300], [1000, 77, 4096], [24552]])
-def test_matches_sdpa(lens):
+def test_matches_sdpa(lens, version):
     g = torch.Generator(device="cuda").manual_seed(sum(lens))
     n = sum(lens)
     qkv = torch.randn(n, 3, 16, 64, device="cuda", generator=g).to(torch.bfloat16)
     q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
     cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32, device="cuda")
-    got = chandra_cuda.vit_attn(q, k, v, cu, max(lens)).float()
+    got = chandra_cuda.vit_attn(q, k, v, cu, max(lens), version=version).float()
     for i, ln in enumerate(lens):
         s = int(cu[i])
         qi, ki, vi = (x[s : s + ln].transpose(0, 1).float()[None] for x in (q, k, v))  # [1, 16, L, 64]

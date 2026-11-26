@@ -137,7 +137,8 @@ NB_MODULE(_core, m) {
       });
 
   m.def("vit_attn", [](uintptr_t q, uintptr_t k, uintptr_t v, int64_t qkv_stride, uintptr_t out,
-                       int64_t out_stride, uintptr_t cu_seqlens, int n_seq, int max_len, uintptr_t stream) {
+                       int64_t out_stride, uintptr_t cu_seqlens, int n_seq, int max_len, int version,
+                       uintptr_t stream) {
     chandra::VitAttnArgs a{};
     a.q = reinterpret_cast<const void*>(q);
     a.k = reinterpret_cast<const void*>(k);
@@ -148,6 +149,7 @@ NB_MODULE(_core, m) {
     a.cu_seqlens = reinterpret_cast<const int*>(cu_seqlens);
     a.n_seq = n_seq;
     a.max_len = max_len;
+    a.version = version;
     check(chandra::vit_attn(a, reinterpret_cast<cudaStream_t>(stream)));
   });
   m.def("rmsnorm_add", [](uintptr_t x, uintptr_t res, uintptr_t res_out, uintptr_t out, uintptr_t w, int M,

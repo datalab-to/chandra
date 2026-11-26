@@ -34,8 +34,10 @@ def main():
     cu = torch.tensor([0, n], dtype=torch.int32, device="cuda")
     out = torch.empty(n, 16, 64, device="cuda", dtype=torch.bfloat16)
     flops = 4 * n * n * 16 * 64
-    t = time_ms(lambda: chandra_cuda.vit_attn(q, k, v, cu, n, out), a.reps)
-    print(f"ours: {t:.2f} ms, {flops / t / 1e9:.1f} TFLOPS")
+    t1 = time_ms(lambda: chandra_cuda.vit_attn(q, k, v, cu, n, out, version=1), a.reps)
+    print(f"ours v1: {t1:.2f} ms, {flops / t1 / 1e9:.1f} TFLOPS")
+    t = time_ms(lambda: chandra_cuda.vit_attn(q, k, v, cu, n, out, version=2), a.reps)
+    print(f"ours v2: {t:.2f} ms, {flops / t / 1e9:.1f} TFLOPS")
     try:
         from vllm.vllm_flash_attn import flash_attn_varlen_func
 
@@ -44,7 +46,7 @@ def main():
         tf = time_ms(lambda: flash_attn_varlen_func(q=qc, k=kc, v=vc, out=of, cu_seqlens_q=cu, cu_seqlens_k=cu,
                                                     max_seqlen_q=n, max_seqlen_k=n, softmax_scale=0.125,
                                                     causal=False, fa_version=2), a.reps)
-        print(f"FA2:  {tf:.2f} ms, {flops / tf / 1e9:.1f} TFLOPS  (ours {tf / t:.2f}x)")
+        print(f"FA2:     {tf:.2f} ms, {flops / tf / 1e9:.1f} TFLOPS  (v2 {tf / t:.2f}x, v1 {tf / t1:.2f}x)")
         print(f"max |ours - FA2| = {(out.float() - of.float()).abs().max().item():.2e}")
     except Exception as e:  # noqa: BLE001
         print("FA2 unavailable:", e)
