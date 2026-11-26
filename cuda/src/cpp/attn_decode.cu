@@ -425,12 +425,15 @@ __global__ void __launch_bounds__(kThreads, 1) attn_decode_kernel(const AttnDeco
   if (!s_last) return;
   __threadfence();
   float mall = -INFINITY;
+#pragma unroll 8
   for (int sp = 0; sp < splits; ++sp)
     mall = fmaxf(mall, __ldcg(a.partial_ml + ((unit + sp) * kRows + r) * 2));
   float lall = 0.f;
   float tot[32];
 #pragma unroll
   for (int i = 0; i < 32; ++i) tot[i] = 0.f;
+  // Unrolled so several splits' loads are in flight (the sums stay in split order).
+#pragma unroll 4
   for (int sp = 0; sp < splits; ++sp) {
     const float ms = __ldcg(a.partial_ml + ((unit + sp) * kRows + r) * 2);
     const float f = ms == -INFINITY ? 0.f : fast_exp2(ms - mall);
@@ -477,11 +480,12 @@ cudaError_t launch_nq(const AttnDecodeArgs& a, cudaStream_t stream) {
 }  // namespace
 
 void attn_decode_split(int B, int max_ctx, int sms, int* stages_per_split, int* max_splits) {
-  // About two CTAs' worth of work per SM, never fewer than 4 stages per CTA.
+  // One CTA fits per SM (96 KB of stages): about one CTA's worth of work per SM, and never fewer
+  // than 8 stages per CTA, so the ring fills and the last CTA's merge stays short.
   const int stages = (max_ctx + kStageKeys - 1) / kStageKeys;
   const int units = B * kAttnKvHeads;
-  const int want = std::max(1, (2 * sms + units - 1) / units);  // splits per (seq, head)
-  const int sps = std::max(4, (stages + want - 1) / want);
+  const int want = std::max(1, (sms + units - 1) / units);  // splits per (seq, head)
+  const int sps = std::max(8, (stages + want - 1) / want);
   *stages_per_split = sps;
   *max_splits = std::max(1, (stages + sps - 1) / sps);
 }
