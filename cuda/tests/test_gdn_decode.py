@@ -88,3 +88,81 @@ def test_separate_in_and_out_slots():
     chandra_cuda.gdn_decode(qkv, z, ba[:, :HV], ba[:, HV:], A_log, dt_bias, conv_w, norm_w, state, one, two, ring, one, zero)
     assert torch.equal(state[1], before)  # the input slot is only read
     assert not torch.equal(state[2], before)
+
+
+def _layer(seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    return dict(
+        A_log=torch.randn(HV, device="cuda", generator=g) * 0.5,
+        dt_bias=(torch.randn(HV, device="cuda", generator=g) * 0.5).to(torch.bfloat16),
+        conv_w=(torch.randn(C, 4, device="cuda", generator=g) * 0.4).to(torch.bfloat16),
+        norm_w=(1 + 0.1 * torch.randn(D, device="cuda", generator=g)).to(torch.bfloat16),
+    ), g
+
+
+def _tokens(g, rows):
+    qkv = torch.randn(rows, C, device="cuda", generator=g).to(torch.bfloat16)
+    z = torch.randn(rows, HV * D, device="cuda", generator=g).to(torch.bfloat16)
+    ba = torch.randn(rows, 2 * HV, device="cuda", generator=g).to(torch.bfloat16)
+    return qkv, z, ba
+
+
+def _i32(*v):
+    return torch.tensor(v, dtype=torch.int32, device="cuda")
+
+
+def test_verify_equals_sequential_steps():
+    lay, g = _layer(11)
+    batch, T, p0 = 3, 4, 9
+    state0 = torch.randn(batch + 1, HV, D, D, device="cuda", generator=g) * 0.1
+    ring0 = torch.randn(batch + 1, 7, C, device="cuda", generator=g).to(torch.bfloat16)
+    qkv, z, ba = _tokens(g, batch * T)
+    slot = torch.arange(1, batch + 1, dtype=torch.int32, device="cuda")
+    pos = torch.full((batch,), p0, dtype=torch.int32, device="cuda")
+    # One verify step over the 4 tokens.
+    st_v, ring_v = state0.clone(), ring0.clone()
+    out_v = chandra_cuda.gdn_decode(qkv, z, ba[:, :HV], ba[:, HV:], lay["A_log"], lay["dt_bias"], lay["conv_w"],
+                                    lay["norm_w"], st_v, slot, slot, ring_v, slot, pos, T=T)
+    # Four decode steps.
+    st_s, ring_s = state0.clone(), ring0.clone()
+    rows = lambda t_: torch.arange(batch, device="cuda") * T + t_
+    for t in range(T):
+        r = rows(t)
+        out_t = chandra_cuda.gdn_decode(qkv[r], z[r], ba[r, :HV], ba[r, HV:], lay["A_log"], lay["dt_bias"],
+                                        lay["conv_w"], lay["norm_w"], st_s, slot, slot, ring_s, slot, pos + t)
+        assert torch.equal(out_t, out_v[r]), t
+    assert torch.equal(st_s, st_v)
+    assert torch.equal(ring_s, ring_v)
+
+
+@pytest.mark.parametrize("accepted", [1, 2, 3])
+def test_replay_gives_the_state_after_the_accepted_tokens(accepted):
+    lay, g = _layer(20 + accepted)
+    T, p0 = 4, 5
+    state = torch.randn(3, HV, D, D, device="cuda", generator=g) * 0.1  # slot 1: start, slot 2: verify output
+    ring0 = torch.randn(2, 8, C, device="cuda", generator=g).to(torch.bfloat16)
+    hist = torch.zeros(2, T, HV, chandra_cuda._core.gdn_hist_floats, device="cuda")
+    qkv, z, ba = _tokens(g, T)
+    nxt_qkv, nxt_z, nxt_ba = _tokens(g, 1)  # the token after the accepted prefix
+    start = state[1].clone()
+    ring = ring0.clone()
+    chandra_cuda.gdn_decode(qkv, z, ba[:, :HV], ba[:, HV:], lay["A_log"], lay["dt_bias"], lay["conv_w"],
+                            lay["norm_w"], state, _i32(1), _i32(2), ring, _i32(1), _i32(p0), T=T, hist_out=hist)
+    assert torch.equal(state[1], start)
+    # Next step: start from slot 1 again, replay the accepted tokens, then the new token.
+    out = chandra_cuda.gdn_decode(nxt_qkv, nxt_z, nxt_ba[:, :HV], nxt_ba[:, HV:], lay["A_log"], lay["dt_bias"],
+                                  lay["conv_w"], lay["norm_w"], state, _i32(1), _i32(2), ring, _i32(1),
+                                  _i32(p0 + accepted), n_replay=_i32(accepted), hist_in=hist)
+    # Reference: the accepted tokens and the new one as plain decode steps.
+    ref_state = torch.zeros_like(state)
+    ref_state[1] = start
+    ref_ring = ring0.clone()
+    for t in range(accepted):
+        chandra_cuda.gdn_decode(qkv[t : t + 1], z[t : t + 1], ba[t : t + 1, :HV], ba[t : t + 1, HV:], lay["A_log"],
+                                lay["dt_bias"], lay["conv_w"], lay["norm_w"], ref_state, _i32(1), _i32(1), ref_ring,
+                                _i32(1), _i32(p0 + t))
+    ref_out = chandra_cuda.gdn_decode(nxt_qkv, nxt_z, nxt_ba[:, :HV], nxt_ba[:, HV:], lay["A_log"], lay["dt_bias"],
+                                      lay["conv_w"], lay["norm_w"], ref_state, _i32(1), _i32(1), ref_ring, _i32(1),
+                                      _i32(p0 + accepted))
+    assert torch.equal(state[2], ref_state[1])
+    assert torch.equal(out, ref_out)

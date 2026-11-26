@@ -29,17 +29,32 @@ def gdn_decode(
     conv_slot: torch.Tensor,
     pos: torch.Tensor,
     out: torch.Tensor | None = None,
+    T: int = 1,
+    n_replay: torch.Tensor | None = None,
+    hist_in: torch.Tensor | None = None,
+    hist_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """One Gated DeltaNet decode step of one layer, for B sequences.
+    """One Gated DeltaNet step of one layer, for B sequences of T tokens each (T = 1: decode;
+    T = 2..4: verification of draft tokens; row n * T + t is token t of sequence n).
 
     qkv: [B, 8192] BF16 (in_proj_qkv output, before the conv); z: [B, 4096] BF16;
     b, a: [B, 32] BF16 views (same row stride); A_log: [32] FP32; dt_bias: [32] BF16;
     conv_w: [8192, 4] BF16; norm_w: [128] BF16.
     state: [slots, 32, 128, 128] FP32 or FP16, read from slot_in and written to slot_out ([B] int32).
     conv_ring: [slots, ring >= 4, 8192] BF16 raw inputs by position % ring; conv_slot, pos: [B] int32,
-    pos = tokens of the sequence before this one. Returns [B, 4096] BF16, the out_proj input.
+    pos = tokens of the sequence before this step. Returns [B * T, 4096] BF16, the out_proj input.
+
+    Verification with one state read and one write: hist_out ([slots, tmax, 32, gdn_hist_floats]
+    FP32, indexed by conv_slot) receives each token's k, v' and decay. If the next step starts from
+    the same input state with n_replay[n] = j and hist_in = this hist_out, it first replays the j
+    accepted updates, which gives exactly the state after token j.
     """
-    n = qkv.shape[0]
+    if qkv.shape[0] % T:
+        raise ValueError("qkv rows must be B * T")
+    n = qkv.shape[0] // T
+    if (n_replay is None) != (hist_in is None):
+        raise ValueError("n_replay and hist_in go together")
+    tmax = next((h.shape[1] for h in (hist_in, hist_out) if h is not None), 0)
     if b.stride(0) != a.stride(0):
         raise ValueError("a and b must share a row stride")
     if state.dtype not in (torch.float32, torch.float16):
@@ -48,13 +63,17 @@ def gdn_decode(
         if t.stride(-1) != 1:
             raise ValueError("the last dimension must be contiguous")
     if out is None:
-        out = torch.empty(n, 4096, dtype=torch.bfloat16, device=qkv.device)
+        out = torch.empty(n * T, 4096, dtype=torch.bfloat16, device=qkv.device)
     _core.gdn_decode(
         qkv.data_ptr(), qkv.stride(0), z.data_ptr(), z.stride(0), b.data_ptr(), a.data_ptr(), a.stride(0),
         A_log.data_ptr(), dt_bias.data_ptr(), conv_w.data_ptr(), norm_w.data_ptr(),
         state.data_ptr(), state.dtype == torch.float16, slot_in.data_ptr(), slot_out.data_ptr(),
         conv_ring.data_ptr(), conv_ring.shape[1], conv_slot.data_ptr(), pos.data_ptr(),
-        out.data_ptr(), out.stride(0), n, torch.cuda.current_stream(qkv.device).cuda_stream,
+        out.data_ptr(), out.stride(0), n, T,
+        0 if n_replay is None else n_replay.data_ptr(),
+        0 if hist_in is None else hist_in.data_ptr(),
+        0 if hist_out is None else hist_out.data_ptr(),
+        tmax, torch.cuda.current_stream(qkv.device).cuda_stream,
     )
     return out
 

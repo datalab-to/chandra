@@ -73,6 +73,7 @@ NB_MODULE(_core, m) {
         a.max_splits = max_splits;
         check(chandra::attn_decode(a, reinterpret_cast<cudaStream_t>(stream)));
       });
+  m.attr("gdn_hist_floats") = chandra::kGdnHistFloats;
   m.def("attn_decode_split", [](int B, int max_ctx, int sms) {
     int sps = 0, ms = 0;
     chandra::attn_decode_split(B, max_ctx, sms, &sps, &ms);
@@ -84,7 +85,8 @@ NB_MODULE(_core, m) {
       [](uintptr_t qkv, int64_t qkv_stride, uintptr_t z, int64_t z_stride, uintptr_t b, uintptr_t a,
          int64_t ab_stride, uintptr_t A_log, uintptr_t dt_bias, uintptr_t conv_w, uintptr_t norm_w,
          uintptr_t state, bool state_fp16, uintptr_t slot_in, uintptr_t slot_out, uintptr_t conv_ring, int ring,
-         uintptr_t conv_slot, uintptr_t pos, uintptr_t out, int64_t out_stride, int B, uintptr_t stream) {
+         uintptr_t conv_slot, uintptr_t pos, uintptr_t out, int64_t out_stride, int B, int T, uintptr_t n_replay,
+         uintptr_t hist_in, uintptr_t hist_out, int hist_tmax, uintptr_t stream) {
         chandra::GdnDecodeArgs g{};
         g.qkv = reinterpret_cast<const void*>(qkv);
         g.qkv_stride = qkv_stride;
@@ -108,6 +110,11 @@ NB_MODULE(_core, m) {
         g.out = reinterpret_cast<void*>(out);
         g.out_stride = out_stride;
         g.B = B;
+        g.T = T;
+        g.n_replay = reinterpret_cast<const int*>(n_replay);
+        g.hist_in = reinterpret_cast<const float*>(hist_in);
+        g.hist_out = reinterpret_cast<float*>(hist_out);
+        g.hist_tmax = hist_tmax;
         check(chandra::gdn_decode(g, reinterpret_cast<cudaStream_t>(stream)));
       });
 }

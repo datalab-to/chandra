@@ -1,13 +1,19 @@
-// One fused Gated DeltaNet decode step per layer: causal conv (ring state) + SiLU,
-// l2norm of q and k, the gates, the delta rule on the recurrent state, o, and the
-// gated RMSNorm. The state moves once: read once and written once per step.
+// One fused Gated DeltaNet step per layer for T = 1..4 tokens per sequence (decode, or
+// the verification of draft tokens): causal conv (ring state) + SiLU, l2norm of q and
+// k, the gates, the delta rule on the recurrent state, o, and the gated RMSNorm.
+// The state moves once per step whatever T is: read once, written once.
 //
 // One CTA (8 warps) per (sequence, value head) owns the head's 128 x 128 state.
 // Each lane owns one 128-bit vector of a state row (4 FP32 or 8 FP16 elements);
-// every state load of a thread is issued first (ld.global.cs.v4 = LDG.E.EF.128),
-// then per row two dot products reduced with xor shuffles, v' = beta (v - decay S k),
-// o = decay S q + v' (k . q) and S' = decay S + v' k^T from the same registers, and
-// one 128-bit streaming store per row.
+// every state load of a thread is issued first (ld.global.cs.v4 = LDG.E.EF.128) and
+// the rows stay in FP32 registers across the T tokens. Per token and row: two dot
+// products reduced with xor shuffles, v' = beta (v - decay S k), o = decay S q + v' (k.q),
+// S = fma(decay, S, v' k). The final state is stored once (STG.E.EF.128).
+//
+// Verification without storing per-token states: each token's k, v' and decay go to a
+// small history (1 KB per head); if only j tokens are accepted, the next step starts
+// from the old state and replays those j updates with the same instructions, which
+// reproduces the state after token j exactly.
 #include "gdn_decode.h"
 
 #include <cuda_bf16.h>
@@ -67,15 +73,15 @@ __device__ __forceinline__ float bf(const bf16* p) { return __bfloat162float(*p)
 __device__ __forceinline__ float round_bf16(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
 __device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); }
 
-template <typename ST>
-__global__ void __launch_bounds__(256, 2) gdn_decode_kernel(const GdnDecodeArgs a) {
+template <typename ST, int T>
+__global__ void __launch_bounds__(256, 2) gdn_step_kernel(const GdnDecodeArgs a) {
   constexpr int E = SV<ST>::E;
   constexpr int LPR = kGdnDim / E;  // lanes per state row
   constexpr int RPI = 32 / LPR;     // rows per warp instruction
   constexpr int RPW = kGdnDim / 8;  // rows per warp (16)
-  constexpr int IT = RPW / RPI;     // 128-bit state vectors per thread
-  __shared__ float xs[3 * kGdnDim];  // conv + SiLU output: q | k | v of this head
-  __shared__ float o_s[kGdnDim];
+  constexpr int IT = RPW / RPI;     // state vectors (rows) per thread
+  __shared__ float xs[T][3 * kGdnDim];  // conv + SiLU output per token: q | k | v of this head
+  __shared__ float o_s[T][kGdnDim];
 
   const int hv = blockIdx.x, n = blockIdx.y, h = hv >> 1;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -84,6 +90,7 @@ __global__ void __launch_bounds__(256, 2) gdn_decode_kernel(const GdnDecodeArgs 
   constexpr size_t kHead = static_cast<size_t>(kGdnDim) * kGdnDim;
   const ST* s_in = static_cast<const ST*>(a.state) + (static_cast<size_t>(a.slot_in[n]) * kGdnValueHeads + hv) * kHead;
   ST* s_out = static_cast<ST*>(a.state) + (static_cast<size_t>(a.slot_out[n]) * kGdnValueHeads + hv) * kHead;
+  const int cslot = a.conv_slot[n];
 
   // 1. All state loads in flight before anything else.
   uint4 sv[IT];
@@ -91,100 +98,153 @@ __global__ void __launch_bounds__(256, 2) gdn_decode_kernel(const GdnDecodeArgs 
   for (int i = 0; i < IT; ++i)
     sv[i] = __ldcs(reinterpret_cast<const uint4*>(s_in + static_cast<size_t>(rbase + i * RPI) * kGdnDim + kl * E));
 
-  // 2. Causal conv (width 4) + SiLU for q, k of key head h and v of value head hv.
-  //    out[t] = sum_j w[j] x[t - 3 + j]; earlier x come from the ring, row = position % ring.
+  // 2. Causal conv (width 4) + SiLU for every token: q, k of key head h and v of value head hv.
+  //    out[p] = sum_j w[j] x[p - 3 + j]. Inputs of this step's tokens come from their rows; earlier
+  //    positions from the ring (row = position % ring), which this step then extends.
   {
-    const bf16* x = static_cast<const bf16*>(a.qkv) + static_cast<int64_t>(n) * a.qkv_stride;
-    bf16* ring = static_cast<bf16*>(a.conv_ring) + static_cast<size_t>(a.conv_slot[n]) * a.ring * kGdnChannels;
+    const bf16* x = static_cast<const bf16*>(a.qkv);
+    bf16* ring = static_cast<bf16*>(a.conv_ring) + static_cast<size_t>(cslot) * a.ring * kGdnChannels;
     const bf16* cw = static_cast<const bf16*>(a.conv_w);
-    const int p = a.pos[n];
-    for (int i = threadIdx.x; i < 3 * kGdnDim; i += blockDim.x) {
-      const int ch = i < kGdnDim ? h * kGdnDim + i
-                     : i < 2 * kGdnDim ? 2048 + h * kGdnDim + (i - kGdnDim)
-                                       : 4096 + hv * kGdnDim + (i - 2 * kGdnDim);
-      const bf16 xt = x[ch];
+    const int p0 = a.pos[n];
+    for (int i = threadIdx.x; i < T * 3 * kGdnDim; i += blockDim.x) {
+      const int t = i / (3 * kGdnDim), c = i % (3 * kGdnDim);
+      const int ch = c < kGdnDim ? h * kGdnDim + c
+                     : c < 2 * kGdnDim ? 2048 + h * kGdnDim + (c - kGdnDim)
+                                       : 4096 + hv * kGdnDim + (c - 2 * kGdnDim);
+      const bf16 xt = x[(static_cast<int64_t>(n) * T + t) * a.qkv_stride + ch];
       float acc = __bfloat162float(cw[ch * 4 + 3]) * __bfloat162float(xt);
 #pragma unroll
-      for (int j = 1; j <= 3; ++j)
-        if (p - j >= 0) acc += __bfloat162float(cw[ch * 4 + 3 - j]) * bf(ring + static_cast<size_t>((p - j) % a.ring) * kGdnChannels + ch);
-      xs[i] = round_bf16(silu(acc));  // the conv output is BF16 in vLLM
+      for (int j = 1; j <= 3; ++j) {
+        const int pp = p0 + t - j;
+        float xv = 0.f;
+        if (pp >= p0)
+          xv = bf(x + (static_cast<int64_t>(n) * T + t - j) * a.qkv_stride + ch);
+        else if (pp >= 0)
+          xv = bf(ring + static_cast<size_t>(pp % a.ring) * kGdnChannels + ch);
+        acc += __bfloat162float(cw[ch * 4 + 3 - j]) * xv;
+      }
+      xs[t][c] = round_bf16(silu(acc));  // the conv output is BF16 in vLLM
       // q and k channels are shared by the two value heads of a key head: the even one writes them.
-      if (i >= 2 * kGdnDim || (hv & 1) == 0) ring[static_cast<size_t>(p % a.ring) * kGdnChannels + ch] = xt;
+      if (c >= 2 * kGdnDim || (hv & 1) == 0) ring[static_cast<size_t>((p0 + t) % a.ring) * kGdnChannels + ch] = xt;
     }
   }
-  __syncthreads();
 
-  // 3. l2norm of q and k (q also scaled by 128^-1/2), k . q, and the gates.
-  float q[E], k[E];
+  float s[IT][E];
 #pragma unroll
-  for (int e = 0; e < E; ++e) {
-    q[e] = xs[kl * E + e];
-    k[e] = xs[kGdnDim + kl * E + e];
-  }
-  float sq = 0.f, sk = 0.f;
-#pragma unroll
-  for (int e = 0; e < E; ++e) {
-    sq = fmaf(q[e], q[e], sq);
-    sk = fmaf(k[e], k[e], sk);
-  }
-  sq = rsum<LPR>(sq);
-  sk = rsum<LPR>(sk);
-  const float rq = rsqrtf(sq + 1e-6f) * 0.08838834764831845f, rk = rsqrtf(sk + 1e-6f);
-  float kq = 0.f;
-#pragma unroll
-  for (int e = 0; e < E; ++e) {
-    q[e] *= rq;
-    k[e] *= rk;
-    kq = fmaf(q[e], k[e], kq);
-  }
-  kq = rsum<LPR>(kq);
-  const bf16* ap = static_cast<const bf16*>(a.a) + static_cast<int64_t>(n) * a.ab_stride;
-  const bf16* bp = static_cast<const bf16*>(a.b) + static_cast<int64_t>(n) * a.ab_stride;
-  const float xa = bf(ap + hv) + bf(static_cast<const bf16*>(a.dt_bias) + hv);
-  const float sp = xa <= 20.f ? log1pf(__expf(xa)) : xa;
-  const float decay = __expf(-__expf(a.A_log[hv]) * sp);
-  const float beta = 1.f / (1.f + __expf(-bf(bp + hv)));
+  for (int i = 0; i < IT; ++i) SV<ST>::unpack(sv[i], s[i]);
 
-  // 4. The delta rule, row by row, from the registers loaded in step 1.
+  // 3. Replay the accepted updates of the previous step, if any.
+  const int nrep = a.n_replay ? a.n_replay[n] : 0;
+  if (nrep > 0) {
+    const float* hs = a.hist_in + static_cast<size_t>(cslot) * a.hist_tmax * kGdnValueHeads * kGdnHistFloats;
+    for (int t = 0; t < nrep; ++t) {
+      const float* ht = hs + (static_cast<size_t>(t) * kGdnValueHeads + hv) * kGdnHistFloats;
+      const float dec = ht[2 * kGdnDim];
+      float kk[E];
 #pragma unroll
-  for (int i = 0; i < IT; ++i) {
-    const int r = rbase + i * RPI;
-    float s[E];
-    SV<ST>::unpack(sv[i], s);
-    float dk = 0.f, dq = 0.f;
+      for (int e = 0; e < E; ++e) kk[e] = ht[kl * E + e];
+#pragma unroll
+      for (int i = 0; i < IT; ++i) {
+        const float vp = ht[kGdnDim + rbase + i * RPI];
+#pragma unroll
+        for (int e = 0; e < E; ++e) s[i][e] = fmaf(dec, s[i][e], vp * kk[e]);
+      }
+    }
+  }
+  __syncthreads();  // xs ready
+
+  float* ho = a.hist_out
+                  ? a.hist_out + static_cast<size_t>(cslot) * a.hist_tmax * kGdnValueHeads * kGdnHistFloats
+                  : nullptr;
+#pragma unroll
+  for (int t = 0; t < T; ++t) {
+    // 4. l2norm of q and k (q also scaled by 128^-1/2), k . q, and the gates.
+    float q[E], k[E];
 #pragma unroll
     for (int e = 0; e < E; ++e) {
-      dk = fmaf(s[e], k[e], dk);
-      dq = fmaf(s[e], q[e], dq);
+      q[e] = xs[t][kl * E + e];
+      k[e] = xs[t][kGdnDim + kl * E + e];
     }
-    dk = rsum<LPR>(dk);
-    dq = rsum<LPR>(dq);
-    const float vp = beta * (xs[2 * kGdnDim + r] - decay * dk);
-    const float o = fmaf(vp, kq, decay * dq);
+    float sq = 0.f, sk = 0.f;
 #pragma unroll
-    for (int e = 0; e < E; ++e) s[e] = fmaf(decay, s[e], vp * k[e]);
-    __stcs(reinterpret_cast<uint4*>(s_out + static_cast<size_t>(r) * kGdnDim + kl * E), SV<ST>::pack(s));
-    if (kl == 0) o_s[r] = round_bf16(o);  // vLLM rounds o to BF16 before the norm
+    for (int e = 0; e < E; ++e) {
+      sq = fmaf(q[e], q[e], sq);
+      sk = fmaf(k[e], k[e], sk);
+    }
+    sq = rsum<LPR>(sq);
+    sk = rsum<LPR>(sk);
+    const float rq = rsqrtf(sq + 1e-6f) * 0.08838834764831845f, rk = rsqrtf(sk + 1e-6f);
+    float kq = 0.f;
+#pragma unroll
+    for (int e = 0; e < E; ++e) {
+      q[e] *= rq;
+      k[e] *= rk;
+      kq = fmaf(q[e], k[e], kq);
+    }
+    kq = rsum<LPR>(kq);
+    const int64_t row = static_cast<int64_t>(n) * T + t;
+    const bf16* ap = static_cast<const bf16*>(a.a) + row * a.ab_stride;
+    const bf16* bp = static_cast<const bf16*>(a.b) + row * a.ab_stride;
+    const float xa = bf(ap + hv) + bf(static_cast<const bf16*>(a.dt_bias) + hv);
+    const float sp = xa <= 20.f ? log1pf(__expf(xa)) : xa;
+    const float decay = __expf(-__expf(a.A_log[hv]) * sp);
+    const float beta = 1.f / (1.f + __expf(-bf(bp + hv)));
+    float* ht = ho ? ho + (static_cast<size_t>(t) * kGdnValueHeads + hv) * kGdnHistFloats : nullptr;
+    if (ht && warp == 0 && sub == 0) {
+#pragma unroll
+      for (int e = 0; e < E; ++e) ht[kl * E + e] = k[e];
+      if (kl == 0) ht[2 * kGdnDim] = decay;
+    }
+
+    // 5. The delta rule, row by row, on the registers.
+#pragma unroll
+    for (int i = 0; i < IT; ++i) {
+      const int r = rbase + i * RPI;
+      float dk = 0.f, dq = 0.f;
+#pragma unroll
+      for (int e = 0; e < E; ++e) {
+        dk = fmaf(s[i][e], k[e], dk);
+        dq = fmaf(s[i][e], q[e], dq);
+      }
+      dk = rsum<LPR>(dk);
+      dq = rsum<LPR>(dq);
+      const float vp = beta * (xs[t][2 * kGdnDim + r] - decay * dk);
+      const float o = fmaf(vp, kq, decay * dq);
+#pragma unroll
+      for (int e = 0; e < E; ++e) s[i][e] = fmaf(decay, s[i][e], vp * k[e]);
+      if (kl == 0) {
+        o_s[t][r] = round_bf16(o);  // vLLM rounds o to BF16 before the norm
+        if (ht) ht[kGdnDim + r] = vp;
+      }
+    }
   }
+
+  // 6. The state after the last token, stored once.
+#pragma unroll
+  for (int i = 0; i < IT; ++i)
+    __stcs(reinterpret_cast<uint4*>(s_out + static_cast<size_t>(rbase + i * RPI) * kGdnDim + kl * E),
+           SV<ST>::pack(s[i]));
   __syncthreads();
 
-  // 5. Gated RMSNorm over the head: out = o * rsqrt(mean(o^2) + eps) * w * SiLU(z).
-  if (warp == 0) {
+  // 7. Gated RMSNorm per token (warp t): out = o * rsqrt(mean(o^2) + eps) * w * SiLU(z).
+  if (warp < T) {
+    const int t = warp;
     float ov[4], ss = 0.f;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      ov[j] = o_s[lane * 4 + j];
+      ov[j] = o_s[t][lane * 4 + j];
       ss = fmaf(ov[j], ov[j], ss);
     }
     ss = rsum<32>(ss);
     const float rstd = rsqrtf(ss * (1.f / kGdnDim) + 1e-6f);
-    const bf16* zr = static_cast<const bf16*>(a.z) + static_cast<int64_t>(n) * a.z_stride + hv * kGdnDim + lane * 4;
+    const int64_t row = static_cast<int64_t>(n) * T + t;
+    const bf16* zr = static_cast<const bf16*>(a.z) + row * a.z_stride + hv * kGdnDim + lane * 4;
     const bf16* w = static_cast<const bf16*>(a.norm_w) + lane * 4;
-    bf16* out = static_cast<bf16*>(a.out) + static_cast<int64_t>(n) * a.out_stride + hv * kGdnDim + lane * 4;
-    __nv_bfloat162 r01 = __floats2bfloat162_rn(ov[0] * rstd * bf(w) * silu(bf(zr)),
-                                               ov[1] * rstd * bf(w + 1) * silu(bf(zr + 1)));
-    __nv_bfloat162 r23 = __floats2bfloat162_rn(ov[2] * rstd * bf(w + 2) * silu(bf(zr + 2)),
-                                               ov[3] * rstd * bf(w + 3) * silu(bf(zr + 3)));
+    bf16* out = static_cast<bf16*>(a.out) + row * a.out_stride + hv * kGdnDim + lane * 4;
+    const __nv_bfloat162 r01 = __floats2bfloat162_rn(ov[0] * rstd * bf(w) * silu(bf(zr)),
+                                                     ov[1] * rstd * bf(w + 1) * silu(bf(zr + 1)));
+    const __nv_bfloat162 r23 = __floats2bfloat162_rn(ov[2] * rstd * bf(w + 2) * silu(bf(zr + 2)),
+                                                     ov[3] * rstd * bf(w + 3) * silu(bf(zr + 3)));
     uint2 st;
     st.x = *reinterpret_cast<const unsigned*>(&r01);
     st.y = *reinterpret_cast<const unsigned*>(&r23);
@@ -192,16 +252,27 @@ __global__ void __launch_bounds__(256, 2) gdn_decode_kernel(const GdnDecodeArgs 
   }
 }
 
+template <typename ST>
+cudaError_t launch_t(const GdnDecodeArgs& a, cudaStream_t stream) {
+  const dim3 grid(kGdnValueHeads, a.B);
+  switch (a.T) {
+    case 1: gdn_step_kernel<ST, 1><<<grid, 256, 0, stream>>>(a); break;
+    case 2: gdn_step_kernel<ST, 2><<<grid, 256, 0, stream>>>(a); break;
+    case 3: gdn_step_kernel<ST, 3><<<grid, 256, 0, stream>>>(a); break;
+    case 4: gdn_step_kernel<ST, 4><<<grid, 256, 0, stream>>>(a); break;
+    default: return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
 }  // namespace
 
 cudaError_t gdn_decode(const GdnDecodeArgs& a, cudaStream_t stream) {
-  if (a.ring < 4) return cudaErrorInvalidValue;  // the slot written must differ from the 3 read
-  const dim3 grid(kGdnValueHeads, a.B);
-  if (a.state_fp16)
-    gdn_decode_kernel<__half><<<grid, 256, 0, stream>>>(a);
-  else
-    gdn_decode_kernel<float><<<grid, 256, 0, stream>>>(a);
-  return cudaGetLastError();
+  // The rows this step writes (positions pos .. pos+T-1) must differ from the 3 it reads.
+  if (a.ring < 3 + a.T) return cudaErrorInvalidValue;
+  if ((a.n_replay || a.hist_in) && !(a.n_replay && a.hist_in)) return cudaErrorInvalidValue;
+  if ((a.hist_in || a.hist_out) && a.hist_tmax < a.T) return cudaErrorInvalidValue;
+  return a.state_fp16 ? launch_t<__half>(a, stream) : launch_t<float>(a, stream);
 }
 
 }  // namespace chandra
