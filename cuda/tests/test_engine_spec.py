@@ -196,3 +196,15 @@ def test_generate_mtp_with_4bit_draft_layer(ckpt, run):
     out, steps = dec4.generate_mtp(seqs, first, hidden, max_new=32)
     for n in range(len(seqs)):
         assert out[n] == ref[n][:32], n
+
+
+def test_graph_verify_step_matches_eager(run):
+    """A CUDA graph of a verify step (4 rows per sequence, commit mode) gives eager verify's picks."""
+    dec, seqs, t0, ref = run
+    _reset(dec)
+    vin = torch.tensor([[int(t0[n])] + ref[n][:3] for n in range(len(seqs))], device="cuda")
+    g_eager, _ = dec.verify(vin, seqs)
+    _reset(dec)
+    gs = dec.graph_step(seqs, T=4, commit=True)
+    _, nxt = gs(vin.reshape(-1))
+    assert torch.equal(nxt.view(len(seqs), 4), g_eager)
