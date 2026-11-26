@@ -17,12 +17,14 @@ Usage:
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import glob
 import html as _html
 import os
 import re
 import subprocess
 import sys
+import threading
 
 import unicodeit
 
@@ -147,37 +149,46 @@ def run_inference(
         rel = os.path.relpath(pdf, pdf_dir)
         return os.path.join(cand_dir, f"{os.path.splitext(rel)[0]}_pg1_repeat1.md")
 
-    done, buf = 0, []
+    todo = [pdf for pdf in pdfs if not os.path.exists(out_path(pdf))]  # resumable
+    lock = threading.Lock()
+    done = len(pdfs) - len(todo)
+    # Keep `workers` pages in flight: a new page is sent as soon as one finishes,
+    # instead of waiting for a whole batch. With batches, the server ran each
+    # batch's slowest page (and its retries) nearly alone before the next batch.
+    slots = threading.BoundedSemaphore(workers)
 
-    def flush(batch):
+    def ocr(pdf, image):
         nonlocal done
-        if not batch:
-            return
-        items = [BatchInputItem(image=im, prompt_type="ocr_layout") for _, im in batch]
-        outs = mgr.generate(items, vllm_api_base=vllm_api_base, max_workers=workers)
-        for (pdf, _im), out in zip(batch, outs):
+        try:
+            item = BatchInputItem(image=image, prompt_type="ocr_layout")
+            out = mgr.generate([item], vllm_api_base=vllm_api_base, max_workers=1)[0]
             op = out_path(pdf)
             os.makedirs(os.path.dirname(op), exist_ok=True)
             md = out.markdown or ""
             with open(op, "w", encoding="utf-8") as f:
                 f.write(postprocess(md) if apply_postprocess else md)
-        done += len(batch)
-        print(f"  {done}/{len(pdfs)}")
+            with lock:
+                done += 1
+                print(f"  {done}/{len(pdfs)}", flush=True)
+        finally:
+            slots.release()
 
-    for pdf in pdfs:
-        if os.path.exists(out_path(pdf)):  # resumable
-            continue
-        try:
-            imgs = load_pdf_images(pdf, page_range=[0], image_dpi=image_dpi)
-        except Exception as e:
-            print(f"  render failed {pdf}: {e}")
-            continue
-        if imgs:
-            buf.append((pdf, imgs[0]))
-        if len(buf) >= workers:
-            flush(buf)
-            buf = []
-    flush(buf)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = []
+        for pdf in todo:
+            # pdfium is not thread-safe, so pages are rendered here, one at a
+            # time, while up to `workers` earlier pages are being OCR'd.
+            try:
+                imgs = load_pdf_images(pdf, page_range=[0], image_dpi=image_dpi)
+            except Exception as e:
+                print(f"  render failed {pdf}: {e}", flush=True)
+                continue
+            if not imgs:
+                continue
+            slots.acquire()
+            futures.append(pool.submit(ocr, pdf, imgs[0]))
+        for fut in futures:
+            fut.result()
     return cand_dir
 
 
