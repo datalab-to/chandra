@@ -50,13 +50,16 @@ def _rows(fn, x: torch.Tensor) -> torch.Tensor:
 class Decoder:
     def __init__(self, ckpt_dir: str, device: str = "cuda", max_seqs: int = 8, max_ctx: int = 18432,
                  state_dtype: torch.dtype = torch.float32, mtp: bool = False, draft_tokens: int = 3,
-                 weights: str = "bf16", lm_head: str = "bf16", kv: str = "bf16"):
+                 weights: str = "bf16", lm_head: str = "bf16", kv: str = "bf16", attn_split_keys: int | None = 1024):
         """weights: the format of the decoder layers' linear weights (bf16; fp8, mxfp4, int4 are
         approximate, class G). lm_head: "bf16", or "exact" (INT8 pass + BF16 re-check, the same picks).
         The MTP layer, if any, stays BF16. kv: "bf16", or "int8" (symmetric per token and head, class G)."""
         if kv not in ("bf16", "int8"):
             raise ValueError(kv)
         self.kv = kv
+        # Fixed attention chunks: results independent of the batch, and MTP verify steps round
+        # exactly as plain steps (None: chunks sized to fill the GPU, faster at batch 1-4).
+        self.attn_split_keys = attn_split_keys
         from safetensors import safe_open
 
         cfg = json.load(open(os.path.join(ckpt_dir, "config.json")))["text_config"]
@@ -213,7 +216,7 @@ class Decoder:
                             rope_theta=self.rope_theta, k_scale=L.get("k_scale"), v_scale=L.get("v_scale"))
         gate = qkv[:, :8192].view(m, 16, 512)[..., 256:]
         att = attn_decode(q, gate, L["k_cache"], L["v_cache"], bt, ctx, n_q=T, max_ctx=max_ctx,
-                          k_scale=L.get("k_scale"), v_scale=L.get("v_scale"))
+                          k_scale=L.get("k_scale"), v_scale=L.get("v_scale"), split_keys=self.attn_split_keys)
         return _rows(L["o"], att.reshape(m, 4096))
 
     @torch.no_grad()

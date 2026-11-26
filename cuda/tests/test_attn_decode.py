@@ -134,3 +134,21 @@ def test_kv_write_int8():
             deq = c8[p, :, s].float() * cs[p, :, s, None]
             ref = cb[p, :, s].float()
             assert ((deq - ref).abs() <= cs[p, :, s, None] * 0.51 + ref.abs() * 2**-7).all()
+
+
+def test_fixed_split_keys_is_batch_invariant():
+    """With split_keys, a sequence's output does not depend on the other sequences or max_ctx."""
+    torch.manual_seed(31)
+    pages, B = 64, 4
+    kc = torch.randn(pages, 4, 64, 256, device="cuda").to(torch.bfloat16)
+    vc = torch.randn_like(kc)
+    bt = torch.arange(pages, dtype=torch.int32, device="cuda").reshape(B, pages // B)
+    ctx = torch.tensor([900, 1023, 37, 600], dtype=torch.int32, device="cuda")
+    q = torch.randn(B, 16, 256, device="cuda").to(torch.bfloat16)
+    gate = torch.randn_like(q)
+    full = chandra_cuda.attn_decode(q, gate, kc, vc, bt, ctx, max_ctx=1024, split_keys=256)
+    for i in range(B):
+        one = chandra_cuda.attn_decode(q[i : i + 1], gate[i : i + 1], kc, vc, bt[i : i + 1], ctx[i : i + 1],
+                                       max_ctx=int(ctx[i]), split_keys=256)
+        assert torch.equal(one, full[i : i + 1]), i
+

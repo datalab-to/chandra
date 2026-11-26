@@ -101,8 +101,13 @@ def attn_decode(
     out: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    split_keys: int | None = None,
 ) -> torch.Tensor:
     """Gated decode/verify attention for Chandra 2's full-attention layers.
+
+    split_keys (a multiple of 32): every sequence's keys are split into chunks of this size, so a
+    query's result depends only on its own context, not on the batch or max_ctx (batch-invariant,
+    and a verify step rounds as plain steps do). None: chunks sized to fill the GPU for this batch.
 
     With k_scale, v_scale ([pages, 4, 64] FP32), k_cache and v_cache hold INT8: x = int8 * scale
     per (token, head); the kernel dequantizes to FP16 per stage and runs FP16 MMAs.
@@ -123,7 +128,13 @@ def attn_decode(
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
     if max_ctx is None:
         max_ctx = int(ctx_lens.max())
-    sps, max_splits = _core.attn_decode_split(b, max_ctx, sms)
+    if split_keys is None:
+        sps, max_splits = _core.attn_decode_split(b, max_ctx, sms)
+    else:
+        if split_keys % 32:
+            raise ValueError("split_keys must be a multiple of 32")
+        sps = split_keys // 32
+        max_splits = max(1, -(-max_ctx // split_keys))
     key = (dev, b, max_splits)
     ws = _attn_ws.get(key)
     if ws is None:
