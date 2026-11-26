@@ -40,6 +40,13 @@ NB_MODULE(_core, m) {
         return nb::make_tuple(p.row_groups, p.splits);
       },
       nb::arg("N"), nb::arg("K"), nb::arg("sms"));
+  m.def("decode_gemm_fp8", [](uintptr_t x, uintptr_t wp, uintptr_t wscale, uintptr_t y, uintptr_t workspace,
+                              uintptr_t counters, int M, int N, int K, int sms, uintptr_t stream) {
+    check(chandra::decode_gemm_fp8(reinterpret_cast<const void*>(x), reinterpret_cast<const void*>(wp),
+                                   reinterpret_cast<const float*>(wscale), reinterpret_cast<void*>(y),
+                                   reinterpret_cast<float*>(workspace), reinterpret_cast<unsigned*>(counters), M, N,
+                                   K, sms, reinterpret_cast<cudaStream_t>(stream)));
+  });
   m.def(
       "decode_gemm_argmax",
       [](uintptr_t x, uintptr_t wp, uintptr_t keys, int M, int N, int K, int sms, uintptr_t stream) {

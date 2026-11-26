@@ -75,15 +75,36 @@ __device__ __forceinline__ unsigned long long argmax_key(float v, int row) {
   return (static_cast<unsigned long long>(ord) << 32) | (0xffffffffu - static_cast<unsigned>(row));
 }
 
+// Four FP8 e4m3 weights -> two BF16 pairs, exactly, without FP8 hardware (sm_80/86):
+// PRMT puts each byte in the high byte of a 16-bit lane, one shift and mask/or makes
+// BF16 bits whose exponent bias is 127 instead of 7, and one HMUL2 by 2^120 fixes the
+// bias (the products are representable, subnormals included).
+__device__ __forceinline__ void fp8x4_to_bf16(uint32_t w, uint32_t& lo, uint32_t& hi) {
+  const uint32_t v01 = __byte_perm(w, 0u, 0x1404);  // b1 << 24 | b0 << 8
+  const uint32_t v23 = __byte_perm(w, 0u, 0x3424);  // b3 << 24 | b2 << 8
+  const uint32_t t01 = ((v01 >> 4) & 0x07F007F0u) | (v01 & 0x80008000u);
+  const uint32_t t23 = ((v23 >> 4) & 0x07F007F0u) | (v23 & 0x80008000u);
+  const uint32_t k = 0x7B807B80u;  // 2^120 in both BF16 halves
+  const __nv_bfloat162 r01 = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&t01),
+                                     *reinterpret_cast<const __nv_bfloat162*>(&k));
+  const __nv_bfloat162 r23 = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&t23),
+                                     *reinterpret_cast<const __nv_bfloat162*>(&k));
+  lo = *reinterpret_cast<const uint32_t*>(&r01);
+  hi = *reinterpret_cast<const uint32_t*>(&r23);
+}
+
 // NP: pairs of n8 token tiles (M <= 16 * NP). RW x KW = kWarps. ARGMAX: instead of
 // writing y, reduce each token's greedy pick into keys[token] (an LM head that never
-// writes its logits); needs splits == 1.
-template <int NP, int RW, int KW, bool ARGMAX = false>
+// writes its logits); needs splits == 1. FP8: W holds e4m3 bytes (one 16-byte load per
+// lane covers two k16 blocks) and wscale[row] scales each output row.
+template <int NP, int RW, int KW, bool ARGMAX = false, bool FP8 = false>
 __global__ void __launch_bounds__(kThreads, 2)
     decode_gemm_kernel(const __nv_bfloat16* __restrict__ x, const uint4* __restrict__ wp,
                        __nv_bfloat16* __restrict__ y, float* __restrict__ partial,
                        unsigned* __restrict__ counters, int M, int N, int K, int splits,
-                       unsigned long long* __restrict__ keys) {
+                       unsigned long long* __restrict__ keys, const float* __restrict__ wscale) {
+  constexpr int BPL = FP8 ? 2 : 1;  // k16 blocks per 16-byte W load
+  static_assert(!FP8 || KW <= 4, "FP8 needs at least one W load per warp per chunk");
   static_assert(RW * KW == kWarps, "8 warps per CTA");
   constexpr int MP = NP * 16;
   constexpr int kBufBytes = MP * kRowBytes;
@@ -102,10 +123,10 @@ __global__ void __launch_bounds__(kThreads, 2)
   const int kb_split = KB / splits;
   const int kb0 = split * kb_split;
   const int nchunks = kb_split / kBlocksPerChunk;
-  const int nblk = kb_split / KW;  // this warp's k16 blocks
+  const int nblk = kb_split / BPL / KW;  // this warp's W loads
   const int g = tile * RW + rw;    // 16-row group
   // Block i of this warp is k16 block kb0 + i * KW + kq of row group g.
-  const uint4* w = wp + (static_cast<size_t>(g) * KB + kb0 + kq) * 32 + lane;
+  const uint4* w = wp + (static_cast<size_t>(g) * (KB / BPL) + kb0 / BPL + kq) * 32 + lane;
   const size_t wstep = static_cast<size_t>(KW) * 32;
 
   auto load_x = [&](int c, int buf) {
@@ -145,23 +166,47 @@ __global__ void __launch_bounds__(kThreads, 2)
     __syncthreads();
     const unsigned char* s = smem + (c & 1) * kBufBytes + lane_off;
 #pragma unroll
-    for (int jj = 0; jj < kBlocksPerChunk / KW; ++jj) {
-      const int j = jj * KW + kq;                       // k16 block within the chunk
-      const int i = c * (kBlocksPerChunk / KW) + jj;    // this warp's block index
-      const uint4 a = w0;
+    for (int jj = 0; jj < kBlocksPerChunk / BPL / KW; ++jj) {
+      const int u = jj * KW + kq;                             // W load within the chunk
+      const int i = c * (kBlocksPerChunk / BPL / KW) + jj;    // this warp's load index
+      const uint4 wv = w0;
       w0 = w1;
       w1 = w2;
       w2 = w3;
       if (i + kDepth < nblk) w3 = ld_stream(w + (i + kDepth) * wstep);
+      uint4 af[BPL];
+      if constexpr (FP8) {
+        fp8x4_to_bf16(wv.x, af[0].x, af[0].y);
+        fp8x4_to_bf16(wv.y, af[0].z, af[0].w);
+        fp8x4_to_bf16(wv.z, af[1].x, af[1].y);
+        fp8x4_to_bf16(wv.w, af[1].z, af[1].w);
+      } else {
+        af[0] = wv;
+      }
 #pragma unroll
-      for (int p = 0; p < NP; ++p) {
-        uint32_t b0, b1, b2, b3;
-        ldmatrix_x4(b0, b1, b2, b3, s + p * 16 * kRowBytes + j * 32);
-        mma_bf16(acc[2 * p], a, b0, b1);
-        mma_bf16(acc[2 * p + 1], a, b2, b3);
+      for (int bb = 0; bb < BPL; ++bb) {
+        const int j = u * BPL + bb;  // k16 block within the chunk
+#pragma unroll
+        for (int p = 0; p < NP; ++p) {
+          uint32_t b0, b1, b2, b3;
+          ldmatrix_x4(b0, b1, b2, b3, s + p * 16 * kRowBytes + j * 32);
+          mma_bf16(acc[2 * p], af[bb], b0, b1);
+          mma_bf16(acc[2 * p + 1], af[bb], b2, b3);
+        }
       }
     }
     __syncthreads();
+  }
+
+  if constexpr (FP8) {  // per-row weight scales (linear, so before the K-slice sum)
+    const float s0 = wscale[g * 16 + (lane >> 2)], s8 = wscale[g * 16 + (lane >> 2) + 8];
+#pragma unroll
+    for (int t = 0; t < 2 * NP; ++t) {
+      acc[t][0] *= s0;
+      acc[t][1] *= s0;
+      acc[t][2] *= s8;
+      acc[t][3] *= s8;
+    }
   }
 
   // Reduce the KW K slices of each row group through shared memory, in order.
@@ -265,15 +310,27 @@ __global__ void __launch_bounds__(kThreads, 2)
   if (tid == 0) counters[tile] = 0;
 }
 
-template <int NP, int RW, int KW, bool ARGMAX = false>
+template <int NP, int RW, int KW, bool ARGMAX = false, bool FP8 = false>
 cudaError_t launch(const void* x, const void* wp, void* y, float* ws, unsigned* counters, int M, int N,
-                   int K, int splits, cudaStream_t stream, unsigned long long* keys = nullptr) {
+                   int K, int splits, cudaStream_t stream, unsigned long long* keys = nullptr,
+                   const float* wscale = nullptr) {
   constexpr int smem = 2 * NP * 16 * kRowBytes;
   const dim3 grid(N / (16 * RW), splits);
-  decode_gemm_kernel<NP, RW, KW, ARGMAX><<<grid, kThreads, smem, stream>>>(
+  decode_gemm_kernel<NP, RW, KW, ARGMAX, FP8><<<grid, kThreads, smem, stream>>>(
       static_cast<const __nv_bfloat16*>(x), static_cast<const uint4*>(wp), static_cast<__nv_bfloat16*>(y),
-      ws, counters, M, N, K, splits, keys);
+      ws, counters, M, N, K, splits, keys, wscale);
   return cudaGetLastError();
+}
+
+template <int NP>
+cudaError_t launch_fp8(int rw, const void* x, const void* wp, const float* wscale, void* y, float* ws,
+                       unsigned* counters, int M, int N, int K, int splits, cudaStream_t stream) {
+  switch (rw) {
+    case 8: return launch<NP, 8, 1, false, true>(x, wp, y, ws, counters, M, N, K, splits, stream, nullptr, wscale);
+    case 4: return launch<NP, 4, 2, false, true>(x, wp, y, ws, counters, M, N, K, splits, stream, nullptr, wscale);
+    case 2: return launch<NP, 2, 4, false, true>(x, wp, y, ws, counters, M, N, K, splits, stream, nullptr, wscale);
+    default: return cudaErrorInvalidValue;  // FP8 needs N % 32 == 0
+  }
 }
 
 template <int NP>
@@ -346,6 +403,18 @@ cudaError_t decode_gemm_argmax(const void* x, const void* wp, unsigned long long
     case 2: return launch<2, 8, 1, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys);
     case 3: return launch<3, 8, 1, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys);
     default: return launch<4, 8, 1, true>(x, wp, nullptr, nullptr, nullptr, M, N, K, 1, stream, keys);
+  }
+}
+
+cudaError_t decode_gemm_fp8(const void* x, const void* wp, const float* wscale, void* y, float* workspace,
+                            unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream) {
+  if (M < 1 || M > 64 || N % 32 != 0 || K % kKC != 0) return cudaErrorInvalidValue;
+  const DecodeGemmPlan p = decode_gemm_plan(N, K, sms);
+  switch ((M + 15) / 16) {
+    case 1: return launch_fp8<1>(p.row_groups, x, wp, wscale, y, workspace, counters, M, N, K, p.splits, stream);
+    case 2: return launch_fp8<2>(p.row_groups, x, wp, wscale, y, workspace, counters, M, N, K, p.splits, stream);
+    case 3: return launch_fp8<3>(p.row_groups, x, wp, wscale, y, workspace, counters, M, N, K, p.splits, stream);
+    default: return launch_fp8<4>(p.row_groups, x, wp, wscale, y, workspace, counters, M, N, K, p.splits, stream);
   }
 }
 

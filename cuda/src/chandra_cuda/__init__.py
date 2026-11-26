@@ -10,7 +10,7 @@ import torch
 
 from . import _core
 
-__all__ = ["pack_weight", "DecodeLinear", "LMHead", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul",
+__all__ = ["pack_weight", "pack_weight_fp8", "DecodeLinear", "DecodeLinearFP8", "LMHead", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul",
            "qk_norm_rope_kv"]
 
 
@@ -276,3 +276,62 @@ def qk_norm_rope_kv(qkv: torch.Tensor, q_norm_w: torch.Tensor, k_norm_w: torch.T
                           pos.contiguous().data_ptr(), float(rope_theta), q_out.data_ptr(), k_cache.data_ptr(),
                           v_cache.data_ptr(), page.data_ptr(), slot.data_ptr(), m, _stream(qkv))
     return q_out
+
+
+def pack_weight_fp8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a [N, K] BF16 weight to FP8 e4m3 with one scale per output row (absmax / 448)
+    and pack it for DecodeLinearFP8: per 16-row group and pair of k16 blocks, each lane's
+    16 bytes are its mma A fragment (pack_weight's element order) for block 2j, then 2j + 1."""
+    n, k = w.shape
+    if n % 16 or k % 32:
+        raise ValueError(f"weight shape {tuple(w.shape)}: N must be a multiple of 16 and K of 32")
+    wf = w.float()
+    scale = (wf.abs().amax(dim=1) / 448.0).clamp_min(1e-12)
+    q = (wf / scale[:, None]).to(torch.float8_e4m3fn).view(torch.uint8)
+    # q[g*16 + rh*8 + gid][kb2*32 + kbp*16 + kh*8 + tig*2 + e] -> [g][kb2][gid][tig][kbp][kh][rh][e]
+    packed = (
+        q.reshape(n // 16, 2, 8, k // 32, 2, 2, 4, 2)
+        .permute(0, 3, 2, 6, 4, 5, 1, 7)
+        .contiguous()
+        .reshape(-1)
+    )
+    return packed, scale.contiguous()
+
+
+class DecodeLinearFP8(DecodeLinear):
+    """DecodeLinear with FP8 e4m3 weights (per-row scales): half the weight bytes per step.
+    Approximate (class G): y = x @ (scale[:, None] * fp8(weight / scale[:, None])).T."""
+
+    def __init__(self, weight: torch.Tensor):
+        if weight.shape[0] % 32:
+            raise ValueError("N must be a multiple of 32")
+        super().__init__(weight)
+        self.packed, self.scale = pack_weight_fp8(weight)
+
+    def dequantized(self) -> torch.Tensor:
+        """The weight this layer actually multiplies by, as FP32 (for checks)."""
+        n, k = self.n, self.k
+        q = (
+            self.packed.view(n // 16, k // 32, 8, 4, 2, 2, 2, 2)
+            .permute(0, 6, 2, 1, 4, 5, 3, 7)
+            .reshape(n, k)
+            .view(torch.float8_e4m3fn)
+            .float()
+        )
+        return q * self.scale[:, None]
+
+    def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != self.k:
+            raise ValueError(f"expected a [M, {self.k}] bfloat16 input")
+        m = x.shape[0]
+        if not 1 <= m <= 64:
+            raise ValueError("M must be between 1 and 64")
+        x = x.contiguous()
+        if out is None:
+            out = torch.empty(m, self.n, dtype=torch.bfloat16, device=self.device)
+        _core.decode_gemm_fp8(
+            x.data_ptr(), self.packed.data_ptr(), self.scale.data_ptr(), out.data_ptr(),
+            self.workspace.data_ptr(), self.counters.data_ptr(), m, self.n, self.k, self.sms,
+            torch.cuda.current_stream(self.device).cuda_stream,
+        )
+        return out

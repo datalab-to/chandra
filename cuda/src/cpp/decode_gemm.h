@@ -27,6 +27,11 @@ cudaError_t decode_gemm(const void* x, const void* wp, void* y, float* workspace
                         unsigned* counters, int M, int N, int K, int sms,
                         cudaStream_t stream);
 
+// The same GEMM with FP8 e4m3 weights (packed by pack_weight_fp8) and one FP32 scale per
+// output row: y = x * (scale[n] * W8[n])^T. Same plan, workspace and counters.
+cudaError_t decode_gemm_fp8(const void* x, const void* wp, const float* wscale, void* y, float* workspace,
+                            unsigned* counters, int M, int N, int K, int sms, cudaStream_t stream);
+
 // LM head with the greedy pick fused: for each token m, keys[m] (zeroed before the call)
 // becomes the max over rows n of key(bf16(y[m][n]), n); the picked row is
 // 0xffffffff - (keys[m] & 0xffffffff). Ties go to the lowest row. y is never written.

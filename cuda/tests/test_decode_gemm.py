@@ -76,3 +76,29 @@ def test_lm_head_ties_go_to_the_lowest_index():
     w2[3] = w[int(best[0])]  # and an earlier one
     ids = chandra_cuda.LMHead(w2)(x)
     assert int(ids[0]) == min(3, int(best[0]))
+
+
+@pytest.mark.parametrize("n,k", [s for s in SHAPES if s[0] % 32 == 0])
+def test_fp8_matches_its_dequantized_weight(n, k):
+    torch.manual_seed(n * 7 + k)
+    w = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
+    lin = chandra_cuda.DecodeLinearFP8(w)
+    wd = lin.dequantized()
+    # The quantization itself: within e4m3's relative step (2^-3) of each weight.
+    assert ((wd - w.float()).abs() <= w.float().abs() * 2**-3 + lin.scale[:, None] * 2**-9).all()
+    for m in ROWS:
+        x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
+        ref = x.float() @ wd.T
+        got = lin(x).float()
+        assert (got - ref).abs().max().item() <= ref.abs().max().item() * 2**-7 + 1e-3, m
+
+
+def test_fp8_same_result_at_every_batch_size():
+    torch.manual_seed(2)
+    w = (torch.randn(2560, 9216, device="cuda") * 0.02).to(torch.bfloat16)
+    lin = chandra_cuda.DecodeLinearFP8(w)
+    x = torch.randn(64, 9216, device="cuda").to(torch.bfloat16)
+    full = lin(x)
+    for m in ROWS:
+        assert torch.equal(lin(x[:m]), full[:m]), m
+
