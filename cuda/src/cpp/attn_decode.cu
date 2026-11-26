@@ -15,6 +15,7 @@
 #include "attn_decode.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <algorithm>
 #include <cmath>
@@ -29,6 +30,11 @@ constexpr int kRowBytes = kAttnHeadDim * 2;              // 512: one key's K or 
 constexpr int kHalfBytes = kStageKeys * kRowBytes;       // 16 KB of K (or V) per stage
 constexpr int kStageBytes = 2 * kHalfBytes;              // 32 KB
 constexpr int kSmemBytes = kStages * kStageBytes;        // 96 KB
+// INT8 KV: an FP16 work tile (K | V, 32 KB) then 3 raw stages of K 8 KB | V 8 KB | scales.
+constexpr int kRawHalf = kStageKeys * kAttnHeadDim;      // 8 KB of INT8 K (or V) per stage
+constexpr int kRawStage = 2 * kRawHalf + 2 * kStageKeys * 4;
+constexpr int kSmemBytesI8 = kStageBytes + kStages * kRawStage;
+static_assert(kSmemBytesI8 >= 4 * 16 * kAttnHeadDim * 4, "the warp merge reuses the stage memory");
 constexpr int kRows = 16;
 constexpr float kScaleLog2 = 0.0625f * 1.4426950408889634f;  // 1/sqrt(256) * log2(e)
 
@@ -58,23 +64,60 @@ __device__ __forceinline__ void ldsm_x4_t(uint32_t& r0, uint32_t& r1, uint32_t& 
                : "r"(s));
 }
 
+// F16: operands are FP16 (the INT8 KV path), else BF16. FP32 accumulation either way.
+template <bool F16>
 __device__ __forceinline__ void mma16816(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-  asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
-      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+  if constexpr (F16)
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+  else
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
+template <bool F16>
 __device__ __forceinline__ void mma1688(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t b0) {
-  asm("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 "
-      "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
-      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-      : "r"(a0), "r"(a1), "r"(b0));
+  if constexpr (F16)
+    asm("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(b0));
+  else
+    asm("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(b0));
 }
 
 __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
   uint32_t r;
   asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
   return r;
+}
+__device__ __forceinline__ uint32_t pack_f16(float lo, float hi) {
+  uint32_t r;
+  asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
+  return r;
+}
+template <bool F16>
+__device__ __forceinline__ uint32_t pack2(float lo, float hi) {
+  return F16 ? pack_f16(lo, hi) : pack_bf16(lo, hi);
+}
+
+// Four INT8 values -> two FP16 pairs scaled by s. PRMT builds FP16 1024 + (x + 128) exactly
+// (selectors 0x4140 / 0x4342 against 0x64646464), HSUB2 of 1152 gives x, then x * s.
+__device__ __forceinline__ void i8x4_to_f16(uint32_t w, float s, uint32_t& lo, uint32_t& hi) {
+  const uint32_t u = w ^ 0x80808080u;
+  uint32_t h01 = __byte_perm(u, 0x64646464u, 0x4140);
+  uint32_t h23 = __byte_perm(u, 0x64646464u, 0x4342);
+  const __half2 bias = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480));  // 1152
+  const float2 f01 = __half22float2(__hsub2(*reinterpret_cast<__half2*>(&h01), bias));
+  const float2 f23 = __half22float2(__hsub2(*reinterpret_cast<__half2*>(&h23), bias));
+  lo = pack_f16(f01.x * s, f01.y * s);
+  hi = pack_f16(f23.x * s, f23.y * s);
 }
 
 __device__ __forceinline__ float fast_exp2(float x) {
@@ -86,7 +129,7 @@ __device__ __forceinline__ float fast_exp2(float x) {
 // Byte offset of 16-byte chunk c (0..31) of key row k inside a K or V half.
 __device__ __forceinline__ int swz(int k, int c) { return k * kRowBytes + ((c ^ (k & 7)) << 4); }
 
-template <int NQ>
+template <int NQ, bool I8>
 __global__ void __launch_bounds__(kThreads, 1) attn_decode_kernel(const AttnDecodeArgs a) {
   extern __shared__ __align__(128) unsigned char smem[];
   __shared__ float s_m[4][kRows], s_l[4][kRows];
@@ -109,8 +152,30 @@ __global__ void __launch_bounds__(kThreads, 1) attn_decode_kernel(const AttnDeco
   auto load_stage = [&](int st, int buf) {
     const int key0 = st * kStageKeys;
     const int page = bt[key0 / kAttnPageTokens];
-    const size_t base = ((static_cast<size_t>(page) * kAttnKvHeads + kvh) * kAttnPageTokens +
-                         key0 % kAttnPageTokens) * kAttnHeadDim;
+    const size_t tok0 = (static_cast<size_t>(page) * kAttnKvHeads + kvh) * kAttnPageTokens + key0 % kAttnPageTokens;
+    const size_t base = tok0 * kAttnHeadDim;
+    if constexpr (I8) {
+      // Raw INT8 rows (unswizzled: only the dequant pass reads them) and the stage's scales.
+      unsigned char* rk = smem + kStageBytes + buf * kRawStage;
+      unsigned char* rv = rk + kRawHalf;
+      float* rs = reinterpret_cast<float*>(rv + kRawHalf);
+      const unsigned char* kc8 = static_cast<const unsigned char*>(a.k_cache);
+      const unsigned char* vc8 = static_cast<const unsigned char*>(a.v_cache);
+#pragma unroll
+      for (int i = threadIdx.x; i < kStageKeys * 16; i += kThreads) {
+        const int k = i >> 4, c = i & 15;
+        const bool valid = key0 + k < ctx;
+        const size_t off = base + static_cast<size_t>(valid ? k : 0) * kAttnHeadDim + c * 16;
+        cp_async16(rk + k * kAttnHeadDim + c * 16, kc8 + off, valid);
+        cp_async16(rv + k * kAttnHeadDim + c * 16, vc8 + off, valid);
+      }
+      if (threadIdx.x < 16) {  // 8 chunks of 4 K scales, then 8 of V
+        const int c = threadIdx.x & 7;
+        const float* src = (threadIdx.x < 8 ? a.k_scale : a.v_scale) + tok0 + c * 4;
+        cp_async16(rs + (threadIdx.x < 8 ? 0 : kStageKeys) + c * 4, src, key0 + c * 4 < ctx);
+      }
+      return;
+    }
     unsigned char* sk = smem + buf * kStageBytes;
     unsigned char* sv = sk + kHalfBytes;
 #pragma unroll
@@ -124,6 +189,7 @@ __global__ void __launch_bounds__(kThreads, 1) attn_decode_kernel(const AttnDeco
   };
 
   // Start the KV stream before reading Q.
+  constexpr bool F16 = I8;
   load_stage(st0, 0);
   cp_async_commit();
   if (st0 + 1 < st1) load_stage(st0 + 1, 1);
@@ -143,6 +209,11 @@ __global__ void __launch_bounds__(kThreads, 1) attn_decode_kernel(const AttnDeco
       for (int kk = 0; kk < 16; ++kk) {
         qf[kk][half] = live ? *reinterpret_cast<const uint32_t*>(qr + kk * 16) : 0u;
         qf[kk][half + 2] = live ? *reinterpret_cast<const uint32_t*>(qr + kk * 16 + 8) : 0u;
+        if constexpr (F16) {  // BF16 pairs -> FP16 pairs (q is post-norm: far inside FP16 range)
+          qf[kk][half] = pack_f16(__uint_as_float(qf[kk][half] << 16), __uint_as_float(qf[kk][half] & 0xffff0000u));
+          qf[kk][half + 2] =
+              pack_f16(__uint_as_float(qf[kk][half + 2] << 16), __uint_as_float(qf[kk][half + 2] & 0xffff0000u));
+        }
       }
     }
   }
@@ -163,8 +234,35 @@ __global__ void __launch_bounds__(kThreads, 1) attn_decode_kernel(const AttnDeco
     cp_async_commit();
     cp_async_wait<2>();
     __syncthreads();
-    const unsigned char* sk = smem + ((st - st0) % kStages) * kStageBytes;
+    const unsigned char* sk = smem + (I8 ? 0 : ((st - st0) % kStages) * kStageBytes);
     const unsigned char* sv = sk + kHalfBytes;
+    if constexpr (I8) {
+      // Dequantize the raw stage into the FP16 work tile (swizzled like the BF16 stages):
+      // 16 INT8 of one key -> two 16-byte FP16 chunks, x * scale; keys past ctx -> 0.
+      const unsigned char* rk = smem + kStageBytes + ((st - st0) % kStages) * kRawStage;
+      const unsigned char* rv = rk + kRawHalf;
+      const float* rs = reinterpret_cast<const float*>(rv + kRawHalf);
+      unsigned char* wk = smem;
+      unsigned char* wv = smem + kHalfBytes;
+#pragma unroll
+      for (int i = threadIdx.x; i < 2 * kStageKeys * 16; i += kThreads) {
+        const bool is_v = i >= kStageKeys * 16;
+        const int j = is_v ? i - kStageKeys * 16 : i;
+        const int k = j >> 4, c = j & 15;
+        const bool live = st * kStageKeys + k < ctx;
+        const float sc = live ? rs[(is_v ? kStageKeys : 0) + k] : 0.f;
+        const uint4 raw = *reinterpret_cast<const uint4*>((is_v ? rv : rk) + k * kAttnHeadDim + c * 16);
+        uint4 h0, h1;
+        i8x4_to_f16(raw.x, sc, h0.x, h0.y);
+        i8x4_to_f16(raw.y, sc, h0.z, h0.w);
+        i8x4_to_f16(raw.z, sc, h1.x, h1.y);
+        i8x4_to_f16(raw.w, sc, h1.z, h1.w);
+        unsigned char* dst = is_v ? wv : wk;
+        *reinterpret_cast<uint4*>(dst + swz(k, 2 * c)) = h0;
+        *reinterpret_cast<uint4*>(dst + swz(k, 2 * c + 1)) = h1;
+      }
+      __syncthreads();
+    }
 
     // S = Q K^T for this warp's 8 keys.
     float s[4] = {0.f, 0.f, 0.f, 0.f};
@@ -172,8 +270,8 @@ __global__ void __launch_bounds__(kThreads, 1) attn_decode_kernel(const AttnDeco
     for (int kk2 = 0; kk2 < 8; ++kk2) {
       uint32_t b0, b1, b2, b3;
       ldsm_x4(b0, b1, b2, b3, sk + swz(my_key, kk2 * 4 + lq));
-      mma16816(s, qf[2 * kk2], b0, b1);
-      mma16816(s, qf[2 * kk2 + 1], b2, b3);
+      mma16816<F16>(s, qf[2 * kk2], b0, b1);
+      mma16816<F16>(s, qf[2 * kk2 + 1], b2, b3);
     }
 
     // Online softmax (base 2). Lane holds rows gid (s0, s1) and gid+8 (s2, s3).
@@ -206,17 +304,17 @@ __global__ void __launch_bounds__(kThreads, 1) attn_decode_kernel(const AttnDeco
         o[i][3] *= al1;
       }
     }
-    const uint32_t pa0 = pack_bf16(e0, e1), pa1 = pack_bf16(e2, e3);
+    const uint32_t pa0 = pack2<F16>(e0, e1), pa1 = pack2<F16>(e2, e3);
 
     // O += P V: V B fragments for 4 n8 dim tiles per ldmatrix.x4.trans.
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
       uint32_t v0, v1, v2, v3;
       ldsm_x4_t(v0, v1, v2, v3, sv + swz(my_key, j * 4 + lq));
-      mma1688(o[4 * j + 0], pa0, pa1, v0);
-      mma1688(o[4 * j + 1], pa0, pa1, v1);
-      mma1688(o[4 * j + 2], pa0, pa1, v2);
-      mma1688(o[4 * j + 3], pa0, pa1, v3);
+      mma1688<F16>(o[4 * j + 0], pa0, pa1, v0);
+      mma1688<F16>(o[4 * j + 1], pa0, pa1, v1);
+      mma1688<F16>(o[4 * j + 2], pa0, pa1, v2);
+      mma1688<F16>(o[4 * j + 3], pa0, pa1, v3);
     }
     __syncthreads();
   }
@@ -350,18 +448,30 @@ __global__ void __launch_bounds__(kThreads, 1) attn_decode_kernel(const AttnDeco
   finish(tot, lall);
 }
 
-template <int NQ>
+template <int NQ, bool I8>
 cudaError_t launch(const AttnDecodeArgs& a, cudaStream_t stream) {
+  constexpr int smem = I8 ? kSmemBytesI8 : kSmemBytes;
   static bool configured = false;
   if (!configured) {
-    const cudaError_t e = cudaFuncSetAttribute(attn_decode_kernel<NQ>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                               kSmemBytes);
+    const cudaError_t e = cudaFuncSetAttribute(attn_decode_kernel<NQ, I8>,
+                                               cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     if (e != cudaSuccess) return e;
     configured = true;
   }
   const dim3 grid(a.max_splits, kAttnKvHeads, a.B);
-  attn_decode_kernel<NQ><<<grid, kThreads, kSmemBytes, stream>>>(a);
+  attn_decode_kernel<NQ, I8><<<grid, kThreads, smem, stream>>>(a);
   return cudaGetLastError();
+}
+
+template <bool I8>
+cudaError_t launch_nq(const AttnDecodeArgs& a, cudaStream_t stream) {
+  switch (a.n_q) {
+    case 1: return launch<1, I8>(a, stream);
+    case 2: return launch<2, I8>(a, stream);
+    case 3: return launch<3, I8>(a, stream);
+    case 4: return launch<4, I8>(a, stream);
+    default: return cudaErrorInvalidValue;
+  }
 }
 
 }  // namespace
@@ -377,13 +487,8 @@ void attn_decode_split(int B, int max_ctx, int sms, int* stages_per_split, int* 
 }
 
 cudaError_t attn_decode(const AttnDecodeArgs& a, cudaStream_t stream) {
-  switch (a.n_q) {
-    case 1: return launch<1>(a, stream);
-    case 2: return launch<2>(a, stream);
-    case 3: return launch<3>(a, stream);
-    case 4: return launch<4>(a, stream);
-    default: return cudaErrorInvalidValue;
-  }
+  if ((a.k_scale == nullptr) != (a.v_scale == nullptr)) return cudaErrorInvalidValue;
+  return a.k_scale ? launch_nq<true>(a, stream) : launch_nq<false>(a, stream);
 }
 
 }  // namespace chandra

@@ -130,6 +130,25 @@ __global__ void __launch_bounds__(256) qk_norm_rope_kernel(const QkNormRopeArgs 
       }
     }
   }
+  if (!is_q && a.k_scale) {  // INT8 cache: symmetric per (token, head)
+    float mx = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) mx = fmaxf(mx, fabsf(x[j]));
+#pragma unroll
+    for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    const float scale = mx > 0.f ? mx / 127.f : 1.f, inv = 1.f / scale;
+    unsigned w[2] = {0u, 0u};
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int q = max(-127, min(127, __float2int_rn(x[j] * inv)));
+      w[j >> 2] |= (static_cast<unsigned>(q) & 0xffu) << (8 * (j & 3));
+    }
+    const size_t tok = (static_cast<size_t>(a.page[m]) * 4 + h) * 64 + a.slot[m];
+    unsigned char* cache = static_cast<unsigned char*>(is_v ? a.v_cache : a.k_cache);
+    *reinterpret_cast<uint2*>(cache + tok * 256 + lane * 8) = make_uint2(w[0], w[1]);
+    if (lane == 0) (is_v ? a.v_scale : a.k_scale)[tok] = scale;
+    return;
+  }
   const uint4 packed = pack8(x);
   if (is_q) {
     *reinterpret_cast<uint4*>(static_cast<bf16*>(a.q_out) + (static_cast<size_t>(m) * 16 + h) * 256 + lane * 8) = packed;

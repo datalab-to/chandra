@@ -37,6 +37,8 @@ struct QkNormRopeArgs {
   const int* page;
   const int* slot;
   int M;
+  float* k_scale;  // INT8 cache: [pages][4][64] per (token, head) scales (absmax / 127); null for BF16
+  float* v_scale;
 };
 cudaError_t qk_norm_rope_kv(const QkNormRopeArgs& a, cudaStream_t stream);
 

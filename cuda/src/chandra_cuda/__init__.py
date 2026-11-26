@@ -93,8 +93,13 @@ def attn_decode(
     n_q: int = 1,
     max_ctx: int | None = None,
     out: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gated decode/verify attention for Chandra 2's full-attention layers.
+
+    With k_scale, v_scale ([pages, 4, 64] FP32), k_cache and v_cache hold INT8: x = int8 * scale
+    per (token, head); the kernel dequantizes to FP16 per stage and runs FP16 MMAs.
 
     q, gate: [B * n_q, 16, 256] BF16 views (token, head, dim; the last dim
     contiguous), e.g. the two halves of q_proj's per-head [q | gate] output.
@@ -131,7 +136,9 @@ def attn_decode(
         k_cache.data_ptr(), v_cache.data_ptr(),
         block_table.data_ptr(), block_table.stride(0), ctx_lens.data_ptr(),
         ws[0].data_ptr(), ws[1].data_ptr(), ws[2].data_ptr(),
-        b, n_q, sps, max_splits, torch.cuda.current_stream(dev).cuda_stream,
+        b, n_q, sps, max_splits,
+        0 if k_scale is None else k_scale.data_ptr(), 0 if v_scale is None else v_scale.data_ptr(),
+        torch.cuda.current_stream(dev).cuda_stream,
     )
     return out
 
@@ -263,7 +270,8 @@ def silu_mul(gate_up: torch.Tensor, out: torch.Tensor | None = None) -> torch.Te
 
 def qk_norm_rope_kv(qkv: torch.Tensor, q_norm_w: torch.Tensor, k_norm_w: torch.Tensor, pos: torch.Tensor,
                     k_cache: torch.Tensor, v_cache: torch.Tensor, page: torch.Tensor, slot: torch.Tensor,
-                    rope_theta: float = 1e7, q_out: torch.Tensor | None = None) -> torch.Tensor:
+                    rope_theta: float = 1e7, q_out: torch.Tensor | None = None,
+                    k_scale: torch.Tensor | None = None, v_scale: torch.Tensor | None = None) -> torch.Tensor:
     """After the merged qkv GEMM of a full-attention layer (rows [16 x (q | gate)] [k] [v], 10,240 BF16):
     q -> RMSNorm(1 + w) + partial mRoPE -> q_out [M, 16, 256]; k likewise and v as is into the paged
     cache [pages, 4, 64, 256] at (page[m], slot[m]). pos: [M, 3] int32 (t, h, w) positions."""
@@ -274,7 +282,9 @@ def qk_norm_rope_kv(qkv: torch.Tensor, q_norm_w: torch.Tensor, k_norm_w: torch.T
         q_out = torch.empty(m, 16, 256, dtype=torch.bfloat16, device=qkv.device)
     _core.qk_norm_rope_kv(qkv.data_ptr(), qkv.stride(0), q_norm_w.data_ptr(), k_norm_w.data_ptr(),
                           pos.contiguous().data_ptr(), float(rope_theta), q_out.data_ptr(), k_cache.data_ptr(),
-                          v_cache.data_ptr(), page.data_ptr(), slot.data_ptr(), m, _stream(qkv))
+                          v_cache.data_ptr(), page.data_ptr(), slot.data_ptr(), m,
+                          0 if k_scale is None else k_scale.data_ptr(), 0 if v_scale is None else v_scale.data_ptr(),
+                          _stream(qkv))
     return q_out
 
 

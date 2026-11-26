@@ -63,7 +63,7 @@ NB_MODULE(_core, m) {
       [](uintptr_t q, int64_t q_ts, int q_hs, uintptr_t gate, int64_t g_ts, int g_hs, uintptr_t out,
          int64_t o_ts, int o_hs, uintptr_t k_cache, uintptr_t v_cache, uintptr_t block_table, int bt_stride,
          uintptr_t ctx_lens, uintptr_t partial_o, uintptr_t partial_ml, uintptr_t tickets, int B, int n_q,
-         int stages_per_split, int max_splits, uintptr_t stream) {
+         int stages_per_split, int max_splits, uintptr_t k_scale, uintptr_t v_scale, uintptr_t stream) {
         chandra::AttnDecodeArgs a{};
         a.q = reinterpret_cast<const void*>(q);
         a.q_token_stride = q_ts;
@@ -86,6 +86,8 @@ NB_MODULE(_core, m) {
         a.n_q = n_q;
         a.stages_per_split = stages_per_split;
         a.max_splits = max_splits;
+        a.k_scale = reinterpret_cast<const float*>(k_scale);
+        a.v_scale = reinterpret_cast<const float*>(v_scale);
         check(chandra::attn_decode(a, reinterpret_cast<cudaStream_t>(stream)));
       });
   m.attr("gdn_hist_floats") = chandra::kGdnHistFloats;
@@ -145,7 +147,7 @@ NB_MODULE(_core, m) {
   });
   m.def("qk_norm_rope_kv", [](uintptr_t qkv, int64_t qkv_stride, uintptr_t qw, uintptr_t kw, uintptr_t pos,
                               float theta, uintptr_t q_out, uintptr_t kc, uintptr_t vc, uintptr_t page,
-                              uintptr_t slot, int M, uintptr_t stream) {
+                              uintptr_t slot, int M, uintptr_t k_scale, uintptr_t v_scale, uintptr_t stream) {
     chandra::QkNormRopeArgs a{};
     a.qkv = reinterpret_cast<const void*>(qkv);
     a.qkv_stride = qkv_stride;
@@ -159,6 +161,8 @@ NB_MODULE(_core, m) {
     a.page = reinterpret_cast<const int*>(page);
     a.slot = reinterpret_cast<const int*>(slot);
     a.M = M;
+    a.k_scale = reinterpret_cast<float*>(k_scale);
+    a.v_scale = reinterpret_cast<float*>(v_scale);
     check(chandra::qk_norm_rope_kv(a, reinterpret_cast<cudaStream_t>(stream)));
   });
 }

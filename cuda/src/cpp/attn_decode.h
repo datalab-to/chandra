@@ -24,8 +24,10 @@ struct AttnDecodeArgs {
   void* out;
   int64_t out_token_stride;
   int out_head_stride;
-  const void* k_cache;  // [pages][4][64][256] BF16
+  const void* k_cache;  // [pages][4][64][256] BF16, or INT8 when k_scale is set
   const void* v_cache;
+  const float* k_scale;  // [pages][4][64]: INT8 KV, x = int8 * scale per (token, head); null for BF16
+  const float* v_scale;
   const int* block_table;  // [B][block_table_stride] page ids
   int block_table_stride;
   const int* ctx_lens;  // [B] tokens in the cache, including this step's n_q
