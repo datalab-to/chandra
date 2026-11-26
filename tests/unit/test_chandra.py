@@ -227,23 +227,39 @@ def test_batch_input_item_default_prompt_type():
     assert item.prompt_type == "ocr_layout"
 
 
+def _fake_stream(pieces, usage=None):
+    """A streamed chat completion: one chunk per piece, then a usage-only chunk.
+    `consumed` counts the chunks the client actually read."""
+
+    class _Stream:
+        def __init__(self):
+            self.consumed = 0
+            self.closed = False
+
+        def __iter__(self):
+            for p in pieces:
+                self.consumed += 1
+                yield SimpleNamespace(
+                    choices=[SimpleNamespace(delta=SimpleNamespace(content=p))], usage=None
+                )
+            yield SimpleNamespace(choices=[], usage=usage)
+
+        def close(self):
+            self.closed = True
+
+    return _Stream()
+
+
 def test_inference_manager_vllm_and_empty_batch():
     from chandra.model.vllm import generate_vllm
 
     assert generate_vllm([]) == []
 
-    fake_completion = SimpleNamespace(
-        choices=[
-            SimpleNamespace(
-                message=SimpleNamespace(
-                    content='<div data-bbox="[10, 20, 300, 80]" data-label="Text">Hello Chandra</div>'
-                )
-            )
-        ],
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = _fake_stream(
+        ['<div data-bbox="[10, 20, 300, 80]" data-label="Text">Hello Chandra</div>'],
         usage=None,  # Verify None usage doesn't crash
     )
-    fake_client = MagicMock()
-    fake_client.chat.completions.create.return_value = fake_completion
 
     with patch("chandra.model.vllm.OpenAI", return_value=fake_client):
         manager = InferenceManager(method="vllm")
@@ -254,6 +270,46 @@ def test_inference_manager_vllm_and_empty_batch():
     assert "Hello Chandra" in results[0].markdown
     assert results[0].token_count == 0
     assert len(results[0].chunks) == 1
+
+
+def test_vllm_stops_repeating_generation_early_and_retries():
+    from chandra.model.vllm import generate_vllm
+
+    looping = _fake_stream(["<p>The answer is"] + [" the same"] * 5000)
+    good = _fake_stream(
+        ['<div data-bbox="0 0 10 10" data-label="Text"><p>Done</p></div>'],
+        usage=SimpleNamespace(completion_tokens=12),
+    )
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.side_effect = [looping, good]
+
+    with patch("chandra.model.vllm.OpenAI", return_value=fake_client):
+        img = Image.new("RGB", (200, 100), color=(255, 255, 255))
+        results = generate_vllm([BatchInputItem(image=img)], max_retries=1)
+
+    assert looping.closed
+    assert looping.consumed < 200  # stopped long before the 5,000-chunk loop ends
+    assert fake_client.chat.completions.create.call_count == 2
+    assert results[0].raw.endswith("<p>Done</p></div>")
+    assert results[0].token_count == 12
+
+
+def test_vllm_does_not_stop_on_short_legitimate_repeats():
+    from chandra.model.vllm import generate_vllm
+
+    row = "<tr>" + "<td></td>" * 6 + "</tr>"
+    text = ["<table>"] + [row] * 3 + ["</table>"] + ["<p>Text after the table.</p>"] * 20
+    stream = _fake_stream(text, usage=SimpleNamespace(completion_tokens=len(text)))
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = stream
+
+    with patch("chandra.model.vllm.OpenAI", return_value=fake_client):
+        img = Image.new("RGB", (200, 100), color=(255, 255, 255))
+        results = generate_vllm([BatchInputItem(image=img)], max_retries=0)
+
+    assert not stream.closed
+    assert stream.consumed == len(text)
+    assert results[0].raw == "".join(text)
 
 
 def test_resolve_device_fallback():

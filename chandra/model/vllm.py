@@ -14,6 +14,18 @@ from chandra.prompts import PROMPT_MAPPING
 from chandra.settings import settings
 
 
+# A generation that falls into a loop otherwise runs to max_tokens (12K+
+# tokens) before the repeat detector sees the finished text and retries.
+# While streaming, the detector runs every REPEAT_CHECK_EVERY chunks (about one
+# token each); once it has fired on REPEAT_STOP_AFTER checks in a row (~32
+# tokens) the request is stopped and retried at once. Legitimate repeats, such
+# as a row of empty table cells, end long before that.
+REPEAT_CHECK_EVERY = 8
+REPEAT_STOP_AFTER = 4
+# detect_repeat_token never looks back further than ~1.3K characters.
+REPEAT_TAIL_CHARS = 2048
+
+
 def image_to_base64(image: Image.Image) -> str:
     """Convert PIL Image to base64 string."""
     buffered = io.BytesIO()
@@ -41,6 +53,7 @@ def generate_vllm(
     vllm_model_name: str | None = settings.VLLM_MODEL_NAME,
     temperature: float = 0.0,
     top_p: float = 0.1,
+    stop_on_repeat: bool = True,
 ) -> List[GenerationResult]:
     if not batch:
         return []
@@ -90,26 +103,46 @@ def generate_vllm(
         content.append({"type": "text", "text": prompt})
 
         try:
-            completion = client.chat.completions.create(
+            stream = client.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": content}],
                 max_tokens=max_output_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                stream=True,
+                stream_options={"include_usage": True},
             )
-            if hasattr(completion, "error") and completion.error:
-                raise RuntimeError(str(completion.error))
-            raw = (
-                completion.choices[0].message.content
-                if completion.choices and completion.choices[0].message
-                else ""
-            ) or ""
-            usage = getattr(completion, "usage", None)
-            token_count = (
-                int(usage.completion_tokens)
-                if usage is not None and getattr(usage, "completion_tokens", None) is not None
-                else 0
-            )
+            raw, usage, n_chunks, hits, stopped = "", None, 0, 0, False
+            for chunk in stream:
+                if getattr(chunk, "error", None):
+                    raise RuntimeError(str(chunk.error))
+                if getattr(chunk, "usage", None) is not None:
+                    usage = chunk.usage
+                if not chunk.choices or chunk.choices[0].delta is None:
+                    continue
+                piece = chunk.choices[0].delta.content
+                if not piece:
+                    continue
+                raw += piece
+                n_chunks += 1
+                if stop_on_repeat and n_chunks % REPEAT_CHECK_EVERY == 0:
+                    if detect_repeat_token(raw[-REPEAT_TAIL_CHARS:]):
+                        hits += 1
+                        if hits >= REPEAT_STOP_AFTER:
+                            stopped = True
+                            break
+                    else:
+                        hits = 0
+            if stopped:
+                # Closing the connection makes the server abort the request.
+                stream.close()
+                print(f"Stopped a repeating generation after {n_chunks} tokens")
+            if usage is not None and getattr(usage, "completion_tokens", None) is not None:
+                token_count = int(usage.completion_tokens)
+            else:
+                # The server sends usage only with the last chunk; a stopped
+                # stream has none, so count chunks (about one token each).
+                token_count = n_chunks if stopped else 0
             result = GenerationResult(
                 raw=raw,
                 token_count=token_count,
