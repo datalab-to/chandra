@@ -270,6 +270,18 @@ class Decoder:
         h, _ = rmsnorm_add(res, M["w_norm"], x=z)
         return h, _rows(self.draft_head, h)
 
+    def exact_head(self):
+        """An LMHeadExact (INT8 pass + BF16 re-check, the same picks as the BF16 head) sharing this
+        decoder's BF16 head."""
+        from safetensors import safe_open
+
+        from . import LMHeadExact
+
+        f = safe_open(os.path.join(self.ckpt_dir, "model.safetensors"), "pt", device=str(self.device))
+        head = LMHeadExact(f.get_tensor("lm_head.weight"), self.lm_head)
+        torch.cuda.empty_cache()
+        return head
+
     def set_draft_head(self, kind: str = "bf16", rows: torch.Tensor | None = None):
         """The LM head the MTP drafts use: "bf16" (the main model's), or "fp8" with an optional
         draft vocabulary (token ids). Drafts only change how many tokens a step keeps, never which."""

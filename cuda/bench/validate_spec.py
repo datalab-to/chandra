@@ -86,12 +86,40 @@ def main():
         plain = [[f] for f in firsts]
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        for _ in range(a.steps - 1):
-            nxt = dec.step(torch.tensor([t[-1] for t in plain], device="cuda"), seqs)
+        hid = []  # final hidden states of every 8th step, for the exact INT8 LM head check below
+        for i in range(a.steps - 1):
+            h, nxt = dec._forward(torch.tensor([t[-1] for t in plain], device="cuda"), seqs, 1, commit=False)
+            for s in seqs:
+                dec.length[s] += 1
+            if i % 8 == 0:
+                hid.append((h.clone(), nxt.clone()))
             for t, x in zip(plain, nxt.tolist()):
                 t.append(x)
         torch.cuda.synchronize()
         t_plain = time.perf_counter() - t0
+
+        # The exact LM head (INT8 pass + BF16 re-check of candidate tiles) on real hidden states.
+        ex = dec.exact_head()
+        same = all(torch.equal(ex(h), n) for h, n in hid)
+        cand = torch.cat([ex.candidate_tiles(h).float() for h, _ in hid])
+        h = hid[-1][0]
+
+        def ms(fn, reps=50):
+            fn()
+            torch.cuda.synchronize()
+            t = time.perf_counter()
+            for _ in range(reps):
+                fn()
+            torch.cuda.synchronize()
+            return (time.perf_counter() - t) / reps * 1e3
+
+        print(f"exact INT8 LM head on {cand.numel()} real tokens: picks equal to the BF16 head: {same}; "
+              f"candidate tiles per token (of {ex.n // 128}): mean {cand.mean():.1f}, median "
+              f"{cand.median():.0f}, p90 {cand.quantile(0.9):.0f}, max {cand.max():.0f}; "
+              f"M={h.shape[0]}: BF16 head {ms(lambda: dec.lm_head(h)):.2f} ms, exact {ms(lambda: ex(h)):.2f} ms",
+              flush=True)
+        del ex
+        torch.cuda.empty_cache()
 
         # MTP drafts + verify, from the same prefill state (the MTP KV over the prompt is unchanged),
         # once per draft head; the first is reported in full.
