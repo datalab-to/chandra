@@ -59,7 +59,7 @@ def main():
             t_ref = time_us(lambda: F.linear(x, w), a.reps)
             t_ours = time_us(lambda: lin(x, out), a.reps)
             t_fp8 = time_us(lambda: lin8(x, out), a.reps) if lin8 is not None else float("nan")
-            step[m][2] += uses * t_fp8
+            step[m][2] += uses * (t_fp8 if lin8 is not None else t_ours)  # LM head stays BF16
             step[m][0] += uses * t_ref
             step[m][1] += uses * t_ours
             print(f"{name:12s} {n:6d} {k:5d} {m:3d} {str(lin.plan):>8s} {t_ref:9.1f} {t_ours:8.1f} "
@@ -69,8 +69,8 @@ def main():
     print("one decode step, all GEMMs (ms):")
     for m in a.rows:
         print(f"  M={m:2d}: cuBLAS {step[m][0] / 1e3:6.2f}  ours {step[m][1] / 1e3:6.2f}  "
-              f"({step[m][0] / step[m][1]:.2f}x)  ours FP8 weights (LM head BF16) "
-              f"{(step[m][2] + 2.1e3) / 1e3:6.2f} ms")
+              f"({step[m][0] / step[m][1]:.2f}x)  ours, FP8 weights (LM head BF16) "
+              f"{step[m][2] / 1e3:6.2f} ({step[m][0] / step[m][2]:.2f}x)")
 
 
 if __name__ == "__main__":
