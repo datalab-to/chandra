@@ -95,6 +95,8 @@ NB_MODULE(_core, m) {
                                               reinterpret_cast<unsigned long long*>(keys), M, N, K,
                                               reinterpret_cast<cudaStream_t>(stream)));
       });
+  m.def("set_decode_gemm_plan", &chandra::set_decode_gemm_plan, nb::arg("N"), nb::arg("K"), nb::arg("rw"),
+        nb::arg("splits"));
   m.def("decode_gemm_workspace_bytes", &chandra::decode_gemm_workspace_bytes, nb::arg("N"), nb::arg("K"),
         nb::arg("sms"));
   m.def("decode_gemm_counters", &chandra::decode_gemm_counters, nb::arg("N"), nb::arg("K"), nb::arg("sms"));

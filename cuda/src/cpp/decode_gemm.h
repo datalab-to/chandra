@@ -15,6 +15,8 @@ struct DecodeGemmPlan {
   int splits;      // CTAs along K per row tile (1 = no partial sums in global memory)
 };
 DecodeGemmPlan decode_gemm_plan(int N, int K, int sms);
+// For measurements: force the plan of (N, K) (rw <= 0 removes the override). Not thread-safe.
+void set_decode_gemm_plan(int N, int K, int rw, int splits);
 
 // Bytes of FP32 workspace and number of uint32 counters `decode_gemm` needs.
 size_t decode_gemm_workspace_bytes(int N, int K, int sms);

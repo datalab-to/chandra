@@ -601,7 +601,31 @@ cudaError_t gemm_entry(const void* x, const void* wp, const float* sc, void* y, 
 
 }  // namespace
 
+namespace {
+// Plan overrides for measurements only (set_decode_gemm_plan); empty in normal use.
+struct PlanOverride {
+  int N, K, rw, splits;
+};
+PlanOverride g_overrides[16];
+int g_n_overrides = 0;
+}  // namespace
+
+void set_decode_gemm_plan(int N, int K, int rw, int splits) {
+  for (int i = 0; i < g_n_overrides; ++i)
+    if (g_overrides[i].N == N && g_overrides[i].K == K) {
+      if (rw <= 0) {  // remove
+        g_overrides[i] = g_overrides[--g_n_overrides];
+      } else {
+        g_overrides[i] = {N, K, rw, splits};
+      }
+      return;
+    }
+  if (rw > 0 && g_n_overrides < 16) g_overrides[g_n_overrides++] = {N, K, rw, splits};
+}
+
 DecodeGemmPlan decode_gemm_plan(int N, int K, int sms) {
+  for (int i = 0; i < g_n_overrides; ++i)
+    if (g_overrides[i].N == N && g_overrides[i].K == K) return {g_overrides[i].rw, g_overrides[i].splits};
   // A CTA's x chunk is re-read from L2 by every CTA, so x traffic per weight byte is
   // (padded tokens) / (rows per CTA): take the widest row tile (128 rows). GEMMs with
   // fewer tiles than SMs split K across CTAs, using the largest split (dividing K's
