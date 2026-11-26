@@ -359,6 +359,14 @@ def vit_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens: torc
         raise ValueError("q, k, v must share a row stride with contiguous heads")
     if out is None:
         out = torch.empty(n, 16, 64, dtype=torch.bfloat16, device=q.device)
+    k8 = k_scale = k_mean = None
+    if version == 3:  # INT8 QK^T (approximate): per-image K mean, per-tile K scales, per-row Q scales
+        n_seq = cu_seqlens.shape[0] - 1
+        k8 = torch.empty(n, 16, 64, dtype=torch.int8, device=q.device)
+        k_scale = torch.empty(n_seq, (int(max_len) + 63) // 64, 16, dtype=torch.float32, device=q.device)
+        k_mean = torch.empty(n_seq, 16, 64, dtype=torch.float32, device=q.device)
     _core.vit_attn(q.data_ptr(), k.data_ptr(), v.data_ptr(), q.stride(0), out.data_ptr(), out.stride(0),
-                   cu_seqlens.data_ptr(), cu_seqlens.shape[0] - 1, int(max_len), int(version), _stream(q))
+                   cu_seqlens.data_ptr(), cu_seqlens.shape[0] - 1, int(max_len), int(version),
+                   0 if k8 is None else k8.data_ptr(), 0 if k_scale is None else k_scale.data_ptr(),
+                   0 if k_mean is None else k_mean.data_ptr(), _stream(q))
     return out
