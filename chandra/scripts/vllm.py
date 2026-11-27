@@ -89,6 +89,25 @@ def main():
         help="Run the container command via sudo",
     )
     parser.add_argument(
+        "--state-dtype",
+        default=None,
+        choices=["float16", "float32"],
+        help="Gated DeltaNet state dtype (vLLM --mamba-ssm-cache-dtype; default: vLLM's choice). "
+        "float16 gave the same olmOCR-bench score as the default and a few percent more pages/s",
+    )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        default=None,
+        help="KV cache dtype of the full-attention layers (vLLM --kv-cache-dtype, e.g. "
+        "int8_per_token_head or fp8; default: the model dtype). Must be one the image's vLLM supports",
+    )
+    parser.add_argument(
+        "--attention-backend",
+        default=None,
+        help="vLLM attention backend (e.g. TRITON_ATTN, which int8_per_token_head needs; "
+        "default: vLLM's choice)",
+    )
+    parser.add_argument(
         "--mtp",
         action="store_true",
         default=False,
@@ -145,6 +164,13 @@ def main():
     if args.mtp:
         spec_config = json.dumps({"method": "mtp", "num_speculative_tokens": 1})
         cmd.extend(["--speculative-config", spec_config])
+
+    if args.state_dtype:
+        cmd.extend(["--mamba-ssm-cache-dtype", args.state_dtype])
+    if args.kv_cache_dtype:
+        cmd.extend(["--kv-cache-dtype", args.kv_cache_dtype])
+    if args.attention_backend:
+        cmd.extend(["--attention-backend", args.attention_backend])
 
     vram = GPU_VRAM_GB[args.gpu]
     print(f"GPU: {args.gpu} ({vram}GB VRAM, dtype={dtype})")

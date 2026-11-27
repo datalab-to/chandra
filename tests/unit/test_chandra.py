@@ -452,3 +452,25 @@ def test_viewer_http_endpoints(tmp_path: Path):
     )
     assert status == 400
     assert "Unsupported file type" in json.loads(body.decode("utf-8"))["error"]
+
+
+def test_vllm_launcher_cache_dtypes():
+    """--state-dtype, --kv-cache-dtype and --attention-backend reach the vLLM command; without them
+    nothing is added."""
+    import chandra.scripts.vllm as launcher
+
+    def command(argv):
+        with patch.object(sys, "argv", ["chandra_vllm", *argv]), patch.object(
+            launcher, "detect_container_runtime", return_value="docker"
+        ), patch.object(launcher.subprocess, "run") as run:
+            launcher.main()
+        return run.call_args[0][0]
+
+    cmd = command(["--gpu", "l40s", "--state-dtype", "float16", "--kv-cache-dtype", "int8_per_token_head",
+                   "--attention-backend", "TRITON_ATTN"])
+    assert cmd[cmd.index("--mamba-ssm-cache-dtype") + 1] == "float16"
+    assert cmd[cmd.index("--kv-cache-dtype") + 1] == "int8_per_token_head"
+    assert cmd[cmd.index("--attention-backend") + 1] == "TRITON_ATTN"
+    cmd = command(["--gpu", "l40s"])
+    assert not {"--mamba-ssm-cache-dtype", "--kv-cache-dtype", "--attention-backend"} & set(cmd)
+
