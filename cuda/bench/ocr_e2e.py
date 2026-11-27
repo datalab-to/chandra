@@ -50,7 +50,8 @@ def main():
         same += md.strip() == ref.strip()
     print(f"{len(items)} pages in {dt:.1f} s ({len(items) / dt:.3f} pages/s, {toks / dt:.0f} tokens/s incl. prefill "
           f"and vision); weights {a.weights}, KV {a.kv}, state {a.state}, MTP {not a.no_mtp}, {a.slots} slots")
-    print(f"graph captures: {getattr(gen, 'graph_captures', 'n/a')}")
+    print(f"graph captures: {getattr(gen, 'graph_captures', 'n/a')}; host seconds by phase: "
+          + ", ".join(f"{k} {v:.1f}" for k, v in getattr(gen, "stats", {}).items()))
     if sims:
         print(f"vs the reference run: {len(sims)} pages compared, mean character similarity "
               f"{sum(sims) / len(sims):.3f}, {same} identical")

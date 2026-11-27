@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import glob
 import os
+import time
 
 import torch
 
@@ -78,6 +79,7 @@ class CudaGenerator:
         self.img_tok = self.hf.config.image_token_id
         self._graphs: dict[int, object] = {}  # number of decoding pages -> captured graph(s)
         self.graph_captures = 0
+        self.stats: dict[str, float] = {}  # host seconds per phase of the last generate()
 
     def _graph_for(self, seqs: list[int]):
         g = self._graphs.get(len(seqs))
@@ -169,6 +171,8 @@ class CudaGenerator:
                 results_kept[it] = r
 
         ended: dict[int, bool] = {}
+        st = self.stats = {"wait_cpu": 0.0, "prefill": 0.0, "graph": 0.0, "step": 0.0, "host": 0.0}
+        clock = time.perf_counter
         top_up()
         out: dict[int, list[int]] = {}
         slot_of: dict[int, int] = {}  # item -> slot, for pages still decoding
@@ -182,7 +186,12 @@ class CudaGenerator:
                 new = []
                 while queue and free:
                     (it, fut), s = queue.popleft(), free.pop(0)
-                    first, h = self._prefill(s, fut.result())
+                    t0 = clock()
+                    prepared = fut.result()
+                    t1 = clock()
+                    first, h = self._prefill(s, prepared)  # ends with a sync (the first token)
+                    st["wait_cpu"] += t1 - t0
+                    st["prefill"] += clock() - t1
                     top_up()
                     out[it] = [first]
                     if first in self.eos or max_new <= 1:
@@ -193,16 +202,21 @@ class CudaGenerator:
                     slot_of[it], last[it] = s, first
                     new.append((it, h))
                 if self.mtp and new:
+                    t0 = clock()
                     dr = d.first_drafts(torch.tensor([last[it] for it, _ in new], device="cuda"),
                                         torch.stack([h for _, h in new]), [slot_of[it] for it, _ in new])
                     for j, (it, _) in enumerate(new):
                         drafts[it] = dr[j].clone()
+                    st["prefill"] += clock() - t0
                 graph = None
             if not slot_of:
                 continue
             if graph is None:  # a new set of pages: the graphs for that many, re-pointed at them
+                t0 = clock()
                 members = sorted(slot_of, key=lambda it: slot_of[it])
                 graph = self._graph_for([slot_of[it] for it in members])
+                st["graph"] += clock() - t0
+            t0 = clock()
             if self.mtp:
                 emit, nlast, ndrafts = graph.step(torch.tensor([last[it] for it in members], device="cuda"),
                                                   torch.stack([drafts[it] for it in members]))
@@ -217,6 +231,8 @@ class CudaGenerator:
                 emit = [[t] for t in toks]
                 for it, t in zip(members, toks):
                     last[it] = t
+            t1 = clock()
+            st["step"] += t1 - t0
             for j, it in enumerate(members):
                 for t in emit[j]:
                     out[it].append(t)
@@ -229,5 +245,6 @@ class CudaGenerator:
                         graph = None
                         finish(it)
                         break
+            st["host"] += clock() - t1
         pool.shutdown()
         return [results_kept[i] for i in sorted(results_kept)] if on_result is None else None
