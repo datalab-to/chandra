@@ -15,6 +15,17 @@ constexpr int kMlp = 9216;
 cudaError_t rmsnorm_add(const void* x, const void* residual, void* residual_out, void* out, const void* w, int M,
                         cudaStream_t stream);
 
+// DeltaNet prefill of a fresh sequence: out[t][c] = bf16(silu(sum_j w[c][j] x[t - 3 + j][c])) for the
+// 8,192 qkv channels (zero history), the decode kernel's conv arithmetic in the same order.
+// x: [n] rows of row stride x_stride; w: [8192][4]; out: [n][8192].
+cudaError_t conv_silu_prefill(const void* x, int64_t x_stride, const void* w, void* out, int n,
+                              cudaStream_t stream);
+
+// DeltaNet gated RMSNorm per (row, head) of 128: out = bf16(o * rsqrt(mean(o^2) + 1e-6) * w * silu(z)),
+// as the decode kernel's epilogue. o: [n][32][128] BF16 (contiguous); z: [n] rows of z_stride; out: [n][4096].
+cudaError_t gated_rmsnorm(const void* o, const void* z, int64_t z_stride, const void* w, void* out, int n,
+                          cudaStream_t stream);
+
 // out[m][j] = bf16(silu(gu[m][j]) * gu[m][F + j]) for gate_up rows [M][2 * F] (F % 8 == 0).
 cudaError_t silu_mul(const void* gate_up, void* out, int M, cudaStream_t stream, int F = kMlp);
 

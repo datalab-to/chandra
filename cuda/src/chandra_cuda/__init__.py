@@ -11,7 +11,7 @@ import torch
 from . import _core
 
 __all__ = ["pack_weight", "pack_weight_fp8", "DecodeLinear", "DecodeLinearFP8", "DecodeLinearFP4", "DecodeLinearINT4", "DecodeLinearINT8", "mxfp4_quantize", "int4_g128_quantize",
-           "pack_weight_fp4", "pack_weight_i8", "interleave_gate_up", "autotune_plans", "LMHead", "LMHeadFP8", "LMHeadExact", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul",
+           "pack_weight_fp4", "pack_weight_i8", "interleave_gate_up", "autotune_plans", "LMHead", "LMHeadFP8", "LMHeadExact", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul", "conv_silu_prefill", "gated_rmsnorm",
            "qk_norm_rope_kv", "vit_attn"]
 
 
@@ -322,6 +322,30 @@ def rmsnorm_add(residual: torch.Tensor, w: torch.Tensor, x: torch.Tensor | None 
                       0 if residual_out is None else residual_out.data_ptr(), out.data_ptr(), w.data_ptr(), m,
                       _stream(residual))
     return out, (residual if x is None else residual_out)
+
+
+def conv_silu_prefill(x: torch.Tensor, conv_w: torch.Tensor) -> torch.Tensor:
+    """DeltaNet prefill conv of a fresh sequence: x [n, >= 8192] BF16 rows (the qkv part of the in_proj
+    output, last dim contiguous), conv_w [8192, 4] -> [n, 8192] bf16(silu(causal conv)), as the decode
+    kernel computes it."""
+    n = x.shape[0]
+    if x.stride(-1) != 1:
+        raise ValueError("the last dimension must be contiguous")
+    out = torch.empty(n, 8192, dtype=torch.bfloat16, device=x.device)
+    _core.conv_silu_prefill(x.data_ptr(), x.stride(0), conv_w.contiguous().data_ptr(), out.data_ptr(), n, _stream(x))
+    return out
+
+
+def gated_rmsnorm(o: torch.Tensor, z: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """DeltaNet gated RMSNorm: o [n, 32, 128] BF16, z [n, >= 4096] rows -> [n, 4096] BF16."""
+    n = o.shape[0]
+    o = o.contiguous()
+    if z.stride(-1) != 1:
+        raise ValueError("the last dimension of z must be contiguous")
+    out = torch.empty(n, 4096, dtype=torch.bfloat16, device=o.device)
+    _core.gated_rmsnorm(o.data_ptr(), z.data_ptr(), z.stride(0), w.contiguous().data_ptr(), out.data_ptr(), n,
+                        _stream(o))
+    return out
 
 
 def silu_mul(gate_up: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
@@ -901,11 +925,13 @@ class DecodeLinearINT8(DecodeLinear):
         scaled GEMM with this layer's INT8 weights and row scales."""
         from vllm import _custom_ops as ops
 
-        q, sc = self.codes().to(torch.int8), self.scale
-        if self.epilogue:
-            q, sc = deinterleave_gate_up(q), deinterleave_gate_up(sc[:, None])[:, 0]
+        if getattr(self, "_w8", None) is None:  # row-major INT8 copy for prefill (1 byte per weight), once
+            q, sc = self.codes().to(torch.int8), self.scale
+            if self.epilogue:
+                q, sc = deinterleave_gate_up(q), deinterleave_gate_up(sc[:, None])[:, 0]
+            self._w8, self._w8s = q.contiguous(), sc[:, None].contiguous()
         xq, xs, _ = ops.scaled_int8_quant(x.contiguous())
-        return ops.cutlass_scaled_mm(xq, q.t(), scale_a=xs, scale_b=sc[:, None].contiguous(), out_dtype=torch.bfloat16)
+        return ops.cutlass_scaled_mm(xq, self._w8.t(), scale_a=xs, scale_b=self._w8s, out_dtype=torch.bfloat16)
 
     def prefill(self, x: torch.Tensor) -> torch.Tensor:
         """As the decode kernel: x times the INT8 values (exact in BF16), then the row scale."""

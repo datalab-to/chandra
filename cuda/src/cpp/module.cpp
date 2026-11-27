@@ -221,6 +221,15 @@ NB_MODULE(_core, m) {
                                reinterpret_cast<void*>(res_out), reinterpret_cast<void*>(out),
                                reinterpret_cast<const void*>(w), M, reinterpret_cast<cudaStream_t>(stream)));
   });
+  m.def("conv_silu_prefill", [](uintptr_t x, int64_t xs, uintptr_t w, uintptr_t out, int n, uintptr_t stream) {
+    check(chandra::conv_silu_prefill(reinterpret_cast<const void*>(x), xs, reinterpret_cast<const void*>(w),
+                                     reinterpret_cast<void*>(out), n, reinterpret_cast<cudaStream_t>(stream)));
+  });
+  m.def("gated_rmsnorm", [](uintptr_t o, uintptr_t z, int64_t zs, uintptr_t w, uintptr_t out, int n, uintptr_t stream) {
+    check(chandra::gated_rmsnorm(reinterpret_cast<const void*>(o), reinterpret_cast<const void*>(z), zs,
+                                 reinterpret_cast<const void*>(w), reinterpret_cast<void*>(out), n,
+                                 reinterpret_cast<cudaStream_t>(stream)));
+  });
   m.def("silu_mul", [](uintptr_t gu, uintptr_t out, int M, uintptr_t stream, int F) {
     check(chandra::silu_mul(reinterpret_cast<const void*>(gu), reinterpret_cast<void*>(out), M,
                             reinterpret_cast<cudaStream_t>(stream), F));

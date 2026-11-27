@@ -159,7 +159,71 @@ __global__ void __launch_bounds__(256) qk_norm_rope_kernel(const QkNormRopeArgs 
   }
 }
 
+__device__ __forceinline__ float bf2f(const bf16* p) { return __bfloat162float(*p); }
+__device__ __forceinline__ float silu_fast(float x) { return x / (1.f + __expf(-x)); }
+
+__global__ void __launch_bounds__(256) conv_silu_prefill_kernel(const bf16* __restrict__ x, int64_t xs,
+                                                                 const bf16* __restrict__ w, bf16* __restrict__ out,
+                                                                 int n) {
+  const int c = blockIdx.x * 256 + threadIdx.x, t = blockIdx.y;
+  if (c >= 8192) return;
+  float acc = bf2f(w + c * 4 + 3) * bf2f(x + static_cast<int64_t>(t) * xs + c);
+#pragma unroll
+  for (int j = 1; j <= 3; ++j) {
+    const float xv = t - j >= 0 ? bf2f(x + static_cast<int64_t>(t - j) * xs + c) : 0.f;
+    acc += bf2f(w + c * 4 + 3 - j) * xv;
+  }
+  out[static_cast<int64_t>(t) * 8192 + c] = __float2bfloat16_rn(silu_fast(acc));
+}
+
+// One warp per (row, head): lane l holds dims 4l .. 4l + 3.
+__global__ void __launch_bounds__(256) gated_rmsnorm_kernel(const bf16* __restrict__ o, const bf16* __restrict__ z,
+                                                             int64_t zs, const bf16* __restrict__ w,
+                                                             bf16* __restrict__ out, int n) {
+  const int lane = threadIdx.x & 31, unit = blockIdx.x * 8 + (threadIdx.x >> 5);
+  if (unit >= n * 32) return;
+  const int row = unit >> 5, h = unit & 31;
+  const bf16* op = o + static_cast<int64_t>(unit) * 128 + lane * 4;
+  float ov[4], ss = 0.f;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    ov[j] = bf2f(op + j);
+    ss = fmaf(ov[j], ov[j], ss);
+  }
+#pragma unroll
+  for (int off = 16; off; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
+  const float rstd = rsqrtf(ss * (1.f / 128.f) + 1e-6f);
+  const bf16* zr = z + static_cast<int64_t>(row) * zs + h * 128 + lane * 4;
+  const bf16* wr = w + lane * 4;
+  bf16* dst = out + static_cast<int64_t>(row) * 4096 + h * 128 + lane * 4;
+  const __nv_bfloat162 r01 = __floats2bfloat162_rn(ov[0] * rstd * bf2f(wr) * silu_fast(bf2f(zr)),
+                                                   ov[1] * rstd * bf2f(wr + 1) * silu_fast(bf2f(zr + 1)));
+  const __nv_bfloat162 r23 = __floats2bfloat162_rn(ov[2] * rstd * bf2f(wr + 2) * silu_fast(bf2f(zr + 2)),
+                                                   ov[3] * rstd * bf2f(wr + 3) * silu_fast(bf2f(zr + 3)));
+  uint2 st;
+  st.x = *reinterpret_cast<const unsigned*>(&r01);
+  st.y = *reinterpret_cast<const unsigned*>(&r23);
+  *reinterpret_cast<uint2*>(dst) = st;
+}
+
 }  // namespace
+
+cudaError_t conv_silu_prefill(const void* x, int64_t x_stride, const void* w, void* out, int n,
+                              cudaStream_t stream) {
+  if (n <= 0) return cudaSuccess;
+  conv_silu_prefill_kernel<<<dim3(32, n), 256, 0, stream>>>(static_cast<const bf16*>(x), x_stride,
+                                                            static_cast<const bf16*>(w), static_cast<bf16*>(out), n);
+  return cudaGetLastError();
+}
+
+cudaError_t gated_rmsnorm(const void* o, const void* z, int64_t z_stride, const void* w, void* out, int n,
+                          cudaStream_t stream) {
+  if (n <= 0) return cudaSuccess;
+  gated_rmsnorm_kernel<<<(n * 32 + 7) / 8, 256, 0, stream>>>(static_cast<const bf16*>(o), static_cast<const bf16*>(z),
+                                                             z_stride, static_cast<const bf16*>(w),
+                                                             static_cast<bf16*>(out), n);
+  return cudaGetLastError();
+}
 
 cudaError_t rmsnorm_add(const void* x, const void* residual, void* residual_out, void* out, const void* w, int M,
                         cudaStream_t stream) {

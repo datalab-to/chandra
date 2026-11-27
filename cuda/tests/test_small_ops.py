@@ -83,3 +83,30 @@ def test_qk_norm_rope_kv(m):
     for i in range(m):
         assert ulp_close(kc[page[i], :, slot[i]], k_ref[i], ulps=3)
         assert torch.equal(vc[page[i], :, slot[i]], v_ref[i])
+
+
+def test_conv_silu_prefill_matches_reference():
+    torch.manual_seed(41)
+    n = 97
+    y = torch.randn(n, 12416, device="cuda").to(torch.bfloat16)
+    x = y[:, :8192]
+    w = (0.4 * torch.randn(8192, 4, device="cuda")).to(torch.bfloat16)
+    got = chandra_cuda.conv_silu_prefill(x, w).float()
+    conv = torch.nn.functional.conv1d(x.T.float()[None], w.float()[:, None, :], padding=3, groups=8192)[0, :, :n]
+    ref = torch.nn.functional.silu(conv).T
+    assert (got - ref).abs().max().item() <= 2e-2 * ref.abs().max().item()
+
+
+def test_gated_rmsnorm_matches_reference():
+    torch.manual_seed(42)
+    n = 53
+    o = torch.randn(n, 32, 128, device="cuda").to(torch.bfloat16)
+    zz = torch.randn(n, 12416, device="cuda").to(torch.bfloat16)
+    z = zz[:, 8192:12288]
+    w = (1 + 0.1 * torch.randn(128, device="cuda")).to(torch.bfloat16)
+    got = chandra_cuda.gated_rmsnorm(o, z, w).float()
+    of = o.float()
+    on = of * torch.rsqrt(of.pow(2).mean(-1, keepdim=True) + 1e-6)
+    ref = (on * w.float() * torch.nn.functional.silu(z.float().reshape(n, 32, 128))).reshape(n, 4096)
+    assert (got - ref).abs().max().item() <= 2e-2 * ref.abs().max().item()
+

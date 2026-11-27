@@ -220,7 +220,7 @@ class Decoder:
         from vllm.third_party.flash_linear_attention.ops import chunk_gated_delta_rule
         from vllm.vllm_flash_attn import flash_attn_varlen_func
 
-        from . import silu_mul
+        from . import conv_silu_prefill, gated_rmsnorm, silu_mul
 
         dev = self.device
         n = embeds.shape[0]
@@ -245,8 +245,7 @@ class Decoder:
                 y = lin(L, "qkvzba", xn)
                 raw = y[:, :8192]
                 z, b, a = y[:, 8192:12288], y[:, 12288:12320], y[:, 12320:12352]
-                conv = F.conv1d(raw.T.float()[None], L["conv_w"].float()[:, None, :], padding=3, groups=8192)
-                mixed = F.silu(conv[0, :, :n]).to(torch.bfloat16).T  # [n, 8192], BF16 as vLLM's conv output
+                mixed = conv_silu_prefill(raw, L["conv_w"])  # [n, 8192], BF16 as vLLM's conv output
                 q = mixed[:, :2048].reshape(1, n, 16, 128).repeat_interleave(2, dim=2)
                 k = mixed[:, 2048:4096].reshape(1, n, 16, 128).repeat_interleave(2, dim=2)
                 v = mixed[:, 4096:].reshape(1, n, 32, 128)
@@ -259,10 +258,8 @@ class Decoder:
                 for j in range(1, 4):
                     if n - j >= 0:
                         L["ring"][seq + 1, (n - j) % self.ring] = raw[n - j]
-                of = o[0].to(torch.bfloat16).float()  # vLLM rounds o to BF16 before the norm
-                on = of * torch.rsqrt(of.pow(2).mean(-1, keepdim=True) + 1e-6)
-                gated = (on * L["norm_w"].float()) * F.silu(z.float().reshape(n, 32, 128))
-                y = lin(L, "out", gated.to(torch.bfloat16).reshape(n, 4096))
+                gated = gated_rmsnorm(o[0].to(torch.bfloat16), z, L["norm_w"])  # o rounded to BF16, as vLLM
+                y = lin(L, "out", gated)
             else:
                 qkv = lin(L, "qkv", xn).contiguous()
                 q = qk_norm_rope_kv(qkv, L["q_norm"], L["k_norm"], pos3, L["k_cache"], L["v_cache"], page,
