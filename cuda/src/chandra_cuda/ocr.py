@@ -9,7 +9,9 @@ set changes.
 
 With overlap (the default where the driver can split a GPU's SMs, see partition.py), a worker thread
 runs the vision tower and the prefill of the next pages on most of the SMs while the decode steps of
-the current pages run on the rest; a page joins the decoding set when its prefill is done. Each
+the current pages run on the rest; a page joins the decoding set when its prefill is done. The worker
+runs pages through the vision tower ahead of free slots (up to the prefetch depth); while it has
+nothing to do (every slot busy, every queued page through vision) the steps use the whole GPU. Each
 page's tokens are the same as without overlap (the engine's kernels do not depend on the batch,
 its plans not on the SM count).
 
@@ -38,7 +40,6 @@ REPEAT_CHECK_EVERY = 8
 REPEAT_STOP_AFTER = 4
 REPEAT_TAIL_CHARS = 2048
 REPEAT_TAIL_TOKENS = 768
-VISION_LOOKAHEAD = 2  # pages the overlap worker runs through the vision tower before a slot is free
 
 
 def _flat(x):
@@ -219,6 +220,7 @@ class CudaGenerator:
         worker = None
         worker_done = parts is None
         stop_worker = threading.Event()
+        worker_busy = threading.Event()  # set while the worker has GPU work in flight
 
         def admit(it, s, first) -> bool:
             out[it] = [first]
@@ -243,6 +245,7 @@ class CudaGenerator:
 
             def work():
                 try:
+                    worker_busy.set()
                     torch.cuda.set_device(dev)
                     wstream.wait_stream(full)
                     seen = deque()  # (index, vision outputs) waiting for a slot
@@ -255,7 +258,7 @@ class CudaGenerator:
                                     s = free_q.get_nowait()
                                 except queue.Empty:
                                     pass
-                            if s is None and pending and len(seen) < VISION_LOOKAHEAD:
+                            if s is None and pending and len(seen) < depth:
                                 it, fut = pending.popleft()
                                 top_up()
                                 t0 = clock()
@@ -269,7 +272,10 @@ class CudaGenerator:
                                 break
                             if s is None:
                                 t0 = clock()
+                                wstream.synchronize()  # its work is done: the steps may take the whole GPU
+                                worker_busy.clear()
                                 s = free_q.get()
+                                worker_busy.set()
                                 st["w_wait_slot"] += clock() - t0
                                 if s is None:
                                     break
@@ -283,6 +289,8 @@ class CudaGenerator:
                     ready.put(None)
                 except BaseException as e:  # handed to the main thread
                     ready.put(e)
+                finally:
+                    worker_busy.clear()
 
             worker = threading.Thread(target=work, name="chandra-prefill", daemon=True)
             worker.start()
@@ -290,8 +298,8 @@ class CudaGenerator:
         graph, members = None, []
         try:
             while True:
-                want = dstream if parts and not worker_done else full
-                if want is not cur:  # decode on its partition while the worker runs, on the whole GPU after
+                want = dstream if parts and worker_busy.is_set() else full
+                if want is not cur:  # decode on its partition while the worker has work, else on the whole GPU
                     want.wait_stream(cur)
                     cur = want
                 with torch.cuda.stream(cur):
