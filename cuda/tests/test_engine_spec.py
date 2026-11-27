@@ -208,3 +208,17 @@ def test_graph_verify_step_matches_eager(run):
     gs = dec.graph_step(seqs, T=4, commit=True)
     _, nxt = gs(vin.reshape(-1))
     assert torch.equal(nxt.view(len(seqs), 4), g_eager)
+
+
+def test_spec_graph_matches_plain(ckpt, run):
+    """The graph MTP loop gives plain decoding's tokens."""
+    _, seqs, t0, ref = run
+    dec = Decoder(ckpt, max_seqs=3, max_ctx=512, mtp=True, draft_tokens=3)
+    hidden, first = dec._forward(t0, seqs, 1, commit=False)
+    for s in seqs:
+        dec.length[s] += 1
+    sg = dec.spec_graph(seqs)
+    out, steps = sg.generate(first, hidden, max_new=32)
+    for n in range(len(seqs)):
+        assert out[n][:32] == ref[n][:32], n
+

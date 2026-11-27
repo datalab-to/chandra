@@ -341,6 +341,22 @@ class Decoder:
         h, _ = rmsnorm_add(res, M["w_norm"], x=z)
         return h, _rows(self.draft_head, h)
 
+    def mtp_forward_dev(self, tokens, hidden, start, delta, bt, T):
+        """mtp_forward on device tensors only (start [B] int32 positions, rope deltas, block-table rows)."""
+        M = self.mtp
+        pos3, page, in_page = self.positions_dev(start, delta, bt, T)
+        x = self._mtp_input(tokens, hidden)
+        xn, res = rmsnorm_add(x, M["w_in"])
+        y = self._attention(M, xn, pos3, page, in_page, bt, start + T, T, self.max_ctx)
+        xn, res = rmsnorm_add(res, M["w_post"], x=y)
+        z = _rows(M["down"], _rows(M["gate_up"], xn))
+        h, _ = rmsnorm_add(res, M["w_norm"], x=z)
+        return h, _rows(self.draft_head, h)
+
+    def spec_graph(self, seqs: list[int]) -> "SpecGraph":
+        """CUDA graphs of an MTP verify step and of the k draft passes, for these sequences."""
+        return SpecGraph(self, seqs)
+
     def exact_head(self):
         """An LMHeadExact (INT8 pass + BF16 re-check, the same picks as the BF16 head) sharing this
         decoder's BF16 head."""
@@ -483,4 +499,91 @@ class GraphStep:
         for s in self.seqs:
             d.pending[s] = 0
         return self.hidden, self.next
+
+
+class SpecGraph:
+    """MTP decoding with two CUDA graphs per step: the verify step (k + 1 rows per sequence, commit
+    mode) and the draft passes (the MTP layer on the k + 1 verified rows, then k - 1 single-row
+    passes, each with the draft head). Between them the host reads the verify picks (one sync per
+    step), accepts, and writes the next step's small inputs. Every sequence stays in the graphs
+    until generate() ends (a finished one keeps decoding; its tokens are not kept)."""
+
+    def __init__(self, dec: Decoder, seqs: list[int]):
+        if dec.mtp is None:
+            raise ValueError("needs Decoder(mtp=True)")
+        dev, b, k = dec.device, len(seqs), dec.k
+        T = k + 1
+        self.dec, self.seqs, self.k = dec, list(seqs), k
+        self.verify = GraphStep(dec, seqs, T=T, commit=True)
+        self.mt = torch.zeros(b * T, dtype=torch.int64, device=dev)
+        self.p0 = torch.tensor([dec.length[s] for s in seqs], dtype=torch.int32, device=dev)
+        self.acc = torch.zeros(b, dtype=torch.int32, device=dev)
+        self.sel = torch.arange(b, dtype=torch.int64, device=dev) * T
+        delta, bt = self.verify.delta, self.verify.bt
+
+        def run():
+            hd_all, e_all = dec.mtp_forward_dev(self.mt, self.verify.hidden, self.p0, delta, bt, T)
+            hd, e = hd_all.index_select(0, self.sel), e_all.index_select(0, self.sel)
+            pos = self.p0 + self.acc + 1
+            ds = [e]
+            for j in range(1, k):
+                hd, e = dec.mtp_forward_dev(e, hd, pos + (j - 1), delta, bt, 1)
+                ds.append(e)
+            return torch.stack(ds, dim=1)  # [B, k]
+
+        side = torch.cuda.Stream(dev)
+        side.wait_stream(torch.cuda.current_stream(dev))
+        with torch.cuda.stream(side), torch.no_grad():  # MTP KV writes at positions >= each length
+            for _ in range(2):
+                run()
+        torch.cuda.current_stream(dev).wait_stream(side)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph), torch.no_grad():
+            self.drafts = run()
+
+    @torch.no_grad()
+    def generate(self, first: torch.Tensor, h_last: torch.Tensor, max_new: int, eos=frozenset()):
+        """As Decoder.generate_mtp (same tokens), with the steps as graph replays. Returns the token
+        lists and the number of verify steps."""
+        d, dev, k = self.dec, self.dec.device, self.k
+        seqs, b = self.seqs, len(self.seqs)
+        out = [[int(t)] for t in first.tolist()]
+        live = [out[n][0] not in eos and max_new > 1 for n in range(b)]
+        start = [d.length[s] - 1 for s in seqs]  # the first drafts, eagerly (once)
+        hd, e = d.mtp_forward(first.to(dev), h_last, seqs, start, 1)
+        ds = [e]
+        for j in range(1, k):
+            hd, e = d.mtp_forward(e, hd, seqs, [p + j for p in start], 1)
+            ds.append(e)
+        drafts = torch.stack(ds, dim=1)
+        last = first.to(dev)
+        steps = 0
+        while any(live):
+            vin = torch.cat([last[:, None], drafts], dim=1)  # [B, k + 1]
+            _, nxt = self.verify(vin.reshape(-1))
+            steps += 1
+            gl, dl = nxt.view(b, k + 1).tolist(), vin.tolist()
+            acc = []
+            for n in range(b):
+                a = 0
+                while a < k and dl[n][a + 1] == gl[n][a]:
+                    a += 1
+                acc.append(a)
+                if live[n]:
+                    for t in dl[n][1 : a + 1] + [gl[n][a]]:
+                        out[n].append(t)
+                        if t in eos or len(out[n]) >= max_new:
+                            live[n] = False
+                            break
+            p0 = [d.length[s] for s in seqs]
+            d.accept(seqs, [a + 1 for a in acc])
+            self.mt.copy_(torch.tensor([[dl[n][i + 1] if i < acc[n] else gl[n][acc[n]] for i in range(k + 1)]
+                                        for n in range(b)]).reshape(-1), non_blocking=True)
+            self.p0.copy_(torch.tensor(p0, dtype=torch.int32), non_blocking=True)
+            self.acc.copy_(torch.tensor(acc, dtype=torch.int32), non_blocking=True)
+            self.sel.copy_(torch.tensor([n * (k + 1) + acc[n] for n in range(b)]), non_blocking=True)
+            self.graph.replay()
+            drafts = self.drafts
+            last = torch.tensor([gl[n][acc[n]] for n in range(b)], device=dev)
+        return out, steps
 
