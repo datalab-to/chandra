@@ -288,13 +288,14 @@ def test_autotuned_plan_is_batch_invariant(tmp_path, monkeypatch):
 
 
 
-@pytest.mark.parametrize("fmt", ["bf16", "fp8"])
+@pytest.mark.parametrize("fmt", ["bf16", "fp8", "fp4", "int4"])
 @pytest.mark.parametrize("epi", [None, "silu_mul"])
 def test_prefill_matmul_uses_the_decode_weights(fmt, epi):
     """prefill(x) (cuBLAS on the unpacked weight) matches the decode kernel within rounding."""
     torch.manual_seed(16)
     w = (torch.randn(2048, 2560, device="cuda") * 0.02).to(torch.bfloat16)
-    cls = chandra_cuda.DecodeLinear if fmt == "bf16" else chandra_cuda.DecodeLinearFP8
+    cls = {"bf16": chandra_cuda.DecodeLinear, "fp8": chandra_cuda.DecodeLinearFP8,
+           "fp4": chandra_cuda.DecodeLinearFP4, "int4": chandra_cuda.DecodeLinearINT4}[fmt]
     lin = cls(w, epilogue=epi)
     x = torch.randn(200, 2560, device="cuda").to(torch.bfloat16)
     pre = lin.prefill(x)

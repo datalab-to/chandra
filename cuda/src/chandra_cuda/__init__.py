@@ -572,7 +572,27 @@ class DecodeLinearFP4(DecodeLinear):
     FMT = 2
 
     def prefill(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("prefill from 4-bit layers is not written yet (their accuracy gate is pending)")
+        """cuBLAS on the weight the kernel multiplies by, e2m1 * 2^(E - 127) (exact in BF16)."""
+        n, k = self.n, self.k
+        w = self.packed.view(n // 16, k // 64, 8, 4, 4).to(torch.int64) & 0xFFFFFFFF  # g L gid tig bb
+        mbase = {(0, 0): 6, (1, 0): 9, (0, 1): 0, (1, 1): 3}
+        sbase = {(0, 0): 15, (1, 0): 14, (0, 1): 13, (1, 1): 12}
+        codes = torch.empty(n // 16, 2, 8, k // 64, 4, 2, 4, 2, dtype=torch.int64, device=self.device)
+        for (rh, kh), mb in mbase.items():  # codes[g, rh, gid, L, bb, kh, tig, e]
+            for e in (0, 1):
+                mag = (w >> (mb + 16 * e)) & 7
+                sgn = (w >> (sbase[(rh, kh)] + 16 * e)) & 1
+                codes[:, rh, :, :, :, kh, :, e] = ((sgn << 3) | mag).permute(0, 2, 1, 4, 3)
+        codes = codes.reshape(n, k)
+        sw = self.scales.view(n // 16, k // 64, 8).to(torch.int64) & 0xFFFFFFFF  # g L gid
+        ex = torch.empty(n // 16, 2, 8, k // 64, 2, dtype=torch.int64, device=self.device)  # g rh gid L blk
+        for rh in (0, 1):
+            for blk in (0, 1):
+                ex[:, rh, :, :, blk] = ((sw >> (8 * (2 * rh + blk))) & 0xFF).permute(0, 2, 1) - 126
+        wt = mxfp4_dequantize(codes.to(torch.uint8), ex.reshape(n, k // 32).to(torch.uint8)).to(torch.bfloat16)
+        if self.epilogue:
+            wt = deinterleave_gate_up(wt)
+        return x @ wt.T
 
     def __init__(self, weight: torch.Tensor, keep_codes: bool = False, epilogue: str | None = None):
         if weight.shape[0] % 64:
@@ -730,7 +750,25 @@ class DecodeLinearINT4(DecodeLinear):
     FMT = 3
 
     def prefill(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("prefill from 4-bit layers is not written yet (their accuracy gate is pending)")
+        """cuBLAS on the weight the kernel multiplies by, bf16(q * s)."""
+        n, k = self.n, self.k
+        w = self.packed.view(n // 16, k // 64, 8, 4, 4).to(torch.int64) & 0xFFFFFFFF  # g L gid tig bb
+        q = torch.empty(n // 16, 2, 8, k // 64, 4, 2, 4, 2, dtype=torch.int64, device=self.device)
+        for rh in (0, 1):
+            for kh in (0, 1):
+                j = rh + 2 * kh
+                for e in (0, 1):
+                    q[:, rh, :, :, :, kh, :, e] = (((w >> (4 * j + 16 * e)) & 0xF) - 8).permute(0, 2, 1, 4, 3)
+        q = q.reshape(n, k)
+        sw = self.scales.view(n // 16, k // 128, 8).to(torch.int64) & 0xFFFFFFFF  # g G gid
+        sb = torch.empty(n // 16, 2, 8, k // 128, dtype=torch.int64, device=self.device)
+        sb[:, 0] = (sw & 0xFFFF).permute(0, 2, 1)
+        sb[:, 1] = (sw >> 16).permute(0, 2, 1)
+        sc = sb.reshape(n, k // 128).to(torch.int16).view(torch.bfloat16)
+        wt = (q.float() * sc.float().repeat_interleave(128, dim=1)).to(torch.bfloat16)
+        if self.epilogue:
+            wt = deinterleave_gate_up(wt)
+        return x @ wt.T
 
     def __init__(self, weight: torch.Tensor, keep_codes: bool = False, epilogue: str | None = None):
         if weight.shape[0] % 64:
