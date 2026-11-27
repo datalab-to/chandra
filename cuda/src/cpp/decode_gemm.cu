@@ -223,6 +223,7 @@ __global__ void __launch_bounds__(kThreads, 2)
   constexpr int MP = NP * 16;
   constexpr int kBufBytes = MP * kRowBytes;
   constexpr int kAcc = 2 * NP * 4;  // accumulator floats per lane
+  constexpr int kRing = (NP >= 4 && !FP4) ? 6 : kDepth;  // W loads in flight per warp
   extern __shared__ __align__(16) unsigned char smem[];
   __shared__ int s_last;
   __shared__ unsigned long long s_best[64];
@@ -300,12 +301,11 @@ __global__ void __launch_bounds__(kThreads, 2)
       }
     };
 
-    // The W ring: w0 is the next block to use.
-    uint4 w0 = make_uint4(0, 0, 0, 0), w1 = w0, w2 = w0, w3 = w0;
-    if (0 < nblk) w0 = ld_stream(w);
-    if (1 < nblk) w1 = ld_stream(w + wstep);
-    if (2 < nblk) w2 = ld_stream(w + 2 * wstep);
-    if (3 < nblk) w3 = ld_stream(w + 3 * wstep);
+    // The W ring: wr[0] is the next block to use. With 64 rows each load feeds 16 MMAs, so the
+    // wider kernels keep more loads in flight (the 4-bit ones already feed 4 k16 blocks per load).
+    uint4 wr[kRing];
+  #pragma unroll
+    for (int q = 0; q < kRing; ++q) wr[q] = q < nblk ? ld_stream(w + q * wstep) : make_uint4(0, 0, 0, 0);
     uint32_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;  // FP4 scale words, in step with w0..w3
     if constexpr (FP4) {
       if (0 < nblk) s0 = __ldg(sc_addr(0));
@@ -335,11 +335,10 @@ __global__ void __launch_bounds__(kThreads, 2)
       for (int jj = 0; jj < kBlocksPerChunk / BPL / KW; ++jj) {
         const int u = jj * KW + kq;                             // W load within the chunk
         const int i = c * (kBlocksPerChunk / BPL / KW) + jj;    // this warp's load index
-        const uint4 wv = w0;
-        w0 = w1;
-        w1 = w2;
-        w2 = w3;
-        if (i + kDepth < nblk) w3 = ld_stream(w + (i + kDepth) * wstep);
+        const uint4 wv = wr[0];
+  #pragma unroll
+        for (int q = 0; q + 1 < kRing; ++q) wr[q] = wr[q + 1];
+        if (i + kRing < nblk) wr[kRing - 1] = ld_stream(w + (i + kRing) * wstep);
         uint4 af[BPL];
         if constexpr (FP4) {
           const uint32_t sv = s0;
