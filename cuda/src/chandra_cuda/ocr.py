@@ -71,14 +71,19 @@ class CudaGenerator:
         self.stop_on_repeat = stop_on_repeat
         self.img_tok = self.hf.config.image_token_id
 
-    @torch.no_grad()
-    def _prefill(self, slot: int, item):
-        """A page into a slot. Returns (first token, final-norm hidden state at the last position)."""
+    def _prepare(self, item):
+        """CPU side of a page (run ahead in a thread pool): item, or a callable returning it (to render
+        lazily), -> the processor's tensors."""
         from chandra.model.hf import process_batch_element
 
-        inputs = self.processor.apply_chat_template([[process_batch_element(item)]], tokenize=True,
-                                                    add_generation_prompt=True, return_dict=True,
-                                                    return_tensors="pt")
+        if callable(item):
+            item = item()
+        return self.processor.apply_chat_template([[process_batch_element(item)]], tokenize=True,
+                                                  add_generation_prompt=True, return_dict=True, return_tensors="pt")
+
+    @torch.no_grad()
+    def _prefill(self, slot: int, inputs):
+        """A prepared page into a slot. Returns (first token, final-norm hidden state at the last position)."""
         ids = inputs["input_ids"].to("cuda")
         n = ids.shape[1]
         if n > PAGE_TOKENS_MAX:
@@ -98,8 +103,15 @@ class CudaGenerator:
         return int(first), hidden[-1].clone()
 
     @torch.no_grad()
-    def generate(self, batch, max_output_tokens: int | None = None, **kwargs):
-        """Pages (chandra BatchInputItem) in, GenerationResult out (raw text, token count)."""
+    def generate(self, batch, max_output_tokens: int | None = None, on_result=None, prefetch: int | None = None,
+                 cpu_workers: int = 4, **kwargs):
+        """Pages in (chandra BatchInputItem, or callables returning one, from any iterable), GenerationResult
+        out (raw text, token count), in order. The processor runs ahead in `cpu_workers` threads, up to
+        `prefetch` pages (default: the slot count). on_result(index, result), if given, is called as each
+        page finishes (and the results are not kept)."""
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+
         from chandra.model.schema import GenerationResult
         from chandra.model.util import detect_repeat_token
 
@@ -112,7 +124,33 @@ class CudaGenerator:
             hits[it] = hits.get(it, 0) + 1 if detect_repeat_token(text[-REPEAT_TAIL_CHARS:]) else 0
             return hits[it] >= REPEAT_STOP_AFTER
         d = self.dec
-        queue = list(range(len(batch)))
+        source = enumerate(iter(batch))
+        pool = ThreadPoolExecutor(cpu_workers)
+        queue = deque()  # (index, future of the prepared inputs)
+        depth = prefetch or self.slots
+
+        def top_up():
+            while len(queue) < depth:
+                nxt = next(source, None)
+                if nxt is None:
+                    return
+                queue.append((nxt[0], pool.submit(self._prepare, nxt[1])))
+
+        results_kept: dict[int, object] = {}
+
+        def finish(it):
+            ids = [t for t in out.pop(it) if t not in self.eos]
+            n_tok = len(ids) + (1 if ended.pop(it, False) else 0)
+            text = tok.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            r = GenerationResult(raw=text, token_count=n_tok, error=False)
+            hits.pop(it, None)
+            if on_result is not None:
+                on_result(it, r)
+            else:
+                results_kept[it] = r
+
+        ended: dict[int, bool] = {}
+        top_up()
         out: dict[int, list[int]] = {}
         slot_of: dict[int, int] = {}  # item -> slot, for pages still decoding
         free = list(range(self.slots))
@@ -120,14 +158,18 @@ class CudaGenerator:
         drafts: dict[int, torch.Tensor] = {}
         graph, members = None, []
         while queue or slot_of:
+            top_up()
             if queue and free:  # admit pages into every free slot
                 new = []
                 while queue and free:
-                    it, s = queue.pop(0), free.pop(0)
-                    first, h = self._prefill(s, batch[it])
+                    (it, fut), s = queue.popleft(), free.pop(0)
+                    first, h = self._prefill(s, fut.result())
+                    top_up()
                     out[it] = [first]
                     if first in self.eos or max_new <= 1:
+                        ended[it] = first in self.eos
                         free.append(s)
+                        finish(it)
                         continue
                     slot_of[it], last[it] = s, first
                     new.append((it, h))
@@ -164,12 +206,10 @@ class CudaGenerator:
                     if not stop and self.stop_on_repeat and len(out[it]) % REPEAT_CHECK_EVERY == 0:
                         stop = looping(it)
                     if stop:
+                        ended[it] = t in self.eos
                         free.append(slot_of.pop(it))
                         graph = None
+                        finish(it)
                         break
-        results = []
-        for i in range(len(batch)):
-            ids = [t for t in out.get(i, []) if t not in self.eos]
-            text = tok.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            results.append(GenerationResult(raw=text, token_count=len(out.get(i, [])), error=False))
-        return results
+        pool.shutdown()
+        return [results_kept[i] for i in sorted(results_kept)] if on_result is None else None

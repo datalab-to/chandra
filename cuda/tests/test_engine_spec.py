@@ -298,7 +298,8 @@ def test_cuda_generator_scheduler_matches_single_page_decoding(ckpt):
         return int(first), hidden[-1].clone()
 
     gen._prefill = prefill
-    res = gen.generate(pages, max_output_tokens=max_new)
+    gen._prepare = lambda item: item() if callable(item) else item
+    res = gen.generate([(lambda p=p: p) for p in pages], max_output_tokens=max_new, cpu_workers=2)
     alone = Decoder(ckpt, max_seqs=1, max_ctx=512)
     for p, r in zip(pages, res):
         n = p.shape[0]
