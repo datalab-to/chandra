@@ -2,14 +2,20 @@ from typing import Tuple
 
 from PIL import Image
 
+from chandra.settings import settings
+
 
 def scale_to_fit(
     img: Image.Image,
-    max_size: Tuple[int, int] = (3072, 2048),
+    max_size: Tuple[int, int] | None = None,
     min_size: Tuple[int, int] = (1792, 28),
-    grid_size: int = 28,
+    grid_size: int | None = None,
 ):
+    """Resize to at most `max_size` pixels (default: settings.IMAGE_MAX_PIXELS)
+    on a grid of `grid_size` pixels (default: settings.IMAGE_GRID_SIZE)."""
     resample_method = Image.Resampling.LANCZOS
+    if grid_size is None:
+        grid_size = settings.IMAGE_GRID_SIZE
 
     width, height = img.size
 
@@ -19,7 +25,10 @@ def scale_to_fit(
 
     original_ar = width / height
     current_pixels = width * height
-    max_pixels = max_size[0] * max_size[1]
+    if max_size is None:
+        max_pixels = settings.IMAGE_MAX_PIXELS
+    else:
+        max_pixels = max_size[0] * max_size[1]
     min_pixels = min_size[0] * min_size[1]
 
     # 1. Determine ideal float scale based on pixel bounds
