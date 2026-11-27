@@ -87,9 +87,10 @@ class CudaGenerator:
         feats = _flat(self.hf.model.get_image_features(inputs["pixel_values"].to("cuda", torch.bfloat16), thw))
         emb = self.dec.embed[ids[0]].clone()
         emb[ids[0] == self.img_tok] = feats.to(emb.dtype)
-        pos, delta = self.hf.model.get_rope_index(ids, inputs["mm_token_type_ids"].to("cuda"), thw, None,
-                                                  inputs["attention_mask"].to("cuda"))
-        pos3 = pos[:, 0].transpose(0, 1).contiguous()
+        # The positions on the CPU, where the (unused) language model lives; the inputs are small.
+        pos, delta = self.hf.model.get_rope_index(inputs["input_ids"], inputs["mm_token_type_ids"],
+                                                  inputs["image_grid_thw"], None, inputs["attention_mask"])
+        pos3 = pos[:, 0].transpose(0, 1).contiguous().to("cuda")
         hidden, first = self.dec.prefill(slot, emb, pos3, int(delta[0]))
         if self.mtp:
             nxt = torch.cat([ids[0, 1:], first.view(1)])
