@@ -223,7 +223,14 @@ __global__ void __launch_bounds__(kThreads, 2)
   constexpr int MP = NP * 16;
   constexpr int kBufBytes = MP * kRowBytes;
   constexpr int kAcc = 2 * NP * 4;  // accumulator floats per lane
-  constexpr int kRing = (NP >= 4 && !FP4) ? 6 : kDepth;  // W loads in flight per warp
+  constexpr int kLPC = kBlocksPerChunk / BPL / KW;  // this warp's W loads per x chunk
+  // W loads in flight per warp: with 64 rows each load feeds 16 MMAs, so the wider kernels keep 6 when
+  // the static slots allow it (the 4-bit ones already feed 4 k16 blocks per load).
+  constexpr int kRing0 = (NP >= 4 && !FP4) ? 6 : kDepth;
+  constexpr int kRing = kRing0 % kLPC == 0 ? kRing0 : kLPC % kRing0 == 0 ? kRing0 : kDepth;
+  constexpr int kGroup = kRing >= kLPC ? kRing / kLPC : 1;  // chunks per unrolled group
+  static_assert((kGroup * kLPC) % kRing == 0 && kLPC % (kLPC < kRing ? kLPC : kRing) == 0,
+                "static ring slots");
   extern __shared__ __align__(16) unsigned char smem[];
   __shared__ int s_last;
   __shared__ unsigned long long s_best[64];
@@ -301,17 +308,16 @@ __global__ void __launch_bounds__(kThreads, 2)
       }
     };
 
-    // The W ring: wr[0] is the next block to use. With 64 rows each load feeds 16 MMAs, so the
-    // wider kernels keep more loads in flight (the 4-bit ones already feed 4 k16 blocks per load).
+    // The W ring: this warp's load i lives in slot i % kRing from its issue until its use, and the
+    // slot is refilled right after it is read. The chunk loop is unrolled by kGroup chunks so every
+    // slot index is static: no register moves (a move of a register whose load is in flight stalls
+    // until the load lands, which a rotating ring at the loop back-edge did on every chunk).
     uint4 wr[kRing];
+    uint32_t sr[kRing];  // FP4 scale words, in step with wr
   #pragma unroll
-    for (int q = 0; q < kRing; ++q) wr[q] = q < nblk ? ld_stream(w + q * wstep) : make_uint4(0, 0, 0, 0);
-    uint32_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;  // FP4 scale words, in step with w0..w3
-    if constexpr (FP4) {
-      if (0 < nblk) s0 = __ldg(sc_addr(0));
-      if (1 < nblk) s1 = __ldg(sc_addr(1));
-      if (2 < nblk) s2 = __ldg(sc_addr(2));
-      if (3 < nblk) s3 = __ldg(sc_addr(3));
+    for (int q = 0; q < kRing; ++q) {
+      wr[q] = q < nblk ? ld_stream(w + q * wstep) : make_uint4(0, 0, 0, 0);
+      if constexpr (FP4) sr[q] = q < nblk ? __ldg(sc_addr(q)) : 0u;
     }
 
     float acc[2 * NP][4];
@@ -325,67 +331,72 @@ __global__ void __launch_bounds__(kThreads, 2)
     const int lq = lane >> 3, lr = lane & 7;
     const int lane_off = ((lq >> 1) * 8 + lr) * kRowBytes + (lq & 1) * 16;
 
-    for (int c = 0; c < nchunks; ++c) {
-      if (c + 1 < nchunks) load_x(c + 1, (c + 1) & 1);
-      cp_async_commit();
-      cp_async_wait<1>();
-      __syncthreads();
-      const unsigned char* s = smem + (c & 1) * kBufBytes + lane_off;
+    for (int c0 = 0; c0 < nchunks; c0 += kGroup) {
   #pragma unroll
-      for (int jj = 0; jj < kBlocksPerChunk / BPL / KW; ++jj) {
-        const int u = jj * KW + kq;                             // W load within the chunk
-        const int i = c * (kBlocksPerChunk / BPL / KW) + jj;    // this warp's load index
-        const uint4 wv = wr[0];
+      for (int gq = 0; gq < kGroup; ++gq) {
+        const int c = c0 + gq;
+        if (c >= nchunks) break;  // uniform over the CTA
+        if (c + 1 < nchunks) load_x(c + 1, (c + 1) & 1);
+        cp_async_commit();
+        cp_async_wait<1>();
+        __syncthreads();
+        const unsigned char* s = smem + (c & 1) * kBufBytes + lane_off;
   #pragma unroll
-        for (int q = 0; q + 1 < kRing; ++q) wr[q] = wr[q + 1];
-        if (i + kRing < nblk) wr[kRing - 1] = ld_stream(w + (i + kRing) * wstep);
-        uint4 af[BPL];
-        if constexpr (FP4) {
-          const uint32_t sv = s0;
-          s0 = s1;
-          s1 = s2;
-          s2 = s3;
-          if (i + kDepth < nblk) s3 = __ldg(sc_addr(i + kDepth));
-          if constexpr (I4) {
-            const uint32_t m0 = __byte_perm(sv, 0u, 0x1010), m8 = __byte_perm(sv, 0u, 0x3232);
-            int4x8_to_bf16(wv.x, m0, m8, af[0]);
-            int4x8_to_bf16(wv.y, m0, m8, af[1]);
-            int4x8_to_bf16(wv.z, m0, m8, af[2]);
-            int4x8_to_bf16(wv.w, m0, m8, af[3]);
+        for (int jj = 0; jj < kLPC; ++jj) {
+          const int u = jj * KW + kq;  // W load within the chunk
+          const int i = c * kLPC + jj;  // this warp's load index
+          const int slot = (gq * kLPC + jj) % kRing;  // static after unrolling
+          uint4 af[BPL];
+          if constexpr (FP4) {
+            const uint4 wv = wr[slot];
+            const uint32_t sv = sr[slot];
+            if constexpr (I4) {
+              const uint32_t m0 = __byte_perm(sv, 0u, 0x1010), m8 = __byte_perm(sv, 0u, 0x3232);
+              int4x8_to_bf16(wv.x, m0, m8, af[0]);
+              int4x8_to_bf16(wv.y, m0, m8, af[1]);
+              int4x8_to_bf16(wv.z, m0, m8, af[2]);
+              int4x8_to_bf16(wv.w, m0, m8, af[3]);
+            } else {
+              const uint32_t m00 = e8_to_bf16x2<0>(sv), m01 = e8_to_bf16x2<1>(sv);  // row gid, K blocks 0 / 1
+              const uint32_t m80 = e8_to_bf16x2<2>(sv), m81 = e8_to_bf16x2<3>(sv);  // row gid + 8
+              fp4x8_to_bf16(wv.x, m00, m80, af[0]);
+              fp4x8_to_bf16(wv.y, m00, m80, af[1]);
+              fp4x8_to_bf16(wv.z, m01, m81, af[2]);
+              fp4x8_to_bf16(wv.w, m01, m81, af[3]);
+            }
+          } else if constexpr (I8) {
+            const uint4 wv = wr[slot];
+            i8x4_to_bf16(wv.x, af[0].x, af[0].y);
+            i8x4_to_bf16(wv.y, af[0].z, af[0].w);
+            i8x4_to_bf16(wv.z, af[1].x, af[1].y);
+            i8x4_to_bf16(wv.w, af[1].z, af[1].w);
+          } else if constexpr (FP8) {
+            const uint4 wv = wr[slot];
+            fp8x4_to_bf16(wv.x, af[0].x, af[0].y);
+            fp8x4_to_bf16(wv.y, af[0].z, af[0].w);
+            fp8x4_to_bf16(wv.z, af[1].x, af[1].y);
+            fp8x4_to_bf16(wv.w, af[1].z, af[1].w);
           } else {
-            const uint32_t m00 = e8_to_bf16x2<0>(sv), m01 = e8_to_bf16x2<1>(sv);  // row gid, K blocks 0 / 1
-            const uint32_t m80 = e8_to_bf16x2<2>(sv), m81 = e8_to_bf16x2<3>(sv);  // row gid + 8
-            fp4x8_to_bf16(wv.x, m00, m80, af[0]);
-            fp4x8_to_bf16(wv.y, m00, m80, af[1]);
-            fp4x8_to_bf16(wv.z, m01, m81, af[2]);
-            fp4x8_to_bf16(wv.w, m01, m81, af[3]);
+            af[0] = wr[slot];
           }
-        } else if constexpr (I8) {
-          i8x4_to_bf16(wv.x, af[0].x, af[0].y);
-          i8x4_to_bf16(wv.y, af[0].z, af[0].w);
-          i8x4_to_bf16(wv.z, af[1].x, af[1].y);
-          i8x4_to_bf16(wv.w, af[1].z, af[1].w);
-        } else if constexpr (FP8) {
-          fp8x4_to_bf16(wv.x, af[0].x, af[0].y);
-          fp8x4_to_bf16(wv.y, af[0].z, af[0].w);
-          fp8x4_to_bf16(wv.z, af[1].x, af[1].y);
-          fp8x4_to_bf16(wv.w, af[1].z, af[1].w);
-        } else {
-          af[0] = wv;
-        }
+          if (i + kRing < nblk) {
+            wr[slot] = ld_stream(w + (i + kRing) * wstep);
+            if constexpr (FP4) sr[slot] = __ldg(sc_addr(i + kRing));
+          }
   #pragma unroll
-        for (int bb = 0; bb < BPL; ++bb) {
-          const int j = u * BPL + bb;  // k16 block within the chunk
+          for (int bb = 0; bb < BPL; ++bb) {
+            const int j = u * BPL + bb;  // k16 block within the chunk
   #pragma unroll
-          for (int p = 0; p < NP; ++p) {
-            uint32_t b0, b1, b2, b3;
-            ldmatrix_x4(b0, b1, b2, b3, s + p * 16 * kRowBytes + j * 32);
-            mma_bf16(acc[2 * p], af[bb], b0, b1);
-            mma_bf16(acc[2 * p + 1], af[bb], b2, b3);
+            for (int p = 0; p < NP; ++p) {
+              uint32_t b0, b1, b2, b3;
+              ldmatrix_x4(b0, b1, b2, b3, s + p * 16 * kRowBytes + j * 32);
+              mma_bf16(acc[2 * p], af[bb], b0, b1);
+              mma_bf16(acc[2 * p + 1], af[bb], b2, b3);
+            }
           }
         }
+        __syncthreads();
       }
-      __syncthreads();
     }
 
     if constexpr (FP8 || I8) {  // per-row weight scales (linear, so before the K-slice sum)
