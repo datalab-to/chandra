@@ -43,6 +43,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, nargs="+", default=[1, 8, 16, 32, 64])
     ap.add_argument("--reps", type=int, default=50)
+    ap.add_argument("--autotune", action="store_true", help="autotune each layer's plan first (autotune_plans)")
     a = ap.parse_args()
     torch.manual_seed(0)
     step = {m: [0.0, 0.0, 0.0, 0.0] for m in a.rows}
@@ -54,6 +55,8 @@ def main():
         lin8 = chandra_cuda.DecodeLinearFP8(w) if n % 32 == 0 and name != "lm head" else None
         lin4 = chandra_cuda.DecodeLinearFP4(w) if n % 64 == 0 and name != "lm head" else None
         lini4 = chandra_cuda.DecodeLinearINT4(w) if n % 64 == 0 and name != "lm head" else None
+        if a.autotune and name != "lm head":
+            chandra_cuda.autotune_plans([x for x in (lin, lin8, lin4, lini4) if x is not None])
         gb = n * k * 2 / 1e9
         for m in a.rows:
             x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
