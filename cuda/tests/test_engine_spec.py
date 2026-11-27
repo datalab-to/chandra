@@ -389,3 +389,46 @@ def test_cuda_generator_overlap_matches_single_page_decoding(ckpt):
         assert r.raw == " ".join(map(str, ref)), (r.raw[:80], ref[:10])
     assert gen.graph_captures == 3 and gen.stats["w_vision_prefill"] > 0
 
+
+
+def test_sampled_retries(ckpt, monkeypatch):
+    """Pages whose text repeats go through max_retries sampled attempts (each from the prompt again);
+    the sampler at a tiny temperature picks the BF16 argmax."""
+    pytest.importorskip("vllm")
+    import types
+
+    import chandra.model.util as cu
+    from chandra_cuda.ocr import CudaGenerator
+
+    torch.manual_seed(33)
+    pages = [torch.randint(0, VOCAB, (int(n),), device="cuda") for n in (90, 60, 110)]
+    max_new = 16
+
+    class Tok:
+        def decode(self, ids, **kw):
+            return " ".join(map(str, ids))
+
+    gen = object.__new__(CudaGenerator)
+    gen.dec = Decoder(ckpt, max_seqs=2, max_ctx=512, mtp=True, draft_tokens=3)
+    gen.processor = types.SimpleNamespace(tokenizer=Tok())
+    gen.eos, gen.mtp, gen.slots, gen.stop_on_repeat, gen.max_output_tokens = set(), True, 2, False, max_new
+    gen._graphs, gen._plain_graphs, gen.graph_captures, gen.max_retries = {}, {}, 0, 2
+
+    h = (torch.randn(3, gen.dec.embed.shape[1], device="cuda") * 3).to(torch.bfloat16)
+    gens = [torch.Generator(device="cuda").manual_seed(i) for i in range(3)]
+    assert gen._sample(h, [1e-4] * 3, gens) == (h @ gen.dec.embed.T).float().argmax(-1).tolist()
+
+    def prefill(slot, item):
+        n = item.shape[0]
+        pos3 = torch.arange(n, dtype=torch.int32, device="cuda")[:, None].expand(n, 3).contiguous()
+        hidden, first = gen.dec.prefill(slot, gen.dec.embed[item], pos3, 0)
+        nxt = torch.cat([item[1:], first.view(1)])
+        gen.dec.mtp_prefill(slot, nxt[: n - 1], hidden[: n - 1], pos3[: n - 1])
+        return int(first), hidden[-1].clone()
+
+    gen._prefill = prefill
+    gen._prepare = lambda item: item() if callable(item) else item
+    monkeypatch.setattr(cu, "detect_repeat_token", lambda text, **kw: True)
+    res = gen.generate([(lambda p=p: p) for p in pages], max_output_tokens=max_new)
+    assert gen.retried == 2 * len(pages) and gen.stats["retries"] == 2 * len(pages)
+    assert len(res) == len(pages) and all(r.token_count == max_new for r in res)

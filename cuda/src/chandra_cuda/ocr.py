@@ -5,7 +5,8 @@ the CPU, unused) and the (t, h, w) positions; the engine runs the language model
 decodes up to `slots` pages at a time, with MTP-3 and CUDA graphs by default. A page leaves its
 slot at an end token or after max_output_tokens; free slots are refilled from the queue at once.
 Graphs are captured once per number of decoding pages and re-pointed at the current pages when the
-set changes.
+set changes. A page whose text repeats is generated again with sampling, as chandra's vLLM client
+does (temperature 0.2 per attempt up to 0.8, top-p 0.95, up to max_retries times).
 
 With overlap (the default where the driver can split a GPU's SMs, see partition.py), a worker thread
 runs the vision tower and the prefill of the next pages on most of the SMs while the decode steps of
@@ -56,16 +57,19 @@ class CudaGenerator:
     def __init__(self, checkpoint: str | None = None, slots: int = 16, weights: str = "fp8", kv: str = "int8",
                  state: str = "fp16", lm_head: str = "exact", mtp: bool = True, mtp_weights: str = "fp8",
                  draft_vocab: int = 32768, max_output_tokens: int | None = None, stop_on_repeat: bool = True,
-                 fused_vision: bool = True, overlap: bool = True, decode_sms: int | None = None):
+                 fused_vision: bool = True, overlap: bool = True, decode_sms: int | None = None,
+                 max_retries: int | None = None):
         """overlap: run vision and prefill beside the decode steps on separate SMs (when the driver
         supports green contexts); decode_sms: the decode steps' share while a prefill runs (default
-        about a fifth of the GPU)."""
+        about a fifth of the GPU). max_retries: sampled attempts for a page whose text repeats
+        (default chandra's MAX_VLLM_RETRIES; 0 keeps the greedy text)."""
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
         from chandra.settings import settings
 
         name = checkpoint or settings.MODEL_CHECKPOINT
         self.max_output_tokens = max_output_tokens or settings.MAX_OUTPUT_TOKENS
+        self.max_retries = settings.MAX_VLLM_RETRIES if max_retries is None else max_retries
         self.processor = AutoProcessor.from_pretrained(name)
         self.hf = AutoModelForImageTextToText.from_pretrained(name, dtype=torch.bfloat16,
                                                               device_map={"": "cpu"}).eval()
@@ -93,6 +97,8 @@ class CudaGenerator:
         self.stop_on_repeat = stop_on_repeat
         self.img_tok = self.hf.config.image_token_id
         self._graphs: dict[int, object] = {}  # number of decoding pages -> captured graph(s)
+        self._plain_graphs: dict[int, object] = {}  # the same for single-token steps (sampled retries)
+        self.retried = 0
         self.graph_captures = 0
         self.stats: dict[str, float] = {}  # host seconds per phase of the last generate()
         self.overlap_parts = None
@@ -170,6 +176,10 @@ class CudaGenerator:
         from chandra.model.util import detect_repeat_token
 
         max_new = max_output_tokens or self.max_output_tokens
+        max_retries = getattr(self, "max_retries", 0)
+
+        def should_retry(text) -> bool:  # chandra's vLLM client: retry a generation whose text repeats
+            return bool(detect_repeat_token(text) or (len(text) > 50 and detect_repeat_token(text, cut_from_end=50)))
         tok = self.processor.tokenizer
         d = self.dec
         parts = getattr(self, "overlap_parts", None)
@@ -188,16 +198,26 @@ class CudaGenerator:
             hits[it] = hits.get(it, 0) + 1 if detect_repeat_token(text[-REPEAT_TAIL_CHARS:]) else 0
             return hits[it] >= REPEAT_STOP_AFTER
 
-        def finish(it):
-            ids = [t for t in out.pop(it) if t not in self.eos]
-            n_tok = len(ids) + (1 if ended.pop(it, False) else 0)
-            text = tok.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        items: dict[int, object] = {}  # pages in flight (kept for a sampled retry)
+        retry: list = []  # (index, item, attempt) for the sampled pass
+
+        def deliver(it, text, n_tok):
+            items.pop(it, None)
             r = GenerationResult(raw=text, token_count=n_tok, error=False)
-            hits.pop(it, None)
             if on_result is not None:
                 on_result(it, r)
             else:
                 results_kept[it] = r
+
+        def finish(it, attempt=0):
+            ids = [t for t in out.pop(it) if t not in self.eos]
+            n_tok = len(ids) + (1 if ended.pop(it, False) else 0)
+            text = tok.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            hits.pop(it, None)
+            if attempt < max_retries and should_retry(text):
+                retry.append((it, items[it], attempt + 1))
+            else:
+                deliver(it, text, n_tok)
 
         source = enumerate(iter(batch))
         pool = ThreadPoolExecutor(cpu_workers)
@@ -209,6 +229,7 @@ class CudaGenerator:
                 nxt = next(source, None)
                 if nxt is None:
                     return
+                items[nxt[0]] = nxt[1]
                 pending.append((nxt[0], pool.submit(self._prepare, nxt[1])))
 
         free = list(range(self.slots))  # without overlap: free slots
@@ -393,5 +414,80 @@ class CudaGenerator:
                 free_q.put(None)
                 worker.join()
             full.wait_stream(cur)
+        try:
+            t0 = clock()
+            self.retried = 0
+            if retry:
+                self._sampled_pass(retry, max_new, pool, out, ended, looping, finish)
+            st["retries"] = float(self.retried)
+            st["retry_s"] = clock() - t0
+        finally:
             pool.shutdown()
         return [results_kept[i] for i in sorted(results_kept)] if on_result is None else None
+
+    def _sample(self, hidden: torch.Tensor, temps: list, gens: list, top_p: float = 0.95) -> list:
+        """Tokens sampled from bf16(hidden @ embed.T) (the tied LM head) at each row's temperature, top-p."""
+        logits = (hidden @ self.dec.embed.T).float()
+        toks = []
+        for b in range(logits.shape[0]):
+            p = torch.softmax(logits[b] / temps[b], dim=-1)
+            ps, ix = torch.sort(p, descending=True)
+            keep = (torch.cumsum(ps, 0) - ps) < top_p  # the smallest set reaching top_p (at least one)
+            ps = ps * keep
+            toks.append(int(ix[torch.multinomial(ps / ps.sum(), 1, generator=gens[b])]))
+        return toks
+
+    @torch.no_grad()
+    def _sampled_pass(self, retry, max_new, pool, out, ended, looping, finish):
+        """The pages in retry, (index, item, attempt) each, again from their prompts with sampling
+        (temperature min(0.2 attempt, 0.8), top-p 0.95; seeded per page and attempt), on single-token
+        graph steps, up to `slots` at a time; finish() decides on another attempt."""
+        d = self.dec
+        free = list(range(self.slots))
+        act: dict = {}
+        graph, members = None, []
+        while retry or act:
+            changed = False
+            while retry and free:
+                it, item, attempt = retry.pop(0)
+                s = free.pop(0)
+                self.retried += 1
+                temp = min(0.2 * attempt, 0.8)
+                gen = torch.Generator(device="cuda").manual_seed(1_000_003 * (it + 1) + attempt)
+                _, h = self._prefill(s, pool.submit(self._prepare, item).result())
+                t = self._sample(h[None], [temp], [gen])[0]
+                out[it] = [t]
+                if t in self.eos or max_new <= 1:
+                    ended[it] = t in self.eos
+                    free.append(s)
+                    finish(it, attempt)
+                    continue
+                act[it] = {"slot": s, "temp": temp, "gen": gen, "attempt": attempt, "last": t}
+                changed = True
+            if not act:
+                continue
+            if changed or graph is None:
+                members = sorted(act, key=lambda i: act[i]["slot"])
+                seqs = [act[i]["slot"] for i in members]
+                graph = self._plain_graphs.get(len(seqs))
+                if graph is None:
+                    graph = self._plain_graphs[len(seqs)] = d.graph_step(seqs)
+                else:
+                    graph.rebind(seqs)
+            hidden, _ = graph(torch.tensor([act[i]["last"] for i in members], device="cuda"))
+            for i in members:
+                d.length[act[i]["slot"]] += 1
+            toks = self._sample(hidden, [act[i]["temp"] for i in members], [act[i]["gen"] for i in members])
+            for i, t in zip(members, toks):
+                a = act[i]
+                a["last"] = t
+                out[i].append(t)
+                stop = t in self.eos or len(out[i]) >= max_new
+                if not stop and self.stop_on_repeat and len(out[i]) % REPEAT_CHECK_EVERY == 0:
+                    stop = looping(i)
+                if stop:
+                    ended[i] = t in self.eos
+                    free.append(a["slot"])
+                    del act[i]
+                    graph = None
+                    finish(i, a["attempt"])
