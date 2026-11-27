@@ -33,6 +33,7 @@ def main():
     ap.add_argument("--state", default="fp16")
     ap.add_argument("--mtp-weights", default="mxfp4")
     ap.add_argument("--draft-vocab", type=int, default=32768, help="0: the full vocabulary")
+    ap.add_argument("--lm-head", default="exact", help="bf16, or exact (INT8 pass + BF16 re-check, the same picks)")
     a = ap.parse_args()
     ckpt = glob.glob(os.path.expanduser(
         "~/.cache/huggingface/hub/models--datalab-to--chandra-ocr-2/snapshots/*/"))[0]
@@ -47,7 +48,7 @@ def main():
     eos = set(eos if isinstance(eos, list) else [eos])
     dec = Decoder(ckpt, max_seqs=len(pick), max_ctx=8192 + 4 * a.steps + 64, mtp=True, draft_tokens=3,
                   weights=a.weights, kv=a.kv, state_dtype=torch.float16 if a.state == "fp16" else torch.float32,
-                  mtp_weights=a.mtp_weights)
+                  mtp_weights=a.mtp_weights, lm_head=a.lm_head)
     if a.draft_vocab:
         added = sorted(int(i) for i in tok.added_tokens_decoder)
         rows = torch.tensor(sorted(set(range(a.draft_vocab)) | set(added) | eos), device="cuda")
@@ -111,8 +112,8 @@ def main():
     same = sum(plain[n][: len(spec[n])] == spec[n] for n in range(b))
     gen_plain = (a.steps - 1) * b
     gen_spec = sum(len(s) - 1 for s in spec)
-    print(f"{b} pages, weights {a.weights}, KV {a.kv}, state {a.state}, MTP layer {a.mtp_weights}, draft "
-          f"vocabulary {a.draft_vocab or 'full'}:")
+    print(f"{b} pages, weights {a.weights}, KV {a.kv}, state {a.state}, LM head {a.lm_head}, MTP layer "
+          f"{a.mtp_weights}, draft vocabulary {a.draft_vocab or 'full'}:")
     print(f"  plain graph steps: {t_plain / (a.steps - 1) * 1e3:.2f} ms per step, {gen_plain / t_plain:.0f} tokens/s")
     print(f"  MTP-3 graphs: {steps} verify steps, {gen_spec / max(1, steps * b):.2f} tokens per sequence-step, "
           f"{t_spec / max(1, steps) * 1e3:.2f} ms per step, {gen_spec / t_spec:.0f} tokens/s "
