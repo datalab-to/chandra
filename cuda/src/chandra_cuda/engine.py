@@ -53,13 +53,15 @@ class Decoder:
     def __init__(self, ckpt_dir: str, device: str = "cuda", max_seqs: int = 8, max_ctx: int = 18432,
                  state_dtype: torch.dtype = torch.float32, mtp: bool = False, draft_tokens: int = 3,
                  weights: str = "bf16", lm_head: str = "bf16", kv: str = "bf16", attn_split_keys: int | None = 1024,
-                 mtp_weights: str = "bf16", autotune: bool = True):
+                 mtp_weights: str = "bf16", autotune: bool = True, prefill_w8a8: bool | None = None):
         """weights: the format of the decoder layers' linear weights (bf16; fp8, mxfp4, int4 are
         approximate, class G). lm_head: "bf16", or "exact" (INT8 pass + BF16 re-check, the same picks).
         mtp_weights: the MTP layer's GEMM format (drafts are verified, so any format changes only how
         many tokens a step keeps). kv: "bf16", or "int8" (symmetric per token and head, class G)."""
         if kv not in ("bf16", "int8"):
             raise ValueError(kv)
+        # INT8 weights: prefill GEMMs as W8A8 (INT8 activations per token, CUTLASS), the gated format.
+        self.prefill_w8a8 = (weights == "int8") if prefill_w8a8 is None else prefill_w8a8
         self.kv = kv
         # Fixed attention chunks: results independent of the batch, and MTP verify steps round
         # exactly as plain steps (None: chunks sized to fill the GPU, faster at batch 1-4).
@@ -231,6 +233,8 @@ class Decoder:
         pages = self.block_table[seq, :npg].long()
 
         def lin(L, key, x):
+            if self.prefill_w8a8 and hasattr(L[key], "prefill_w8a8"):
+                return L[key].prefill_w8a8(x)
             return L[key].prefill(x)
 
         res = embeds.to(dev, torch.bfloat16).contiguous()

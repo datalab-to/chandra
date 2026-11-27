@@ -322,3 +322,14 @@ def test_int8_matches_its_dequantized_weight(n, k):
         got = lin(x).float()
         assert (got - ref).abs().max().item() <= ref.abs().max().item() * 2**-7 + 1e-3, m
 
+
+@pytest.mark.parametrize("epi", [None, "silu_mul"])
+def test_int8_prefill_w8a8_close_to_w8a16(epi):
+    pytest.importorskip("vllm")
+    torch.manual_seed(17)
+    w = (torch.randn(2048, 2560, device="cuda") * 0.02).to(torch.bfloat16)
+    lin = chandra_cuda.DecodeLinearINT8(w, epilogue=epi)
+    x = torch.randn(300, 2560, device="cuda").to(torch.bfloat16)
+    a, b = lin.prefill_w8a8(x).float(), lin.prefill(x).float()
+    assert ((a - b).norm() / b.norm()).item() < 2e-2  # per-token INT8 activations: ~1% error
+

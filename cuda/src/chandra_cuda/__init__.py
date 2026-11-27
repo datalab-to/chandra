@@ -896,6 +896,17 @@ class DecodeLinearINT8(DecodeLinear):
     def dequantized(self) -> torch.Tensor:
         return self.codes().float() * self.scale[:, None]
 
+    def prefill_w8a8(self, x: torch.Tensor) -> torch.Tensor:
+        """W8A8 (the gated format): activations quantized per token to INT8, vLLM's CUTLASS INT8
+        scaled GEMM with this layer's INT8 weights and row scales."""
+        from vllm import _custom_ops as ops
+
+        q, sc = self.codes().to(torch.int8), self.scale
+        if self.epilogue:
+            q, sc = deinterleave_gate_up(q), deinterleave_gate_up(sc[:, None])[:, 0]
+        xq, xs, _ = ops.scaled_int8_quant(x.contiguous())
+        return ops.cutlass_scaled_mm(xq, q.t(), scale_a=xs, scale_b=sc[:, None].contiguous(), out_dtype=torch.bfloat16)
+
     def prefill(self, x: torch.Tensor) -> torch.Tensor:
         """As the decode kernel: x times the INT8 values (exact in BF16), then the row scale."""
         q, sc = self.codes().to(torch.bfloat16), self.scale
