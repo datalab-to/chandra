@@ -54,7 +54,7 @@ def _flat(x):
 
 
 class CudaGenerator:
-    def __init__(self, checkpoint: str | None = None, slots: int = 16, weights: str = "fp8", kv: str = "int8",
+    def __init__(self, checkpoint: str | None = None, slots: int = 16, weights: str = "int8", kv: str = "int8",
                  state: str = "fp16", lm_head: str = "exact", mtp: bool = True, mtp_weights: str = "fp8",
                  draft_vocab: int = 32768, max_output_tokens: int | None = None, stop_on_repeat: bool = True,
                  fused_vision: bool = True, overlap: bool = True, decode_sms: int | None = None,
