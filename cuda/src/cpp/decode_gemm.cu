@@ -224,10 +224,7 @@ __global__ void __launch_bounds__(kThreads, 2)
   constexpr int kBufBytes = MP * kRowBytes;
   constexpr int kAcc = 2 * NP * 4;  // accumulator floats per lane
   constexpr int kLPC = kBlocksPerChunk / BPL / KW;  // this warp's W loads per x chunk
-  // W loads in flight per warp: with 64 rows each load feeds 16 MMAs, so the wider kernels keep 6 when
-  // the static slots allow it (the 4-bit ones already feed 4 k16 blocks per load).
-  constexpr int kRing0 = (NP >= 4 && !FP4) ? 6 : kDepth;
-  constexpr int kRing = kRing0 % kLPC == 0 ? kRing0 : kLPC % kRing0 == 0 ? kRing0 : kDepth;
+  constexpr int kRing = kDepth;                     // W loads in flight per warp (deeper spills)
   constexpr int kGroup = kRing >= kLPC ? kRing / kLPC : 1;  // chunks per unrolled group
   static_assert((kGroup * kLPC) % kRing == 0 && kLPC % (kLPC < kRing ? kLPC : kRing) == 0,
                 "static ring slots");
