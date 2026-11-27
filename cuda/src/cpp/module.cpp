@@ -225,6 +225,12 @@ NB_MODULE(_core, m) {
     check(chandra::conv_silu_prefill(reinterpret_cast<const void*>(x), xs, reinterpret_cast<const void*>(w),
                                      reinterpret_cast<void*>(out), n, reinterpret_cast<cudaStream_t>(stream)));
   });
+  m.def("vit_rope", [](uintptr_t qkv, int64_t qs, uintptr_t cs, uintptr_t sn, uintptr_t q, uintptr_t k, int n,
+                       uintptr_t stream) {
+    check(chandra::vit_rope(reinterpret_cast<const void*>(qkv), qs, reinterpret_cast<const float*>(cs),
+                            reinterpret_cast<const float*>(sn), reinterpret_cast<void*>(q), reinterpret_cast<void*>(k), n,
+                            reinterpret_cast<cudaStream_t>(stream)));
+  });
   m.def("gated_rmsnorm", [](uintptr_t o, uintptr_t z, int64_t zs, uintptr_t w, uintptr_t out, int n, uintptr_t stream) {
     check(chandra::gated_rmsnorm(reinterpret_cast<const void*>(o), reinterpret_cast<const void*>(z), zs,
                                  reinterpret_cast<const void*>(w), reinterpret_cast<void*>(out), n,

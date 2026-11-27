@@ -51,3 +51,38 @@ def test_int8_qk_close_to_sdpa(lens, version):
         rel = ((sub - ref).abs().sum() / ref.abs().sum()).item()
         assert rel < 0.02, (ln, rel)
 
+
+def test_vit_rope_bitwise_transformers():
+    mq = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
+    torch.manual_seed(51)
+    n = 333
+    qkv = torch.randn(n, 3072, device="cuda").to(torch.bfloat16)
+    ang = torch.randn(n, 32, device="cuda") * 20
+    emb = torch.cat([ang, ang], -1)
+    cos, sin = emb.cos(), emb.sin()
+    q, k = chandra_cuda.vit_rope(qkv, cos, sin)
+    q0, k0, _ = qkv.reshape(n, 3, 16, 64).permute(1, 0, 2, 3).unbind(0)
+    qr, kr = mq.apply_rotary_pos_emb_vision(q0, k0, cos, sin)
+    assert torch.equal(q, qr) and torch.equal(k, kr)
+
+
+def test_patched_vision_attention_bitwise():
+    mq = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
+    from chandra_cuda.vision import patch_vision
+
+    cfg = mq.Qwen3_5VisionConfig(hidden_size=1024, num_heads=16)
+    cfg._attn_implementation = "sdpa"
+    torch.manual_seed(52)
+    att = mq.Qwen3_5VisionAttention(cfg).to("cuda", torch.bfloat16).eval()
+    n = 900
+    x = torch.randn(n, 1024, device="cuda").to(torch.bfloat16)
+    ang = torch.randn(n, 32, device="cuda") * 20
+    emb = torch.cat([ang, ang], -1)
+    pe = (emb.cos(), emb.sin())
+    cu = torch.tensor([0, 400, 900], device="cuda", dtype=torch.int32)
+    with torch.no_grad():
+        ref = att(x, cu, position_embeddings=pe)
+        assert patch_vision(torch.nn.ModuleList([att])) == 1
+        got = att(x, cu, position_embeddings=pe)
+    assert torch.equal(got, ref)
+

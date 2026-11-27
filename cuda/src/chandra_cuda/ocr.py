@@ -41,7 +41,8 @@ def _flat(x):
 class CudaGenerator:
     def __init__(self, checkpoint: str | None = None, slots: int = 16, weights: str = "fp8", kv: str = "int8",
                  state: str = "fp16", lm_head: str = "exact", mtp: bool = True, mtp_weights: str = "fp8",
-                 draft_vocab: int = 32768, max_output_tokens: int | None = None, stop_on_repeat: bool = True):
+                 draft_vocab: int = 32768, max_output_tokens: int | None = None, stop_on_repeat: bool = True,
+                 fused_vision: bool = True):
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
         from chandra.settings import settings
@@ -52,6 +53,10 @@ class CudaGenerator:
         self.hf = AutoModelForImageTextToText.from_pretrained(name, dtype=torch.bfloat16,
                                                               device_map={"": "cpu"}).eval()
         self.hf.model.visual.to("cuda")
+        if fused_vision:  # fused q/k rotary in the vision tower (bitwise the same features)
+            from .vision import patch_vision
+
+            patch_vision(self.hf.model.visual)
         snap = name if os.path.isdir(name) else glob.glob(os.path.expanduser(
             f"~/.cache/huggingface/hub/models--{name.replace('/', '--')}/snapshots/*/"))[0]
         self.dec = Decoder(snap, max_seqs=slots, max_ctx=PAGE_TOKENS_MAX + self.max_output_tokens + 64, mtp=mtp,

@@ -26,6 +26,14 @@ cudaError_t conv_silu_prefill(const void* x, int64_t x_stride, const void* w, vo
 cudaError_t gated_rmsnorm(const void* o, const void* z, int64_t z_stride, const void* w, void* out, int n,
                           cudaStream_t stream);
 
+// Vision tower rotary (rotate-half, head dim 64) of q and k straight from the qkv GEMM's output, with
+// transformers' FP32 arithmetic in its order: out = bf16(x * cos + rotate_half(x) * sin), each product and
+// the sum rounded to FP32 (no FMA), so the result is bitwise transformers'.
+// qkv: [n] rows of qkv_stride ([q 16 x 64 | k 16 x 64 | v ...]); cos, sin: [n][64] FP32;
+// q_out, k_out: [n][16][64] contiguous.
+cudaError_t vit_rope(const void* qkv, int64_t qkv_stride, const float* cos, const float* sin, void* q_out,
+                     void* k_out, int n, cudaStream_t stream);
+
 // out[m][j] = bf16(silu(gu[m][j]) * gu[m][F + j]) for gate_up rows [M][2 * F] (F % 8 == 0).
 cudaError_t silu_mul(const void* gate_up, void* out, int M, cudaStream_t stream, int F = kMlp);
 

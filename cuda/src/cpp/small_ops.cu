@@ -206,7 +206,47 @@ __global__ void __launch_bounds__(256) gated_rmsnorm_kernel(const bf16* __restri
   *reinterpret_cast<uint2*>(dst) = st;
 }
 
+// One thread per (token, q|k, head, quad g): dims 4g .. 4g + 3 and their rotate-half partners 32 + 4g ...
+__global__ void __launch_bounds__(256) vit_rope_kernel(const bf16* __restrict__ qkv, int64_t qs,
+                                                        const float* __restrict__ cs, const float* __restrict__ sn,
+                                                        bf16* __restrict__ q, bf16* __restrict__ k, int n) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * 256 + threadIdx.x;
+  if (idx >= static_cast<int64_t>(n) * 256) return;
+  const int t = static_cast<int>(idx >> 8), r = static_cast<int>(idx & 255);
+  const int p = r >> 7, h = (r >> 3) & 15, g = r & 7;
+  const bf16* src = qkv + static_cast<int64_t>(t) * qs + p * 1024 + h * 64 + 4 * g;
+  const uint2 lo_raw = *reinterpret_cast<const uint2*>(src);
+  const uint2 hi_raw = *reinterpret_cast<const uint2*>(src + 32);
+  const float4 clo = *reinterpret_cast<const float4*>(cs + static_cast<int64_t>(t) * 64 + 4 * g);
+  const float4 chi = *reinterpret_cast<const float4*>(cs + static_cast<int64_t>(t) * 64 + 32 + 4 * g);
+  const float4 slo = *reinterpret_cast<const float4*>(sn + static_cast<int64_t>(t) * 64 + 4 * g);
+  const float4 shi = *reinterpret_cast<const float4*>(sn + static_cast<int64_t>(t) * 64 + 32 + 4 * g);
+  const bf16* lo = reinterpret_cast<const bf16*>(&lo_raw);
+  const bf16* hi = reinterpret_cast<const bf16*>(&hi_raw);
+  const float cl[4] = {clo.x, clo.y, clo.z, clo.w}, ch[4] = {chi.x, chi.y, chi.z, chi.w};
+  const float sl[4] = {slo.x, slo.y, slo.z, slo.w}, sh[4] = {shi.x, shi.y, shi.z, shi.w};
+  bf16 olo[4], ohi[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const float a = __bfloat162float(lo[j]), b = __bfloat162float(hi[j]);
+    olo[j] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(a, cl[j]), __fmul_rn(-b, sl[j])));
+    ohi[j] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(b, ch[j]), __fmul_rn(a, sh[j])));
+  }
+  bf16* dst = (p ? k : q) + static_cast<int64_t>(t) * 1024 + h * 64 + 4 * g;
+  *reinterpret_cast<uint2*>(dst) = *reinterpret_cast<const uint2*>(olo);
+  *reinterpret_cast<uint2*>(dst + 32) = *reinterpret_cast<const uint2*>(ohi);
+}
+
 }  // namespace
+
+cudaError_t vit_rope(const void* qkv, int64_t qkv_stride, const float* cos, const float* sin, void* q_out,
+                     void* k_out, int n, cudaStream_t stream) {
+  if (n <= 0) return cudaSuccess;
+  const int64_t threads = static_cast<int64_t>(n) * 256;
+  vit_rope_kernel<<<static_cast<unsigned>((threads + 255) / 256), 256, 0, stream>>>(
+      static_cast<const bf16*>(qkv), qkv_stride, cos, sin, static_cast<bf16*>(q_out), static_cast<bf16*>(k_out), n);
+  return cudaGetLastError();
+}
 
 cudaError_t conv_silu_prefill(const void* x, int64_t x_stride, const void* w, void* out, int n,
                               cudaStream_t stream) {

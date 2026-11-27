@@ -11,7 +11,7 @@ import torch
 from . import _core
 
 __all__ = ["pack_weight", "pack_weight_fp8", "DecodeLinear", "DecodeLinearFP8", "DecodeLinearFP4", "DecodeLinearINT4", "DecodeLinearINT8", "mxfp4_quantize", "int4_g128_quantize",
-           "pack_weight_fp4", "pack_weight_i8", "interleave_gate_up", "autotune_plans", "LMHead", "LMHeadFP8", "LMHeadExact", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul", "conv_silu_prefill", "gated_rmsnorm",
+           "pack_weight_fp4", "pack_weight_i8", "interleave_gate_up", "autotune_plans", "LMHead", "LMHeadFP8", "LMHeadExact", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul", "conv_silu_prefill", "gated_rmsnorm", "vit_rope",
            "qk_norm_rope_kv", "vit_attn"]
 
 
@@ -334,6 +334,21 @@ def conv_silu_prefill(x: torch.Tensor, conv_w: torch.Tensor) -> torch.Tensor:
     out = torch.empty(n, 8192, dtype=torch.bfloat16, device=x.device)
     _core.conv_silu_prefill(x.data_ptr(), x.stride(0), conv_w.contiguous().data_ptr(), out.data_ptr(), n, _stream(x))
     return out
+
+
+def vit_rope(qkv: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Vision tower rotary of q and k from the qkv projection's output rows [n, >= 2048] (BF16, last dim
+    contiguous) with FP32 cos, sin [n, 64] -> q, k [n, 16, 64] BF16, bitwise transformers'
+    apply_rotary_pos_emb_vision."""
+    n = qkv.shape[0]
+    if qkv.stride(-1) != 1 or qkv.stride(0) % 4:
+        raise ValueError("qkv rows must be contiguous and 8-byte aligned")
+    cos, sin = cos.float().contiguous(), sin.float().contiguous()
+    q = torch.empty(n, 16, 64, dtype=torch.bfloat16, device=qkv.device)
+    k = torch.empty_like(q)
+    _core.vit_rope(qkv.data_ptr(), qkv.stride(0), cos.data_ptr(), sin.data_ptr(), q.data_ptr(), k.data_ptr(), n,
+                   _stream(qkv))
+    return q, k
 
 
 def gated_rmsnorm(o: torch.Tensor, z: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
