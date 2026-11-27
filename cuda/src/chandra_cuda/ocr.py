@@ -20,6 +20,12 @@ import torch
 from .engine import Decoder
 
 PAGE_TOKENS_MAX = 8192  # prompt budget per page (a 6.29 MP page is ~6.1K image tokens + the prompt)
+# The runaway stop of chandra's vLLM client: detect_repeat_token on the last 2,048 characters every
+# 8 tokens; a page stops once it has fired on 4 checks in a row (its output up to there is kept).
+REPEAT_CHECK_EVERY = 8
+REPEAT_STOP_AFTER = 4
+REPEAT_TAIL_CHARS = 2048
+REPEAT_TAIL_TOKENS = 768
 
 
 def _flat(x):
@@ -35,7 +41,7 @@ def _flat(x):
 class CudaGenerator:
     def __init__(self, checkpoint: str | None = None, slots: int = 16, weights: str = "fp8", kv: str = "int8",
                  state: str = "fp16", lm_head: str = "exact", mtp: bool = True, mtp_weights: str = "fp8",
-                 draft_vocab: int = 32768, max_output_tokens: int | None = None):
+                 draft_vocab: int = 32768, max_output_tokens: int | None = None, stop_on_repeat: bool = True):
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
         from chandra.settings import settings
@@ -62,6 +68,7 @@ class CudaGenerator:
             self.dec.set_draft_head("fp8", rows=torch.tensor(rows, device="cuda") if rows else None)
         self.mtp = mtp
         self.slots = slots
+        self.stop_on_repeat = stop_on_repeat
         self.img_tok = self.hf.config.image_token_id
 
     @torch.no_grad()
@@ -93,8 +100,16 @@ class CudaGenerator:
     def generate(self, batch, max_output_tokens: int | None = None, **kwargs):
         """Pages (chandra BatchInputItem) in, GenerationResult out (raw text, token count)."""
         from chandra.model.schema import GenerationResult
+        from chandra.model.util import detect_repeat_token
 
         max_new = max_output_tokens or self.max_output_tokens
+        tok = self.processor.tokenizer
+        hits: dict[int, int] = {}
+
+        def looping(it) -> bool:  # True once the page has repeated on REPEAT_STOP_AFTER checks in a row
+            text = tok.decode(out[it][-REPEAT_TAIL_TOKENS:], skip_special_tokens=True)
+            hits[it] = hits.get(it, 0) + 1 if detect_repeat_token(text[-REPEAT_TAIL_CHARS:]) else 0
+            return hits[it] >= REPEAT_STOP_AFTER
         d = self.dec
         queue = list(range(len(batch)))
         out: dict[int, list[int]] = {}
@@ -144,11 +159,13 @@ class CudaGenerator:
             for j, it in enumerate(members):
                 for t in emit[j]:
                     out[it].append(t)
-                    if t in self.eos or len(out[it]) >= max_new:
+                    stop = t in self.eos or len(out[it]) >= max_new
+                    if not stop and self.stop_on_repeat and len(out[it]) % REPEAT_CHECK_EVERY == 0:
+                        stop = looping(it)
+                    if stop:
                         free.append(slot_of.pop(it))
                         graph = None
                         break
-        tok = self.processor.tokenizer
         results = []
         for i in range(len(batch)):
             ids = [t for t in out.get(i, []) if t not in self.eos]
