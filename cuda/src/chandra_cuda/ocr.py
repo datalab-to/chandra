@@ -104,9 +104,10 @@ class CudaGenerator:
 
     @torch.no_grad()
     def generate(self, batch, max_output_tokens: int | None = None, on_result=None, prefetch: int | None = None,
-                 cpu_workers: int = 4, **kwargs):
+                 cpu_workers: int = 1, **kwargs):
         """Pages in (chandra BatchInputItem, or callables returning one, from any iterable), GenerationResult
-        out (raw text, token count), in order. The processor runs ahead in `cpu_workers` threads, up to
+        out (raw text, token count), in order. The callables and the processor run ahead of the GPU in
+        `cpu_workers` threads (default one: PDF renderers such as pdfium are not thread-safe), up to
         `prefetch` pages (default: the slot count). on_result(index, result), if given, is called as each
         page finishes (and the results are not kept)."""
         from collections import deque

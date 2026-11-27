@@ -3,12 +3,13 @@ olmocr_bench.py does, at 300 dpi, post-processed the same way) into a candidate 
 then score it with olmocr.bench.benchmark.
 
 usage: python engine_olmocr.py BENCH_DATA_DIR --candidate NAME [--slots 16] [--weights int8] [--kv int8]
-       [--state fp16] [--no-mtp]
+       [--state fp16] [--no-mtp] [--cpu-workers 1] [--pages N]
 """
 
 import argparse
 import glob
 import os
+import threading
 import time
 
 from chandra.input import load_pdf_images
@@ -28,9 +29,13 @@ def main():
     ap.add_argument("--state", default="fp16")
     ap.add_argument("--no-mtp", action="store_true")
     ap.add_argument("--dpi", type=int, default=300)
+    ap.add_argument("--cpu-workers", type=int, default=1)
+    ap.add_argument("--pages", type=int, default=0, help="only the first N bench PDFs (a smoke test)")
     a = ap.parse_args()
     pdf_dir = os.path.join(a.bench_dir, "pdfs")
     pdfs = sorted(glob.glob(os.path.join(pdf_dir, "**", "*.pdf"), recursive=True))
+    if a.pages:
+        pdfs = pdfs[: a.pages]
     cand = os.path.join(a.bench_dir, a.candidate)
 
     def out_path(pdf):
@@ -39,9 +44,13 @@ def main():
     todo = [p for p in pdfs if not os.path.exists(out_path(p))]
     gen = CudaGenerator(slots=a.slots, weights=a.weights, kv=a.kv, state=a.state, mtp=not a.no_mtp)
 
+    render_lock = threading.Lock()  # pdfium is not thread-safe
+
     def loader(pdf):
         def load():
-            return BatchInputItem(image=load_pdf_images(pdf, page_range=[0], image_dpi=a.dpi)[0], prompt_type="ocr_layout")
+            with render_lock:
+                img = load_pdf_images(pdf, page_range=[0], image_dpi=a.dpi)[0]
+            return BatchInputItem(image=img, prompt_type="ocr_layout")
         return load
 
     done = [0]
@@ -58,7 +67,7 @@ def main():
     print(f"{len(todo)} of {len(pdfs)} pages to OCR; weights {a.weights}, KV {a.kv}, state {a.state}, "
           f"MTP {not a.no_mtp}, {a.slots} slots", flush=True)
     t0 = time.perf_counter()
-    gen.generate([loader(p) for p in todo], on_result=write)
+    gen.generate([loader(p) for p in todo], on_result=write, cpu_workers=a.cpu_workers)
     dt = time.perf_counter() - t0
     print(f"ENGINE_SECONDS {dt:.0f} ({len(todo) / dt:.3f} pages/s)")
 
