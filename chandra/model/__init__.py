@@ -9,12 +9,16 @@ from chandra.settings import settings
 
 class InferenceManager:
     def __init__(self, method: str = "vllm"):
-        if method not in ("vllm", "hf"):
-            raise ValueError(f"method must be 'vllm' or 'hf', got {method!r}")
+        if method not in ("vllm", "hf", "cuda"):
+            raise ValueError(f"method must be 'vllm', 'hf' or 'cuda', got {method!r}")
         self.method = method
 
         if method == "hf":
             self.model = load_model()
+        elif method == "cuda":  # the optional chandra-cuda engine (cuda/)
+            from chandra_cuda.ocr import CudaGenerator
+
+            self.model = CudaGenerator()
         else:
             self.model = None
 
@@ -46,6 +50,8 @@ class InferenceManager:
                 vllm_model_name=vllm_model_name,
                 **kwargs,
             )
+        elif self.method == "cuda":
+            results = self.model.generate(batch, max_output_tokens=max_output_tokens)
         else:
             results = generate_hf(
                 batch,

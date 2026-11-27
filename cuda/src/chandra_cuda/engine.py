@@ -433,6 +433,18 @@ class Decoder:
         h, _ = rmsnorm_add(res, M["w_norm"], x=z)
         return h, _rows(self.draft_head, h)
 
+    @torch.no_grad()
+    def first_drafts(self, first: torch.Tensor, h_last: torch.Tensor, seqs: list[int]) -> torch.Tensor:
+        """The k MTP drafts after a prefill (eager passes): first [B] tokens, h_last [B, 2560] the main
+        model's final-norm hidden states at the sequences' last prompt positions. Returns [B, k]."""
+        start = [self.length[s] - 1 for s in seqs]
+        hd, e = self.mtp_forward(first.to(self.device), h_last, seqs, start, 1)
+        ds = [e]
+        for j in range(1, self.k):
+            hd, e = self.mtp_forward(e, hd, seqs, [p + j for p in start], 1)
+            ds.append(e)
+        return torch.stack(ds, dim=1)
+
     def spec_graph(self, seqs: list[int]) -> "SpecGraph":
         """CUDA graphs of an MTP verify step and of the k draft passes, for these sequences."""
         return SpecGraph(self, seqs)
@@ -622,48 +634,51 @@ class SpecGraph:
             self.drafts = run()
 
     @torch.no_grad()
+    def step(self, last: torch.Tensor, drafts: torch.Tensor):
+        """One verify step and the next drafts. last [B], drafts [B, k] (device). Returns (the tokens
+        each sequence emits this step, as lists; the next last [B]; the next drafts [B, k], a view of
+        the graph's output buffer: copy what must outlive the next step)."""
+        d, dev, k = self.dec, self.dec.device, self.k
+        seqs, b = self.seqs, len(self.seqs)
+        vin = torch.cat([last.to(dev)[:, None], drafts], dim=1)
+        _, nxt = self.verify(vin.reshape(-1))
+        gl, dl = nxt.view(b, k + 1).tolist(), vin.tolist()
+        acc, emit = [], []
+        for n in range(b):
+            a = 0
+            while a < k and dl[n][a + 1] == gl[n][a]:
+                a += 1
+            acc.append(a)
+            emit.append(dl[n][1 : a + 1] + [gl[n][a]])
+        p0 = [d.length[s] for s in seqs]
+        d.accept(seqs, [a + 1 for a in acc])
+        self.mt.copy_(torch.tensor([[dl[n][i + 1] if i < acc[n] else gl[n][acc[n]] for i in range(k + 1)]
+                                    for n in range(b)]).reshape(-1), non_blocking=True)
+        self.p0.copy_(torch.tensor(p0, dtype=torch.int32), non_blocking=True)
+        self.acc.copy_(torch.tensor(acc, dtype=torch.int32), non_blocking=True)
+        self.sel.copy_(torch.tensor([n * (k + 1) + acc[n] for n in range(b)]), non_blocking=True)
+        self.graph.replay()
+        return emit, torch.tensor([gl[n][acc[n]] for n in range(b)], device=dev), self.drafts
+
+    @torch.no_grad()
     def generate(self, first: torch.Tensor, h_last: torch.Tensor, max_new: int, eos=frozenset()):
         """As Decoder.generate_mtp (same tokens), with the steps as graph replays. Returns the token
         lists and the number of verify steps."""
-        d, dev, k = self.dec, self.dec.device, self.k
-        seqs, b = self.seqs, len(self.seqs)
+        b = len(self.seqs)
         out = [[int(t)] for t in first.tolist()]
         live = [out[n][0] not in eos and max_new > 1 for n in range(b)]
-        start = [d.length[s] - 1 for s in seqs]  # the first drafts, eagerly (once)
-        hd, e = d.mtp_forward(first.to(dev), h_last, seqs, start, 1)
-        ds = [e]
-        for j in range(1, k):
-            hd, e = d.mtp_forward(e, hd, seqs, [p + j for p in start], 1)
-            ds.append(e)
-        drafts = torch.stack(ds, dim=1)
-        last = first.to(dev)
+        drafts = self.dec.first_drafts(first, h_last, self.seqs)
+        last = first.to(self.dec.device)
         steps = 0
         while any(live):
-            vin = torch.cat([last[:, None], drafts], dim=1)  # [B, k + 1]
-            _, nxt = self.verify(vin.reshape(-1))
+            emit, last, drafts = self.step(last, drafts)
             steps += 1
-            gl, dl = nxt.view(b, k + 1).tolist(), vin.tolist()
-            acc = []
             for n in range(b):
-                a = 0
-                while a < k and dl[n][a + 1] == gl[n][a]:
-                    a += 1
-                acc.append(a)
                 if live[n]:
-                    for t in dl[n][1 : a + 1] + [gl[n][a]]:
+                    for t in emit[n]:
                         out[n].append(t)
                         if t in eos or len(out[n]) >= max_new:
                             live[n] = False
                             break
-            p0 = [d.length[s] for s in seqs]
-            d.accept(seqs, [a + 1 for a in acc])
-            self.mt.copy_(torch.tensor([[dl[n][i + 1] if i < acc[n] else gl[n][acc[n]] for i in range(k + 1)]
-                                        for n in range(b)]).reshape(-1), non_blocking=True)
-            self.p0.copy_(torch.tensor(p0, dtype=torch.int32), non_blocking=True)
-            self.acc.copy_(torch.tensor(acc, dtype=torch.int32), non_blocking=True)
-            self.sel.copy_(torch.tensor([n * (k + 1) + acc[n] for n in range(b)]), non_blocking=True)
-            self.graph.replay()
-            drafts = self.drafts
-            last = torch.tensor([gl[n][acc[n]] for n in range(b)], device=dev)
         return out, steps
 
