@@ -286,3 +286,21 @@ def test_autotuned_plan_is_batch_invariant(tmp_path, monkeypatch):
     finally:
         chandra_cuda._core.set_decode_gemm_plan(2560, 4096, 0, 0, 0)
 
+
+
+@pytest.mark.parametrize("fmt", ["bf16", "fp8"])
+@pytest.mark.parametrize("epi", [None, "silu_mul"])
+def test_prefill_matmul_uses_the_decode_weights(fmt, epi):
+    """prefill(x) (cuBLAS on the unpacked weight) matches the decode kernel within rounding."""
+    torch.manual_seed(16)
+    w = (torch.randn(2048, 2560, device="cuda") * 0.02).to(torch.bfloat16)
+    cls = chandra_cuda.DecodeLinear if fmt == "bf16" else chandra_cuda.DecodeLinearFP8
+    lin = cls(w, epilogue=epi)
+    x = torch.randn(200, 2560, device="cuda").to(torch.bfloat16)
+    pre = lin.prefill(x)
+    if epi:
+        pre = chandra_cuda.silu_mul(pre.contiguous())
+    dec = torch.cat([lin(x[i : i + 64]) for i in range(0, 200, 64)])
+    assert (pre.float() - dec.float()).abs().max().item() <= dec.float().abs().max().item() * 2**-6 + 1e-2
+    if fmt == "bf16" and epi is None:
+        assert torch.equal(lin.unpacked(), w)

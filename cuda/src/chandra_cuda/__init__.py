@@ -160,6 +160,13 @@ def attn_decode(
     return out
 
 
+def deinterleave_gate_up(w: torch.Tensor) -> torch.Tensor:
+    """Inverse of interleave_gate_up."""
+    f = w.shape[0] // 2
+    v = w.reshape(f // 8, 2, 8, -1)
+    return torch.cat([v[:, 0].reshape(f, -1), v[:, 1].reshape(f, -1)])
+
+
 def interleave_gate_up(w: torch.Tensor) -> torch.Tensor:
     """[gate; up] (2F rows) -> 16-row groups of 8 gate rows then the same 8 up rows, the row
     order of the decode GEMM's silu_mul epilogue."""
@@ -221,6 +228,22 @@ class DecodeLinear:
         self._replan()
 
     FMT = 0  # the plan registry's key for this weight format
+
+    def unpacked(self) -> torch.Tensor:
+        """The [N, K] BF16 weight this layer multiplies by, in the original row order (gate before
+        up for silu_mul), for prefill GEMMs. Inverse of pack_weight."""
+        n, k = self.n, self.k
+        w = (
+            self.packed.view(n // 16, k // 16, 8, 4, 2, 2, 2)  # g kb gid tig kh rh e
+            .permute(0, 5, 2, 1, 4, 3, 6)
+            .reshape(n, k)
+        )
+        return deinterleave_gate_up(w) if self.epilogue else w
+
+    def prefill(self, x: torch.Tensor) -> torch.Tensor:
+        """x [M, K] -> [M, N] BF16 for any M (prefill), cuBLAS on the unpacked weight (original row
+        order, so gate and up stay separate under silu_mul)."""
+        return x @ self.unpacked().T
 
     def _replan(self):
         """Size the workspace and counters for the current plan of (N, K, format)."""
@@ -368,6 +391,21 @@ class DecodeLinearFP8(DecodeLinear):
         super().__init__(weight, _pack=False, epilogue=epilogue)  # shapes and the split workspace only
         w, self._prep = self._prep, None
         self.packed, self.scale = pack_weight_fp8(w)
+
+    def prefill(self, x: torch.Tensor) -> torch.Tensor:
+        """As the decode kernel: x times the e4m3 values (exact in BF16), then the per-row scale."""
+        n, k = self.n, self.k
+        q = (
+            self.packed.view(n // 16, k // 32, 8, 4, 2, 2, 2, 2)
+            .permute(0, 6, 2, 1, 4, 5, 3, 7)
+            .reshape(n, k)
+            .view(torch.float8_e4m3fn)
+            .to(torch.bfloat16)
+        )
+        sc = self.scale
+        if self.epilogue:
+            q, sc = deinterleave_gate_up(q), deinterleave_gate_up(sc[:, None])[:, 0]
+        return ((x @ q.T).float() * sc[None, :]).to(torch.bfloat16)
 
     def dequantized(self) -> torch.Tensor:
         """The weight this layer actually multiplies by, as FP32 (for checks)."""
@@ -533,6 +571,9 @@ class DecodeLinearFP4(DecodeLinear):
 
     FMT = 2
 
+    def prefill(self, x: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("prefill from 4-bit layers is not written yet (their accuracy gate is pending)")
+
     def __init__(self, weight: torch.Tensor, keep_codes: bool = False, epilogue: str | None = None):
         if weight.shape[0] % 64:
             raise ValueError("N must be a multiple of 64")
@@ -687,6 +728,9 @@ class DecodeLinearINT4(DecodeLinear):
     y = x @ bf16(q * s).T. N must be a multiple of 64."""
 
     FMT = 3
+
+    def prefill(self, x: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("prefill from 4-bit layers is not written yet (their accuracy gate is pending)")
 
     def __init__(self, weight: torch.Tensor, keep_codes: bool = False, epilogue: str | None = None):
         if weight.shape[0] % 64:

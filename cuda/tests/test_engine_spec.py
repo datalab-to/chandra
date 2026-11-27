@@ -234,3 +234,31 @@ def test_exact_lm_head_in_graphs(ckpt, run):
     out, steps = dec.spec_graph(seqs).generate(first, hidden, max_new=24)
     for n in range(len(seqs)):
         assert out[n][:24] == ref[n][:24], n
+
+
+def test_prefill_equals_step_by_step_decoding(ckpt):
+    """Prefill (chunked FLA DeltaNet, FA2 attention, cuBLAS GEMMs) of a prompt, then decoding,
+    gives the tokens of feeding the same prompt one token at a time through decode steps."""
+    pytest.importorskip("vllm")
+    torch.manual_seed(21)
+    n, steps = 150, 16
+    prompt = torch.randint(0, VOCAB, (n,), device="cuda")
+    pos3 = torch.arange(n, dtype=torch.int32, device="cuda")[:, None].expand(n, 3).contiguous()
+    a = Decoder(ckpt, max_seqs=1, max_ctx=512)
+    for t in prompt[:-1]:
+        a.step(t[None], [0])
+    nxt = a.step(prompt[-1:], [0])
+    ref = [int(nxt)]
+    for _ in range(steps - 1):
+        nxt = a.step(nxt, [0])
+        ref.append(int(nxt))
+    b = Decoder(ckpt, max_seqs=1, max_ctx=512)
+    _, first = b.prefill(0, b.embed[prompt], pos3, 0)
+    got = [int(first)]
+    nxt = first[None]
+    for _ in range(steps - 1):
+        nxt = b.step(nxt, [0])
+        got.append(int(nxt))
+    lead = next((i for i in range(steps) if got[i] != ref[i]), steps)
+    assert lead >= steps // 2, (lead, got, ref)  # chunked vs recurrent DeltaNet: rounding only
+

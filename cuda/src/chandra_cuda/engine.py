@@ -203,6 +203,86 @@ class Decoder:
         self.rope_delta[seq] = int(rope_delta)
         self.pending[seq] = 0
 
+    @torch.no_grad()
+    def prefill(self, seq: int, embeds: torch.Tensor, pos3: torch.Tensor, rope_delta: int):
+        """Run a prompt through the language model into sequence seq's caches (its KV pages, DeltaNet
+        state and conv ring), as transformers' prefill does: embeds [n, 2560] BF16 (text embeddings
+        with the image features in place), pos3 [n, 3] int32 (t, h, w) positions, rope_delta for the
+        positions after the prompt. GEMMs run in cuBLAS on each layer's weight unpacked for the
+        call (BF16 or FP8 layers, the same weights as the decode kernels); the DeltaNet layers use vLLM's chunked FLA kernel, attention FA2.
+        Returns (final-norm hidden states [n, 2560], the greedy next token)."""
+        import torch.nn.functional as F
+
+        from vllm.third_party.flash_linear_attention.ops import chunk_gated_delta_rule
+        from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+        from . import silu_mul
+
+        dev = self.device
+        n = embeds.shape[0]
+        pos = torch.arange(n, dtype=torch.int64, device=dev)
+        page = self.block_table[seq, pos // PAGE].contiguous()
+        in_page = (pos % PAGE).to(torch.int32)
+        pos3 = pos3.to(dev, torch.int32).contiguous()
+        cu = torch.tensor([0, n], dtype=torch.int32, device=dev)
+        npg = math.ceil(n / PAGE)
+        pages = self.block_table[seq, :npg].long()
+
+        def lin(L, key, x):
+            return L[key].prefill(x)
+
+        res = embeds.to(dev, torch.bfloat16).contiguous()
+        prev = None
+        for L in self.layers:
+            xn, res = rmsnorm_add(res, L["w_in"], x=prev)
+            if L["type"] == "linear_attention":
+                y = lin(L, "qkvzba", xn)
+                raw = y[:, :8192]
+                z, b, a = y[:, 8192:12288], y[:, 12288:12320], y[:, 12320:12352]
+                conv = F.conv1d(raw.T.float()[None], L["conv_w"].float()[:, None, :], padding=3, groups=8192)
+                mixed = F.silu(conv[0, :, :n]).to(torch.bfloat16).T  # [n, 8192], BF16 as vLLM's conv output
+                q = mixed[:, :2048].reshape(1, n, 16, 128).repeat_interleave(2, dim=2)
+                k = mixed[:, 2048:4096].reshape(1, n, 16, 128).repeat_interleave(2, dim=2)
+                v = mixed[:, 4096:].reshape(1, n, 32, 128)
+                g = -torch.exp(L["A_log"]) * F.softplus(a.float() + L["dt_bias"].float())
+                beta = torch.sigmoid(b.float()).to(torch.bfloat16)
+                o, st = chunk_gated_delta_rule(q.contiguous(), k.contiguous(), v.contiguous(), g=g[None],
+                                               beta=beta[None], initial_state=None, output_final_state=True,
+                                               use_qk_l2norm_in_kernel=True)
+                L["state"][seq + 1] = st[0].transpose(-1, -2).to(L["state"].dtype)  # [K, V] -> ours [v][k]
+                for j in range(1, 4):
+                    if n - j >= 0:
+                        L["ring"][seq + 1, (n - j) % self.ring] = raw[n - j]
+                of = o[0].to(torch.bfloat16).float()  # vLLM rounds o to BF16 before the norm
+                on = of * torch.rsqrt(of.pow(2).mean(-1, keepdim=True) + 1e-6)
+                gated = (on * L["norm_w"].float()) * F.silu(z.float().reshape(n, 32, 128))
+                y = lin(L, "out", gated.to(torch.bfloat16).reshape(n, 4096))
+            else:
+                qkv = lin(L, "qkv", xn).contiguous()
+                q = qk_norm_rope_kv(qkv, L["q_norm"], L["k_norm"], pos3, L["k_cache"], L["v_cache"], page,
+                                    in_page, rope_theta=self.rope_theta, k_scale=L.get("k_scale"),
+                                    v_scale=L.get("v_scale"))
+
+                def gather(c, sc):
+                    x = c[pages]  # [npg, 4, 64, 256]
+                    if sc is not None:
+                        x = (x.float() * sc[pages][..., None]).to(torch.bfloat16)
+                    return x.permute(0, 2, 1, 3).reshape(npg * PAGE, 4, 256)[:n].contiguous()
+
+                kk, vv = gather(L["k_cache"], L.get("k_scale")), gather(L["v_cache"], L.get("v_scale"))
+                att = flash_attn_varlen_func(q=q, k=kk, v=vv, cu_seqlens_q=cu, cu_seqlens_k=cu, max_seqlen_q=n,
+                                             max_seqlen_k=n, softmax_scale=1.0 / 16.0, causal=True, fa_version=2)
+                gate = qkv[:, :8192].view(n, 16, 512)[..., 256:]
+                out = (att.to(torch.bfloat16).float() * torch.sigmoid(gate.float())).to(torch.bfloat16)
+                y = lin(L, "o", out.reshape(n, 4096))
+            xn, res = rmsnorm_add(res, L["w_post"], x=y)
+            prev = lin(L, "down", silu_mul(lin(L, "gate_up", xn).contiguous()))
+        hidden, _ = rmsnorm_add(res, self.final_w, x=prev)
+        self.length[seq] = n
+        self.rope_delta[seq] = int(rope_delta)
+        self.pending[seq] = 0
+        return hidden, _rows(self.lm_head, hidden[-1:])[0]
+
     def _positions(self, seqs, start, T):
         """Per-row tensors for T tokens of each sequence from position start[n]."""
         dev = self.device
