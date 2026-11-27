@@ -3,7 +3,7 @@ olmocr_bench.py does, at 300 dpi, post-processed the same way) into a candidate 
 then score it with olmocr.bench.benchmark.
 
 usage: python engine_olmocr.py BENCH_DATA_DIR --candidate NAME [--slots 16] [--weights int8] [--kv int8]
-       [--state fp16] [--no-mtp] [--cpu-workers 1] [--pages N]
+       [--state fp16] [--no-mtp] [--cpu-workers 1] [--pages N] [--no-overlap] [--decode-sms K]
 """
 
 import argparse
@@ -31,6 +31,8 @@ def main():
     ap.add_argument("--dpi", type=int, default=300)
     ap.add_argument("--cpu-workers", type=int, default=1)
     ap.add_argument("--pages", type=int, default=0, help="only the first N bench PDFs (a smoke test)")
+    ap.add_argument("--no-overlap", action="store_true")
+    ap.add_argument("--decode-sms", type=int, default=None)
     a = ap.parse_args()
     pdf_dir = os.path.join(a.bench_dir, "pdfs")
     pdfs = sorted(glob.glob(os.path.join(pdf_dir, "**", "*.pdf"), recursive=True))
@@ -42,7 +44,8 @@ def main():
         return os.path.join(cand, os.path.splitext(os.path.relpath(pdf, pdf_dir))[0] + "_pg1_repeat1.md")
 
     todo = [p for p in pdfs if not os.path.exists(out_path(p))]
-    gen = CudaGenerator(slots=a.slots, weights=a.weights, kv=a.kv, state=a.state, mtp=not a.no_mtp)
+    gen = CudaGenerator(slots=a.slots, weights=a.weights, kv=a.kv, state=a.state, mtp=not a.no_mtp,
+                        overlap=not a.no_overlap, decode_sms=a.decode_sms)
 
     render_lock = threading.Lock()  # pdfium is not thread-safe
 
@@ -70,6 +73,9 @@ def main():
     gen.generate([loader(p) for p in todo], on_result=write, cpu_workers=a.cpu_workers)
     dt = time.perf_counter() - t0
     print(f"ENGINE_SECONDS {dt:.0f} ({len(todo) / dt:.3f} pages/s)")
+    parts = gen.overlap_parts
+    print("overlap: " + (f"decode on {parts[0][0]} SMs while prefill runs on {parts[1][0]}" if parts else "off"))
+    print("host seconds by phase: " + ", ".join(f"{k} {v:.1f}" for k, v in gen.stats.items()))
 
 
 if __name__ == "__main__":

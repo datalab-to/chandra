@@ -61,7 +61,8 @@ class CudaGenerator:
                  max_retries: int | None = None):
         """overlap: run vision and prefill beside the decode steps on separate SMs (when the driver
         supports green contexts); decode_sms: the decode steps' share while a prefill runs (default
-        about a fifth of the GPU). max_retries: sampled attempts for a page whose text repeats
+        about 28% of the SMs: alone the steps need few SMs, but beside a prefill the two share DRAM
+        bandwidth roughly by SM count). max_retries: sampled attempts for a page whose text repeats
         (default chandra's MAX_VLLM_RETRIES; 0 keeps the greedy text)."""
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -107,7 +108,7 @@ class CudaGenerator:
 
             sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
             self.overlap_parts = sm_partitions(torch.device("cuda", torch.cuda.current_device()),
-                                               decode_sms or max(4, 2 * round(sms / 10)))
+                                               decode_sms or max(4, 2 * round(sms * 0.14)))
         self._shadows = self.dec.prefill_shadows() if self.overlap_parts else None
 
     def _graph_for(self, seqs: list[int]):
