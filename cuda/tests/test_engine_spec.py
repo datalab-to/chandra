@@ -237,28 +237,32 @@ def test_exact_lm_head_in_graphs(ckpt, run):
 
 
 def test_prefill_equals_step_by_step_decoding(ckpt):
-    """Prefill (chunked FLA DeltaNet, FA2 attention, cuBLAS GEMMs) of a prompt, then decoding,
-    gives the tokens of feeding the same prompt one token at a time through decode steps."""
+    """Prefill (chunked FLA DeltaNet, FA2 attention, cuBLAS GEMMs) of a prompt leaves the caches that
+    feeding the prompt one token at a time through decode steps leaves, to rounding (chunked and
+    recurrent DeltaNet differ by ~3e-3 per layer, as in vLLM), and picks the same next token."""
     pytest.importorskip("vllm")
     torch.manual_seed(21)
-    n, steps = 150, 16
+    n = 150
     prompt = torch.randint(0, VOCAB, (n,), device="cuda")
     pos3 = torch.arange(n, dtype=torch.int32, device="cuda")[:, None].expand(n, 3).contiguous()
     a = Decoder(ckpt, max_seqs=1, max_ctx=512)
     for t in prompt[:-1]:
         a.step(t[None], [0])
     nxt = a.step(prompt[-1:], [0])
-    ref = [int(nxt)]
-    for _ in range(steps - 1):
-        nxt = a.step(nxt, [0])
-        ref.append(int(nxt))
     b = Decoder(ckpt, max_seqs=1, max_ctx=512)
     _, first = b.prefill(0, b.embed[prompt], pos3, 0)
-    got = [int(first)]
-    nxt = first[None]
-    for _ in range(steps - 1):
-        nxt = b.step(nxt, [0])
-        got.append(int(nxt))
-    lead = next((i for i in range(steps) if got[i] != ref[i]), steps)
-    assert lead >= steps // 2, (lead, got, ref)  # chunked vs recurrent DeltaNet: rounding only
+    assert int(first) == int(nxt)
+    assert b.length[0] == a.length[0] == n
+    for La, Lb in zip(a.layers, b.layers):
+        if La["type"] == "linear_attention":
+            sa, sb = La["state"][1].float(), Lb["state"][1].float()
+            assert ((sa - sb).norm() / sa.norm()).item() < 3e-2
+            for p in range(n - 3, n):
+                d = (La["ring"][1, p % 4].float() - Lb["ring"][1, p % 4].float()).abs().max().item()
+                assert d <= 0.1 * La["ring"][1, p % 4].float().abs().max().item()
+        else:
+            npg = (n + 63) // 64
+            for c in ("k_cache", "v_cache"):
+                ca, cb = La[c][:npg].float(), Lb[c][:npg].float()
+                assert ((ca - cb).norm() / ca.norm()).item() < 3e-2, c
 
