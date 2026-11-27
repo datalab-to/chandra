@@ -249,7 +249,7 @@ class Decoder:
                 o, st = chunk_gated_delta_rule(q.contiguous(), k.contiguous(), v.contiguous(), g=g[None],
                                                beta=beta[None], initial_state=None, output_final_state=True,
                                                use_qk_l2norm_in_kernel=True)
-                L["state"][seq + 1] = st[0].transpose(-1, -2).to(L["state"].dtype)  # [K, V] -> ours [v][k]
+                L["state"][seq + 1] = st[0].to(L["state"].dtype)  # vLLM's FLA keeps [H, V, K]: ours [v][k]
                 for j in range(1, 4):
                     if n - j >= 0:
                         L["ring"][seq + 1, (n - j) % self.ring] = raw[n - j]
