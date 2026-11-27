@@ -142,9 +142,10 @@ def save_merged_output(
 )
 @click.option(
     "--method",
-    type=click.Choice(["hf", "vllm"], case_sensitive=False),
+    type=click.Choice(["hf", "vllm", "cuda"], case_sensitive=False),
     default="vllm",
-    help="Inference method: 'hf' for local model, 'vllm' for vLLM server.",
+    help="Inference method: 'hf' for local model, 'vllm' for vLLM server, 'cuda' for the optional "
+    "chandra-cuda engine (cuda/).",
 )
 @click.option(
     "--page-range",
@@ -295,6 +296,9 @@ def main(
     elif method == "vllm":
         if batch_size is None:
             batch_size = 28
+    elif method == "cuda":
+        if batch_size is None:
+            batch_size = 64  # the engine batches continuously within a call; keep its slots full
 
     if not stdout:
         click.echo("Chandra CLI - Starting OCR processing")
