@@ -22,10 +22,12 @@ import os
 
 import torch
 
-from . import (_core, DecodeLinear, DecodeLinearFP4, DecodeLinearFP8, DecodeLinearINT4, LMHead, LMHeadFP8,
+from . import (_core, DecodeLinear, DecodeLinearFP4, DecodeLinearFP8, DecodeLinearINT4, DecodeLinearINT8, LMHead,
+               LMHeadFP8,
                attn_decode, gdn_decode, qk_norm_rope_kv, rmsnorm_add)
 
-WEIGHT_FORMATS = {"bf16": DecodeLinear, "fp8": DecodeLinearFP8, "mxfp4": DecodeLinearFP4, "int4": DecodeLinearINT4}
+WEIGHT_FORMATS = {"bf16": DecodeLinear, "fp8": DecodeLinearFP8, "int8": DecodeLinearINT8, "mxfp4": DecodeLinearFP4,
+                  "int4": DecodeLinearINT4}
 
 PAGE = 64
 ROWS = 64  # the decode GEMMs take up to 64 rows per call

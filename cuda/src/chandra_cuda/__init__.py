@@ -10,7 +10,7 @@ import torch
 
 from . import _core
 
-__all__ = ["pack_weight", "pack_weight_fp8", "DecodeLinear", "DecodeLinearFP8", "DecodeLinearFP4", "DecodeLinearINT4", "mxfp4_quantize", "int4_g128_quantize",
+__all__ = ["pack_weight", "pack_weight_fp8", "DecodeLinear", "DecodeLinearFP8", "DecodeLinearFP4", "DecodeLinearINT4", "DecodeLinearINT8", "mxfp4_quantize", "int4_g128_quantize",
            "pack_weight_fp4", "pack_weight_i8", "interleave_gate_up", "autotune_plans", "LMHead", "LMHeadFP8", "LMHeadExact", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul",
            "qk_norm_rope_kv", "vit_attn"]
 
@@ -865,4 +865,55 @@ def autotune_plans(layers, rows=(1, 16, 64), reps=20, cache: bool = True) -> dic
         except OSError:
             pass
     return chosen
+
+
+class DecodeLinearINT8(DecodeLinear):
+    """DecodeLinear with INT8 weights, symmetric with one scale per output row (absmax / 127, round to
+    nearest): the W8 of a W8A8 checkpoint (bench/make_ct_checkpoint.py --scheme w8a8), here with BF16
+    activations. One byte per weight, as FP8, with a finer grid. Approximate (class G):
+    y = (x @ q.T) * scale. N must be a multiple of 32, K of 256."""
+
+    FMT = 4
+
+    def __init__(self, weight: torch.Tensor, epilogue: str | None = None):
+        if weight.shape[0] % 32:
+            raise ValueError("N must be a multiple of 32")
+        super().__init__(weight, _pack=False, epilogue=epilogue)
+        w, self._prep = self._prep, None
+        self.packed, self.scale, _ = pack_weight_i8(w)
+
+    def codes(self) -> torch.Tensor:
+        """The INT8 values [N, K] in the packed (interleaved, for silu_mul) row order."""
+        n, k = self.n, self.k
+        b = (
+            self.packed.view(n // 16, k // 32, 8, 4, 2, 2, 2, 2)
+            .permute(0, 6, 2, 1, 4, 5, 3, 7)
+            .reshape(n, k)
+            .to(torch.int16)
+        )
+        return torch.where(b >= 128, 128 - b, b)
+
+    def dequantized(self) -> torch.Tensor:
+        return self.codes().float() * self.scale[:, None]
+
+    def prefill(self, x: torch.Tensor) -> torch.Tensor:
+        """As the decode kernel: x times the INT8 values (exact in BF16), then the row scale."""
+        q, sc = self.codes().to(torch.bfloat16), self.scale
+        if self.epilogue:
+            q, sc = deinterleave_gate_up(q), deinterleave_gate_up(sc[:, None])[:, 0]
+        return ((x @ q.T).float() * sc[None, :]).to(torch.bfloat16)
+
+    def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != self.k:
+            raise ValueError(f"expected a [M, {self.k}] bfloat16 input")
+        m = x.shape[0]
+        if not 1 <= m <= 64:
+            raise ValueError("M must be between 1 and 64")
+        x = x.contiguous()
+        if out is None:
+            out = torch.empty(m, self.n_out, dtype=torch.bfloat16, device=self.device)
+        _core.decode_gemm_int8(x.data_ptr(), self.packed.data_ptr(), self.scale.data_ptr(), out.data_ptr(),
+                               self.workspace.data_ptr(), self.counters.data_ptr(), m, self.n, self.k, self.sms,
+                               torch.cuda.current_stream(self.device).cuda_stream, self.epilogue)
+        return out
 

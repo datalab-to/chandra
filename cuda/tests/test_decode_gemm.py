@@ -192,13 +192,14 @@ def test_exact_lm_head_equals_bf16_head():
     print("mean candidate tiles per token:", [round(c, 1) for c in cands])
 
 
-@pytest.mark.parametrize("fmt", ["bf16", "fp8", "fp4", "int4"])
+@pytest.mark.parametrize("fmt", ["bf16", "fp8", "fp4", "int4", "int8"])
 @pytest.mark.parametrize("f,k", [(9216, 2560), (1024, 2560)])  # the MLP; a narrow one, split along K
 def test_silu_mul_epilogue_equals_separate_ops(fmt, f, k):
     torch.manual_seed(f + k)
     w = (torch.randn(2 * f, k, device="cuda") * 0.02).to(torch.bfloat16)
     cls = {"bf16": chandra_cuda.DecodeLinear, "fp8": chandra_cuda.DecodeLinearFP8,
-           "fp4": chandra_cuda.DecodeLinearFP4, "int4": chandra_cuda.DecodeLinearINT4}[fmt]
+           "fp4": chandra_cuda.DecodeLinearFP4, "int4": chandra_cuda.DecodeLinearINT4,
+           "int8": chandra_cuda.DecodeLinearINT8}[fmt]
     plain, fused = cls(w), cls(w, epilogue="silu_mul")
     for m in (1, 9, 33, 64):
         x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
@@ -288,14 +289,15 @@ def test_autotuned_plan_is_batch_invariant(tmp_path, monkeypatch):
 
 
 
-@pytest.mark.parametrize("fmt", ["bf16", "fp8", "fp4", "int4"])
+@pytest.mark.parametrize("fmt", ["bf16", "fp8", "fp4", "int4", "int8"])
 @pytest.mark.parametrize("epi", [None, "silu_mul"])
 def test_prefill_matmul_uses_the_decode_weights(fmt, epi):
     """prefill(x) (cuBLAS on the unpacked weight) matches the decode kernel within rounding."""
     torch.manual_seed(16)
     w = (torch.randn(2048, 2560, device="cuda") * 0.02).to(torch.bfloat16)
     cls = {"bf16": chandra_cuda.DecodeLinear, "fp8": chandra_cuda.DecodeLinearFP8,
-           "fp4": chandra_cuda.DecodeLinearFP4, "int4": chandra_cuda.DecodeLinearINT4}[fmt]
+           "fp4": chandra_cuda.DecodeLinearFP4, "int4": chandra_cuda.DecodeLinearINT4,
+           "int8": chandra_cuda.DecodeLinearINT8}[fmt]
     lin = cls(w, epilogue=epi)
     x = torch.randn(200, 2560, device="cuda").to(torch.bfloat16)
     pre = lin.prefill(x)
@@ -305,3 +307,18 @@ def test_prefill_matmul_uses_the_decode_weights(fmt, epi):
     assert (pre.float() - dec.float()).abs().max().item() <= dec.float().abs().max().item() * 2**-6 + 1e-2
     if fmt == "bf16" and epi is None:
         assert torch.equal(lin.unpacked(), w)
+
+
+@pytest.mark.parametrize("n,k", [s for s in SHAPES if s[0] % 32 == 0 and s[1] % 256 == 0])
+def test_int8_matches_its_dequantized_weight(n, k):
+    torch.manual_seed(n * 11 + k)
+    w = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
+    lin = chandra_cuda.DecodeLinearINT8(w)
+    wd = lin.dequantized()
+    assert ((wd - w.float()).abs() <= lin.scale[:, None] * 0.5 + 1e-7).all()  # round to nearest
+    for m in ROWS:
+        x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
+        ref = x.float() @ wd.T
+        got = lin(x).float()
+        assert (got - ref).abs().max().item() <= ref.abs().max().item() * 2**-7 + 1e-3, m
+
