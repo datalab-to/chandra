@@ -3,8 +3,9 @@
 transformers provides the processor, the vision tower (on the GPU; its language model stays on
 the CPU, unused) and the (t, h, w) positions; the engine runs the language model's prefill and
 decodes up to `slots` pages at a time, with MTP-3 and CUDA graphs by default. A page leaves its
-slot at an end token or after max_output_tokens; free slots are refilled from the queue at once,
-and new graphs are captured whenever the set of pages changes.
+slot at an end token or after max_output_tokens; free slots are refilled from the queue at once.
+Graphs are captured once per number of decoding pages and re-pointed at the current pages when the
+set changes.
 
     gen = CudaGenerator()
     results = gen.generate(batch)        # chandra.model.schema.GenerationResult per page
@@ -75,6 +76,18 @@ class CudaGenerator:
         self.slots = slots
         self.stop_on_repeat = stop_on_repeat
         self.img_tok = self.hf.config.image_token_id
+        self._graphs: dict[int, object] = {}  # number of decoding pages -> captured graph(s)
+        self.graph_captures = 0
+
+    def _graph_for(self, seqs: list[int]):
+        g = self._graphs.get(len(seqs))
+        if g is None:
+            g = self.dec.spec_graph(seqs) if self.mtp else self.dec.graph_step(seqs)
+            self._graphs[len(seqs)] = g
+            self.graph_captures += 1
+        else:
+            g.rebind(seqs)
+        return g
 
     def _prepare(self, item):
         """CPU side of a page (run ahead in a thread pool): item, or a callable returning it (to render
@@ -187,10 +200,9 @@ class CudaGenerator:
                 graph = None
             if not slot_of:
                 continue
-            if graph is None:  # a new set of pages: new graphs
+            if graph is None:  # a new set of pages: the graphs for that many, re-pointed at them
                 members = sorted(slot_of, key=lambda it: slot_of[it])
-                seqs = [slot_of[it] for it in members]
-                graph = d.spec_graph(seqs) if self.mtp else d.graph_step(seqs)
+                graph = self._graph_for([slot_of[it] for it in members])
             if self.mtp:
                 emit, nlast, ndrafts = graph.step(torch.tensor([last[it] for it in members], device="cuda"),
                                                   torch.stack([drafts[it] for it in members]))

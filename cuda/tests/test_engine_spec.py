@@ -170,6 +170,26 @@ def test_graph_step_matches_eager(run):
         assert out[n] == ref[n][:16], n
 
 
+def test_graph_step_rebind_matches_eager(run):
+    """A step captured for sequences [0, 1] and re-pointed at [1, 2] gives eager decoding's tokens
+    for 1 and 2 (no capture for the new set)."""
+    dec, seqs, t0, ref = run
+    _reset(dec)
+    gs = dec.graph_step(seqs[:2])
+    _reset(dec)
+    gs.rebind(seqs[1:])
+    tok = t0[1:].clone()
+    out = [[], []]
+    for _ in range(16):
+        _, nxt = gs(tok)
+        for s in seqs[1:]:
+            dec.length[s] += 1
+        tok = nxt.clone()
+        for o, x in zip(out, tok.tolist()):
+            o.append(x)
+    assert out[0] == ref[1][:16] and out[1] == ref[2][:16]
+
+
 def test_int8_kv_decoder_runs_and_mostly_agrees(ckpt, run):
     """INT8 KV is approximate (class G): on random weights the greedy tokens stay close to BF16 KV's."""
     _, seqs, t0, ref = run
@@ -269,7 +289,7 @@ def test_prefill_equals_step_by_step_decoding(ckpt):
 
 
 def test_cuda_generator_scheduler_matches_single_page_decoding(ckpt):
-    """CudaGenerator's continuous batching (pages join and leave, graphs recaptured, MTP steps) gives
+    """CudaGenerator's continuous batching (pages join and leave, graphs re-pointed, MTP steps) gives
     each page the tokens of decoding it alone, on the random checkpoint (FP32 state: bit-exact)."""
     pytest.importorskip("vllm")
     import types
@@ -288,6 +308,7 @@ def test_cuda_generator_scheduler_matches_single_page_decoding(ckpt):
     gen.dec = Decoder(ckpt, max_seqs=2, max_ctx=512, mtp=True, draft_tokens=3)
     gen.processor = types.SimpleNamespace(tokenizer=Tok())
     gen.eos, gen.mtp, gen.slots, gen.stop_on_repeat, gen.max_output_tokens = set(), True, 2, False, max_new
+    gen._graphs, gen.graph_captures = {}, 0
 
     def prefill(slot, item):
         n = item.shape[0]
@@ -312,3 +333,4 @@ def test_cuda_generator_scheduler_matches_single_page_decoding(ckpt):
             ref.append(int(nxt))
         assert r.raw == " ".join(map(str, ref)), (r.raw[:80], ref[:10])
         assert r.token_count == max_new
+    assert gen.graph_captures <= 2  # one per number of decoding pages; set changes re-point them

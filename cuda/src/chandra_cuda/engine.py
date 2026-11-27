@@ -582,6 +582,20 @@ class GraphStep:
             self.hidden, self.next = run()
         self.slot.copy_(torch.tensor([s + 1 for s in seqs], dtype=torch.int32, device=dev))
 
+    def rebind(self, seqs: list[int]):
+        """Point the captured step at another set of len(seqs) sequences (in this order): the graph
+        reads the sequences only through its slot, block-table, rope-delta and length buffers, so the
+        kernels and their arguments are those a capture for `seqs` would record."""
+        if len(seqs) != len(self.seqs):
+            raise ValueError("rebind needs the same number of sequences")
+        d, dev = self.dec, self.dec.device
+        self.seqs = list(seqs)
+        idx = torch.tensor(seqs, device=dev)
+        self.bt.copy_(d.block_table[idx])
+        self.delta.copy_(torch.tensor([d.rope_delta[s] for s in seqs], dtype=torch.int32), non_blocking=True)
+        self.lens.copy_(torch.tensor([d.length[s] for s in seqs], dtype=torch.int32), non_blocking=True)
+        self.slot.copy_(torch.tensor([s + 1 for s in seqs], dtype=torch.int32), non_blocking=True)
+
     def __call__(self, tokens: torch.Tensor):
         """Run the step on tokens [B * T] at the sequences' current lengths (and pending replays).
         Returns (hidden [B * T, 2560], next tokens [B * T]); the outputs are the graph's buffers."""
@@ -635,6 +649,12 @@ class SpecGraph:
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph), torch.no_grad():
             self.drafts = run()
+
+    def rebind(self, seqs: list[int]):
+        """As GraphStep.rebind, for both graphs (the draft graph shares the verify graph's rope-delta
+        and block-table buffers; its other inputs are written by every step)."""
+        self.verify.rebind(seqs)
+        self.seqs = list(seqs)
 
     @torch.no_grad()
     def step(self, last: torch.Tensor, drafts: torch.Tensor):
