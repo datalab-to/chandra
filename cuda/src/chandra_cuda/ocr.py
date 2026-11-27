@@ -7,6 +7,12 @@ slot at an end token or after max_output_tokens; free slots are refilled from th
 Graphs are captured once per number of decoding pages and re-pointed at the current pages when the
 set changes.
 
+With overlap (the default where the driver can split a GPU's SMs, see partition.py), a worker thread
+runs the vision tower and the prefill of the next pages on most of the SMs while the decode steps of
+the current pages run on the rest; a page joins the decoding set when its prefill is done. Each
+page's tokens are the same as without overlap (the engine's kernels do not depend on the batch,
+its plans not on the SM count).
+
     gen = CudaGenerator()
     results = gen.generate(batch)        # chandra.model.schema.GenerationResult per page
 """
@@ -15,7 +21,11 @@ from __future__ import annotations
 
 import glob
 import os
+import queue
+import threading
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
@@ -28,6 +38,7 @@ REPEAT_CHECK_EVERY = 8
 REPEAT_STOP_AFTER = 4
 REPEAT_TAIL_CHARS = 2048
 REPEAT_TAIL_TOKENS = 768
+VISION_LOOKAHEAD = 2  # pages the overlap worker runs through the vision tower before a slot is free
 
 
 def _flat(x):
@@ -44,7 +55,10 @@ class CudaGenerator:
     def __init__(self, checkpoint: str | None = None, slots: int = 16, weights: str = "fp8", kv: str = "int8",
                  state: str = "fp16", lm_head: str = "exact", mtp: bool = True, mtp_weights: str = "fp8",
                  draft_vocab: int = 32768, max_output_tokens: int | None = None, stop_on_repeat: bool = True,
-                 fused_vision: bool = True):
+                 fused_vision: bool = True, overlap: bool = True, decode_sms: int | None = None):
+        """overlap: run vision and prefill beside the decode steps on separate SMs (when the driver
+        supports green contexts); decode_sms: the decode steps' share while a prefill runs (default
+        about a fifth of the GPU)."""
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
         from chandra.settings import settings
@@ -80,6 +94,14 @@ class CudaGenerator:
         self._graphs: dict[int, object] = {}  # number of decoding pages -> captured graph(s)
         self.graph_captures = 0
         self.stats: dict[str, float] = {}  # host seconds per phase of the last generate()
+        self.overlap_parts = None
+        if overlap:
+            from .partition import sm_partitions
+
+            sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+            self.overlap_parts = sm_partitions(torch.device("cuda", torch.cuda.current_device()),
+                                               decode_sms or max(4, 2 * round(sms / 10)))
+        self._shadows = self.dec.prefill_shadows() if self.overlap_parts else None
 
     def _graph_for(self, seqs: list[int]):
         g = self._graphs.get(len(seqs))
@@ -102,8 +124,9 @@ class CudaGenerator:
                                                   add_generation_prompt=True, return_dict=True, return_tensors="pt")
 
     @torch.no_grad()
-    def _prefill(self, slot: int, inputs):
-        """A prepared page into a slot. Returns (first token, final-norm hidden state at the last position)."""
+    def _vision(self, inputs):
+        """A prepared page through the vision tower -> (input ids, prompt embeddings, (t, h, w) positions,
+        rope delta)."""
         ids = inputs["input_ids"].to("cuda")
         n = ids.shape[1]
         if n > PAGE_TOKENS_MAX:
@@ -116,11 +139,23 @@ class CudaGenerator:
         pos, delta = self.hf.model.get_rope_index(inputs["input_ids"], inputs["mm_token_type_ids"],
                                                   inputs["image_grid_thw"], None, inputs["attention_mask"])
         pos3 = pos[:, 0].transpose(0, 1).contiguous().to("cuda")
-        hidden, first = self.dec.prefill(slot, emb, pos3, int(delta[0]))
+        return ids, emb, pos3, int(delta[0])
+
+    @torch.no_grad()
+    def _lm_prefill(self, slot: int, ids, emb, pos3, delta: int, shadows: dict | None = None):
+        """The language model's prefill (and the MTP layer's) of a page into a slot. Returns (first token,
+        final-norm hidden state at the last position)."""
+        sh = shadows or {}
+        hidden, first = self.dec.prefill(slot, emb, pos3, delta, head=sh.get("lm_head"))
         if self.mtp:
+            n = ids.shape[1]
             nxt = torch.cat([ids[0, 1:], first.view(1)])
-            self.dec.mtp_prefill(slot, nxt[: n - 1], hidden[: n - 1], pos3[: n - 1])
+            self.dec.mtp_prefill(slot, nxt[: n - 1], hidden[: n - 1], pos3[: n - 1], shadows=shadows)
         return int(first), hidden[-1].clone()
+
+    def _prefill(self, slot: int, inputs):
+        """A prepared page into a slot (vision, then prefill). Returns (first token, last hidden state)."""
+        return self._lm_prefill(slot, *self._vision(inputs))
 
     @torch.no_grad()
     def generate(self, batch, max_output_tokens: int | None = None, on_result=None, prefetch: int | None = None,
@@ -130,34 +165,27 @@ class CudaGenerator:
         `cpu_workers` threads (default one: PDF renderers such as pdfium are not thread-safe), up to
         `prefetch` pages (default: the slot count). on_result(index, result), if given, is called as each
         page finishes (and the results are not kept)."""
-        from collections import deque
-        from concurrent.futures import ThreadPoolExecutor
-
         from chandra.model.schema import GenerationResult
         from chandra.model.util import detect_repeat_token
 
         max_new = max_output_tokens or self.max_output_tokens
         tok = self.processor.tokenizer
+        d = self.dec
+        parts = getattr(self, "overlap_parts", None)
+        clock = time.perf_counter
+        st = self.stats = {"wait_cpu": 0.0, "prefill": 0.0, "graph": 0.0, "step": 0.0, "host": 0.0}
         hits: dict[int, int] = {}
+        out: dict[int, list[int]] = {}
+        ended: dict[int, bool] = {}
+        results_kept: dict[int, object] = {}
+        slot_of: dict[int, int] = {}  # item -> slot, for pages still decoding
+        last: dict[int, int] = {}
+        drafts: dict[int, torch.Tensor] = {}
 
         def looping(it) -> bool:  # True once the page has repeated on REPEAT_STOP_AFTER checks in a row
             text = tok.decode(out[it][-REPEAT_TAIL_TOKENS:], skip_special_tokens=True)
             hits[it] = hits.get(it, 0) + 1 if detect_repeat_token(text[-REPEAT_TAIL_CHARS:]) else 0
             return hits[it] >= REPEAT_STOP_AFTER
-        d = self.dec
-        source = enumerate(iter(batch))
-        pool = ThreadPoolExecutor(cpu_workers)
-        queue = deque()  # (index, future of the prepared inputs)
-        depth = prefetch or self.slots
-
-        def top_up():
-            while len(queue) < depth:
-                nxt = next(source, None)
-                if nxt is None:
-                    return
-                queue.append((nxt[0], pool.submit(self._prepare, nxt[1])))
-
-        results_kept: dict[int, object] = {}
 
         def finish(it):
             ids = [t for t in out.pop(it) if t not in self.eos]
@@ -170,81 +198,192 @@ class CudaGenerator:
             else:
                 results_kept[it] = r
 
-        ended: dict[int, bool] = {}
-        st = self.stats = {"wait_cpu": 0.0, "prefill": 0.0, "graph": 0.0, "step": 0.0, "host": 0.0}
-        clock = time.perf_counter
-        top_up()
-        out: dict[int, list[int]] = {}
-        slot_of: dict[int, int] = {}  # item -> slot, for pages still decoding
-        free = list(range(self.slots))
-        last: dict[int, int] = {}
-        drafts: dict[int, torch.Tensor] = {}
+        source = enumerate(iter(batch))
+        pool = ThreadPoolExecutor(cpu_workers)
+        pending = deque()  # (index, future of the prepared inputs)
+        depth = prefetch or self.slots
+
+        def top_up():
+            while len(pending) < depth:
+                nxt = next(source, None)
+                if nxt is None:
+                    return
+                pending.append((nxt[0], pool.submit(self._prepare, nxt[1])))
+
+        free = list(range(self.slots))  # without overlap: free slots
+        free_q: queue.Queue = queue.Queue()  # with overlap: free slots for the worker (None stops it)
+        ready: queue.Queue = queue.Queue()  # with overlap: prefilled pages, then None (or an exception)
+        release = free_q.put if parts else free.append
+        full = torch.cuda.current_stream()
+        cur = full
+        worker = None
+        worker_done = parts is None
+        stop_worker = threading.Event()
+
+        def admit(it, s, first) -> bool:
+            out[it] = [first]
+            if first in self.eos or max_new <= 1:
+                ended[it] = first in self.eos
+                release(s)
+                finish(it)
+                return False
+            slot_of[it], last[it] = s, first
+            return True
+
+        if parts:
+            (_, dstream), (_, wstream) = parts
+            for b in range(1, self.slots + 1):  # every graph before the worker runs (no capture beside it)
+                if b not in self._graphs:
+                    self._graph_for(list(range(b)))
+            for k in ("w_vision_prefill", "w_wait_slot", "w_wait_cpu", "wait_prefill"):
+                st[k] = 0.0
+            for s in free:
+                free_q.put(s)
+            dev = torch.cuda.current_device()
+
+            def work():
+                try:
+                    torch.cuda.set_device(dev)
+                    wstream.wait_stream(full)
+                    seen = deque()  # (index, vision outputs) waiting for a slot
+                    with torch.no_grad(), torch.cuda.stream(wstream):
+                        top_up()
+                        while not stop_worker.is_set():
+                            s = None
+                            if seen:
+                                try:
+                                    s = free_q.get_nowait()
+                                except queue.Empty:
+                                    pass
+                            if s is None and pending and len(seen) < VISION_LOOKAHEAD:
+                                it, fut = pending.popleft()
+                                top_up()
+                                t0 = clock()
+                                inputs = fut.result()
+                                t1 = clock()
+                                seen.append((it, self._vision(inputs)))
+                                st["w_wait_cpu"] += t1 - t0
+                                st["w_vision_prefill"] += clock() - t1
+                                continue
+                            if not seen:
+                                break
+                            if s is None:
+                                t0 = clock()
+                                s = free_q.get()
+                                st["w_wait_slot"] += clock() - t0
+                                if s is None:
+                                    break
+                            it, v = seen.popleft()
+                            t0 = clock()
+                            first, h = self._lm_prefill(s, *v, shadows=self._shadows)
+                            ev = torch.cuda.Event()
+                            ev.record(wstream)
+                            st["w_vision_prefill"] += clock() - t0
+                            ready.put((it, s, first, h, ev))
+                    ready.put(None)
+                except BaseException as e:  # handed to the main thread
+                    ready.put(e)
+
+            worker = threading.Thread(target=work, name="chandra-prefill", daemon=True)
+            worker.start()
+
         graph, members = None, []
-        while queue or slot_of:
-            top_up()
-            if queue and free:  # admit pages into every free slot
-                new = []
-                while queue and free:
-                    (it, fut), s = queue.popleft(), free.pop(0)
-                    t0 = clock()
-                    prepared = fut.result()
-                    t1 = clock()
-                    first, h = self._prefill(s, prepared)  # ends with a sync (the first token)
-                    st["wait_cpu"] += t1 - t0
-                    st["prefill"] += clock() - t1
-                    top_up()
-                    out[it] = [first]
-                    if first in self.eos or max_new <= 1:
-                        ended[it] = first in self.eos
-                        free.append(s)
-                        finish(it)
-                        continue
-                    slot_of[it], last[it] = s, first
-                    new.append((it, h))
-                if self.mtp and new:
-                    t0 = clock()
-                    dr = d.first_drafts(torch.tensor([last[it] for it, _ in new], device="cuda"),
-                                        torch.stack([h for _, h in new]), [slot_of[it] for it, _ in new])
-                    for j, (it, _) in enumerate(new):
-                        drafts[it] = dr[j].clone()
-                    st["prefill"] += clock() - t0
-                graph = None
-            if not slot_of:
-                continue
-            if graph is None:  # a new set of pages: the graphs for that many, re-pointed at them
-                t0 = clock()
-                members = sorted(slot_of, key=lambda it: slot_of[it])
-                graph = self._graph_for([slot_of[it] for it in members])
-                st["graph"] += clock() - t0
-            t0 = clock()
-            if self.mtp:
-                emit, nlast, ndrafts = graph.step(torch.tensor([last[it] for it in members], device="cuda"),
-                                                  torch.stack([drafts[it] for it in members]))
-                for j, (it, t) in enumerate(zip(members, nlast.tolist())):
-                    last[it] = t
-                    drafts[it] = ndrafts[j].clone()
-            else:
-                _, nxt = graph(torch.tensor([last[it] for it in members], device="cuda"))
-                for it in members:
-                    d.length[slot_of[it]] += 1
-                toks = nxt.tolist()
-                emit = [[t] for t in toks]
-                for it, t in zip(members, toks):
-                    last[it] = t
-            t1 = clock()
-            st["step"] += t1 - t0
-            for j, it in enumerate(members):
-                for t in emit[j]:
-                    out[it].append(t)
-                    stop = t in self.eos or len(out[it]) >= max_new
-                    if not stop and self.stop_on_repeat and len(out[it]) % REPEAT_CHECK_EVERY == 0:
-                        stop = looping(it)
-                    if stop:
-                        ended[it] = t in self.eos
-                        free.append(slot_of.pop(it))
+        try:
+            while True:
+                want = dstream if parts and not worker_done else full
+                if want is not cur:  # decode on its partition while the worker runs, on the whole GPU after
+                    want.wait_stream(cur)
+                    cur = want
+                with torch.cuda.stream(cur):
+                    new = []
+                    if parts:
+                        block = not slot_of
+                        t0 = clock()
+                        while not worker_done:
+                            try:
+                                r = ready.get(block=block)
+                            except queue.Empty:
+                                break
+                            block = False
+                            if r is None:
+                                worker_done = True
+                            elif isinstance(r, BaseException):
+                                raise r
+                            else:
+                                it, s, first, h, ev = r
+                                cur.wait_event(ev)
+                                h.record_stream(cur)
+                                if admit(it, s, first):
+                                    new.append((it, h))
+                        st["wait_prefill"] += clock() - t0
+                        if worker_done and not slot_of and not new:
+                            break
+                    else:
+                        top_up()
+                        if not pending and not slot_of:
+                            break
+                        while pending and free:  # admit pages into every free slot
+                            (it, fut), s = pending.popleft(), free.pop(0)
+                            t0 = clock()
+                            prepared = fut.result()
+                            t1 = clock()
+                            first, h = self._prefill(s, prepared)  # ends with a sync (the first token)
+                            st["wait_cpu"] += t1 - t0
+                            st["prefill"] += clock() - t1
+                            top_up()
+                            if admit(it, s, first):
+                                new.append((it, h))
+                    if new:
+                        if self.mtp:
+                            t0 = clock()
+                            dr = d.first_drafts(torch.tensor([last[it] for it, _ in new], device="cuda"),
+                                                torch.stack([h for _, h in new]), [slot_of[it] for it, _ in new])
+                            for j, (it, _) in enumerate(new):
+                                drafts[it] = dr[j].clone()
+                            st["prefill"] += clock() - t0
                         graph = None
-                        finish(it)
-                        break
-            st["host"] += clock() - t1
-        pool.shutdown()
+                    if not slot_of:
+                        continue
+                    if graph is None:  # a new set of pages: the graphs for that many, re-pointed at them
+                        t0 = clock()
+                        members = sorted(slot_of, key=lambda it: slot_of[it])
+                        graph = self._graph_for([slot_of[it] for it in members])
+                        st["graph"] += clock() - t0
+                    t0 = clock()
+                    if self.mtp:
+                        emit, nlast, ndrafts = graph.step(torch.tensor([last[it] for it in members], device="cuda"),
+                                                          torch.stack([drafts[it] for it in members]))
+                        for j, (it, t) in enumerate(zip(members, nlast.tolist())):
+                            last[it] = t
+                            drafts[it] = ndrafts[j].clone()
+                    else:
+                        _, nxt = graph(torch.tensor([last[it] for it in members], device="cuda"))
+                        for it in members:
+                            d.length[slot_of[it]] += 1
+                        toks = nxt.tolist()
+                        emit = [[t] for t in toks]
+                        for it, t in zip(members, toks):
+                            last[it] = t
+                    t1 = clock()
+                    st["step"] += t1 - t0
+                    for j, it in enumerate(members):
+                        for t in emit[j]:
+                            out[it].append(t)
+                            stop = t in self.eos or len(out[it]) >= max_new
+                            if not stop and self.stop_on_repeat and len(out[it]) % REPEAT_CHECK_EVERY == 0:
+                                stop = looping(it)
+                            if stop:
+                                ended[it] = t in self.eos
+                                release(slot_of.pop(it))
+                                graph = None
+                                finish(it)
+                                break
+                    st["host"] += clock() - t1
+        finally:
+            if worker is not None:
+                stop_worker.set()
+                free_q.put(None)
+                worker.join()
+            full.wait_stream(cur)
+            pool.shutdown()
         return [results_kept[i] for i in sorted(results_kept)] if on_result is None else None

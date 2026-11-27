@@ -29,10 +29,13 @@ def main():
     ap.add_argument("--state", default="fp16")
     ap.add_argument("--no-mtp", action="store_true")
     ap.add_argument("--max-tokens", type=int, default=None)
+    ap.add_argument("--no-overlap", action="store_true", help="prefill and decode in turn on the whole GPU")
+    ap.add_argument("--decode-sms", type=int, default=None, help="the decode steps' SMs while a prefill runs")
     a = ap.parse_args()
     man = json.load(open(os.path.join(a.sample_dir, "manifest.json")))[: a.pages]
     items = [BatchInputItem(image=Image.open(os.path.join(a.sample_dir, m["png"])).convert("RGB")) for m in man]
     gen = CudaGenerator(slots=a.slots, weights=a.weights, kv=a.kv, state=a.state, mtp=not a.no_mtp,
+                        overlap=not a.no_overlap, decode_sms=a.decode_sms,
                         max_output_tokens=a.max_tokens)
     t0 = time.perf_counter()
     res = gen.generate(items)
@@ -50,6 +53,8 @@ def main():
         same += md.strip() == ref.strip()
     print(f"{len(items)} pages in {dt:.1f} s ({len(items) / dt:.3f} pages/s, {toks / dt:.0f} tokens/s incl. prefill "
           f"and vision); weights {a.weights}, KV {a.kv}, state {a.state}, MTP {not a.no_mtp}, {a.slots} slots")
+    parts = getattr(gen, "overlap_parts", None)
+    print("overlap: " + (f"decode on {parts[0][0]} SMs while prefill runs on {parts[1][0]}" if parts else "off"))
     print(f"graph captures: {getattr(gen, 'graph_captures', 'n/a')}; host seconds by phase: "
           + ", ".join(f"{k} {v:.1f}" for k, v in getattr(gen, "stats", {}).items()))
     if sims:

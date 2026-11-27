@@ -208,12 +208,34 @@ class Decoder:
         self.pending[seq] = 0
 
     @torch.no_grad()
-    def prefill(self, seq: int, embeds: torch.Tensor, pos3: torch.Tensor, rope_delta: int):
+    def prefill_shadows(self) -> dict:
+        """Copies of the decode-kernel objects that prefill and mtp_prefill call (the LM head's pick of the
+        first token; the MTP layer's fc and qkv) with their own scratch buffers (split workspaces, ticket
+        counters, bound tiles) and the same weights, so a prefill can run on another stream while decode
+        graphs that use the originals run."""
+        import copy
+
+        def own(obj):
+            c = copy.copy(obj)
+            for name in ("workspace", "counters", "tile_ub"):
+                buf = getattr(obj, name, None)
+                if isinstance(buf, torch.Tensor):
+                    setattr(c, name, torch.zeros_like(buf))
+            return c
+
+        sh = {"lm_head": own(self.lm_head)}
+        if self.mtp is not None:
+            sh["fc"], sh["qkv"] = own(self.mtp["fc"]), own(self.mtp["qkv"])
+        return sh
+
+    def prefill(self, seq: int, embeds: torch.Tensor, pos3: torch.Tensor, rope_delta: int, head=None):
         """Run a prompt through the language model into sequence seq's caches (its KV pages, DeltaNet
         state and conv ring), as transformers' prefill does: embeds [n, 2560] BF16 (text embeddings
         with the image features in place), pos3 [n, 3] int32 (t, h, w) positions, rope_delta for the
         positions after the prompt. GEMMs run in cuBLAS on each layer's weight unpacked for the
         call (BF16 or FP8 layers, the same weights as the decode kernels); the DeltaNet layers use vLLM's chunked FLA kernel, attention FA2.
+        head: the LM head object for the first token (default the decoder's; prefill_shadows gives one
+        that is safe beside running decode graphs).
         Returns (final-norm hidden states [n, 2560], the greedy next token)."""
         import torch.nn.functional as F
 
@@ -284,7 +306,7 @@ class Decoder:
         self.length[seq] = n
         self.rope_delta[seq] = int(rope_delta)
         self.pending[seq] = 0
-        return hidden, _rows(self.lm_head, hidden[-1:])[0]
+        return hidden, _rows(head or self.lm_head, hidden[-1:])[0]
 
     def _positions(self, seqs, start, T):
         """Per-row tensors for T tokens of each sequence from position start[n]."""
@@ -385,24 +407,27 @@ class Decoder:
 
     # ---- the MTP draft layer ----------------------------------------------------------------
 
-    def _mtp_input(self, tokens, hidden):
+    def _mtp_input(self, tokens, hidden, fc=None):
         M = self.mtp
         en, _ = rmsnorm_add(self.embed[tokens.to(self.device)], M["w_emb"])
         hn, _ = rmsnorm_add(hidden.contiguous(), M["w_hid"])
-        return _rows(M["fc"], torch.cat([en, hn], dim=1))
+        return _rows(fc or M["fc"], torch.cat([en, hn], dim=1))
 
     @torch.no_grad()
-    def mtp_prefill(self, seq: int, next_tokens: torch.Tensor, hidden: torch.Tensor, pos3: torch.Tensor):
+    def mtp_prefill(self, seq: int, next_tokens: torch.Tensor, hidden: torch.Tensor, pos3: torch.Tensor,
+                    shadows: dict | None = None):
         """The MTP layer's KV over a prompt: row i = (token i + 1, the main model's final-norm hidden
-        state at position i, its (t, h, w) position). Rows 0 .. n - 2 of an n-token prompt."""
+        state at position i, its (t, h, w) position). Rows 0 .. n - 2 of an n-token prompt.
+        shadows: prefill_shadows() (to run beside decode graphs)."""
+        sh = shadows or {}
         M = self.mtp
         dev = self.device
         n = next_tokens.shape[0]
         for i in range(0, n, 1024):
             j = min(n, i + 1024)
-            x = self._mtp_input(next_tokens[i:j], hidden[i:j])
+            x = self._mtp_input(next_tokens[i:j], hidden[i:j], sh.get("fc"))
             xn, _ = rmsnorm_add(x, M["w_in"])
-            qkv = _rows(M["qkv"], xn)
+            qkv = _rows(sh.get("qkv") or M["qkv"], xn)
             pos = torch.arange(i, j, dtype=torch.int64, device=dev)
             page = self.block_table[seq, pos // PAGE].contiguous()
             in_page = (pos % PAGE).to(torch.int32)
