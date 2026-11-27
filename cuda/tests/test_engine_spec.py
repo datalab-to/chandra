@@ -266,3 +266,48 @@ def test_prefill_equals_step_by_step_decoding(ckpt):
                 ca, cb = La[c][:npg].float(), Lb[c][:npg].float()
                 assert ((ca - cb).norm() / ca.norm()).item() < 3e-2, c
 
+
+
+def test_cuda_generator_scheduler_matches_single_page_decoding(ckpt):
+    """CudaGenerator's continuous batching (pages join and leave, graphs recaptured, MTP steps) gives
+    each page the tokens of decoding it alone, on the random checkpoint (FP32 state: bit-exact)."""
+    pytest.importorskip("vllm")
+    import types
+
+    from chandra_cuda.ocr import CudaGenerator
+
+    torch.manual_seed(31)
+    pages = [torch.randint(0, VOCAB, (int(n),), device="cuda") for n in (90, 130, 70, 110, 100)]
+    max_new = 24
+
+    class Tok:
+        def decode(self, ids, **kw):
+            return " ".join(map(str, ids))
+
+    gen = object.__new__(CudaGenerator)
+    gen.dec = Decoder(ckpt, max_seqs=2, max_ctx=512, mtp=True, draft_tokens=3)
+    gen.processor = types.SimpleNamespace(tokenizer=Tok())
+    gen.eos, gen.mtp, gen.slots, gen.stop_on_repeat, gen.max_output_tokens = set(), True, 2, False, max_new
+
+    def prefill(slot, item):
+        n = item.shape[0]
+        pos3 = torch.arange(n, dtype=torch.int32, device="cuda")[:, None].expand(n, 3).contiguous()
+        hidden, first = gen.dec.prefill(slot, gen.dec.embed[item], pos3, 0)
+        nxt = torch.cat([item[1:], first.view(1)])
+        gen.dec.mtp_prefill(slot, nxt[: n - 1], hidden[: n - 1], pos3[: n - 1])
+        return int(first), hidden[-1].clone()
+
+    gen._prefill = prefill
+    res = gen.generate(pages, max_output_tokens=max_new)
+    alone = Decoder(ckpt, max_seqs=1, max_ctx=512)
+    for p, r in zip(pages, res):
+        n = p.shape[0]
+        pos3 = torch.arange(n, dtype=torch.int32, device="cuda")[:, None].expand(n, 3).contiguous()
+        _, first = alone.prefill(0, alone.embed[p], pos3, 0)
+        ref = [int(first)]
+        nxt = first.view(1)
+        while len(ref) < max_new:
+            nxt = alone.step(nxt, [0])
+            ref.append(int(nxt))
+        assert r.raw == " ".join(map(str, ref)), (r.raw[:80], ref[:10])
+        assert r.token_count == max_new
