@@ -96,10 +96,18 @@ NB_MODULE(_core, m) {
                                               reinterpret_cast<cudaStream_t>(stream)));
       });
   m.def("set_decode_gemm_plan", &chandra::set_decode_gemm_plan, nb::arg("N"), nb::arg("K"), nb::arg("rw"),
-        nb::arg("splits"));
+        nb::arg("splits"), nb::arg("fmt") = -1);
+  m.def(
+      "decode_gemm_plan_fmt",
+      [](int N, int K, int sms, int fmt) {
+        const chandra::DecodeGemmPlan p = chandra::decode_gemm_plan_fmt(N, K, sms, fmt);
+        return nb::make_tuple(p.row_groups, p.splits);
+      },
+      nb::arg("N"), nb::arg("K"), nb::arg("sms"), nb::arg("fmt"));
   m.def("decode_gemm_workspace_bytes", &chandra::decode_gemm_workspace_bytes, nb::arg("N"), nb::arg("K"),
-        nb::arg("sms"));
-  m.def("decode_gemm_counters", &chandra::decode_gemm_counters, nb::arg("N"), nb::arg("K"), nb::arg("sms"));
+        nb::arg("sms"), nb::arg("fmt") = 0);
+  m.def("decode_gemm_counters", &chandra::decode_gemm_counters, nb::arg("N"), nb::arg("K"), nb::arg("sms"),
+        nb::arg("fmt") = 0);
 
   m.def(
       "attn_decode",

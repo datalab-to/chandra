@@ -11,7 +11,7 @@ import torch
 from . import _core
 
 __all__ = ["pack_weight", "pack_weight_fp8", "DecodeLinear", "DecodeLinearFP8", "DecodeLinearFP4", "DecodeLinearINT4", "mxfp4_quantize", "int4_g128_quantize",
-           "pack_weight_fp4", "pack_weight_i8", "interleave_gate_up", "LMHead", "LMHeadFP8", "LMHeadExact", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul",
+           "pack_weight_fp4", "pack_weight_i8", "interleave_gate_up", "autotune_plans", "LMHead", "LMHeadFP8", "LMHeadExact", "attn_decode", "gdn_decode", "rmsnorm_add", "silu_mul",
            "qk_norm_rope_kv", "vit_attn"]
 
 
@@ -218,12 +218,18 @@ class DecodeLinear:
         self.n_out = self.n // 2 if self.epilogue else self.n
         self._prep = None if _pack else weight  # for the quantized subclasses
         self.packed = pack_weight(weight) if _pack else None
-        ws = _core.decode_gemm_workspace_bytes(self.n, self.k, self.sms)
+        self._replan()
+
+    FMT = 0  # the plan registry's key for this weight format
+
+    def _replan(self):
+        """Size the workspace and counters for the current plan of (N, K, format)."""
+        ws = _core.decode_gemm_workspace_bytes(self.n, self.k, self.sms, self.FMT)
         self.workspace = torch.empty(max(ws // 4, 1), dtype=torch.float32, device=self.device)
         self.counters = torch.zeros(
-            _core.decode_gemm_counters(self.n, self.k, self.sms), dtype=torch.int32, device=self.device
+            _core.decode_gemm_counters(self.n, self.k, self.sms, self.FMT), dtype=torch.int32, device=self.device
         )
-        self.plan = _core.decode_gemm_plan(self.n, self.k, self.sms)
+        self.plan = _core.decode_gemm_plan_fmt(self.n, self.k, self.sms, self.FMT)
 
     def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != self.k:
@@ -353,6 +359,8 @@ def pack_weight_fp8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 class DecodeLinearFP8(DecodeLinear):
     """DecodeLinear with FP8 e4m3 weights (per-row scales): half the weight bytes per step.
     Approximate (class G): y = x @ (scale[:, None] * fp8(weight / scale[:, None])).T."""
+
+    FMT = 1
 
     def __init__(self, weight: torch.Tensor, epilogue: str | None = None):
         if weight.shape[0] % 32:
@@ -523,6 +531,8 @@ class DecodeLinearFP4(DecodeLinear):
     online `mxfp4`): 4.25 bits per weight, a quarter of BF16's bytes. Approximate (class G):
     y = x @ mxfp4_dequantize(mxfp4_quantize(weight)).T. N must be a multiple of 64."""
 
+    FMT = 2
+
     def __init__(self, weight: torch.Tensor, keep_codes: bool = False, epilogue: str | None = None):
         if weight.shape[0] % 64:
             raise ValueError("N must be a multiple of 64")
@@ -676,6 +686,8 @@ class DecodeLinearINT4(DecodeLinear):
     make_ct_checkpoint.py --scheme w4a16): 4.125 bits per weight. Approximate (class G):
     y = x @ bf16(q * s).T. N must be a multiple of 64."""
 
+    FMT = 3
+
     def __init__(self, weight: torch.Tensor, keep_codes: bool = False, epilogue: str | None = None):
         if weight.shape[0] % 64:
             raise ValueError("N must be a multiple of 64")
@@ -703,4 +715,72 @@ class DecodeLinearINT4(DecodeLinear):
                                self.workspace.data_ptr(), self.counters.data_ptr(), m, self.n, self.k, self.sms,
                                torch.cuda.current_stream(self.device).cuda_stream, self.epilogue)
         return out
+
+
+def _plan_cache_path() -> str:
+    import os
+
+    d = os.environ.get("CHANDRA_CUDA_CACHE", os.path.join(os.path.expanduser("~"), ".cache", "chandra_cuda"))
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "decode_gemm_plans.json")
+
+
+def autotune_plans(layers, rows=(1, 16, 64), reps=20, cache: bool = True) -> dict:
+    """Choose each decode GEMM's plan (rows per CTA, K splits) by timing a fixed candidate set on
+    this GPU, once per (GPU, N, K, weight format), and register it before use. The plan depends
+    only on the shape, the format and the GPU, never on M, so results stay batch-invariant; the
+    choice is cached (CHANDRA_CUDA_CACHE, default ~/.cache/chandra_cuda) so later runs reuse it.
+    layers: DecodeLinear objects (any format). Returns {(N, K, fmt): (rw, splits)}."""
+    import json
+
+    path = _plan_cache_path()
+    table = {}
+    if cache:
+        try:
+            table = json.load(open(path))
+        except (OSError, ValueError):
+            table = {}
+    chosen = {}
+    for lin in layers:
+        dev = lin.device
+        prop = torch.cuda.get_device_properties(dev)
+        key = f"{prop.name}|{lin.sms}|{lin.n}|{lin.k}|{lin.FMT}"
+        if (lin.n, lin.k, lin.FMT) in chosen:
+            lin._replan()
+            continue
+        if key not in table:
+            chunks = lin.k // 128
+            cands = [(rw, s) for rw in (8, 4) if lin.n % (16 * rw) == 0 and not (lin.FMT == 2 and rw < 4)
+                     for s in (1, 2, 3, 4, 6, 8) if chunks % s == 0 and (lin.n // (16 * rw)) * s <= 4 * lin.sms]
+            xs = {m: torch.randn(m, lin.k, device=dev).to(torch.bfloat16) for m in rows}
+            out = {m: torch.empty(m, lin.n_out, device=dev, dtype=torch.bfloat16) for m in rows}
+            times = {}
+            for rw, s in cands:
+                _core.set_decode_gemm_plan(lin.n, lin.k, rw, s, lin.FMT)
+                lin._replan()
+                tot = 0.0
+                for m in rows:
+                    for _ in range(3):
+                        lin(xs[m], out[m])
+                    torch.cuda.synchronize(dev)
+                    a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    a.record()
+                    for _ in range(reps):
+                        lin(xs[m], out[m])
+                    b.record()
+                    torch.cuda.synchronize(dev)
+                    tot += a.elapsed_time(b) / reps
+                times[(rw, s)] = tot
+            best = min(times, key=lambda c: (times[c], c))  # ties: the smaller plan tuple
+            table[key] = list(best)
+        rw, s = table[key]
+        _core.set_decode_gemm_plan(lin.n, lin.k, rw, s, lin.FMT)
+        lin._replan()
+        chosen[(lin.n, lin.k, lin.FMT)] = (rw, s)
+    if cache:
+        try:
+            json.dump(table, open(path, "w"), indent=1, sort_keys=True)
+        except OSError:
+            pass
+    return chosen
 

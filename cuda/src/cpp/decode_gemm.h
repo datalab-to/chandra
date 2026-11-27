@@ -16,12 +16,15 @@ struct DecodeGemmPlan {
                    // stream-K with -splits CTAs sharing all (tile, K chunk) units equally
 };
 DecodeGemmPlan decode_gemm_plan(int N, int K, int sms);
-// For measurements: force the plan of (N, K) (rw <= 0 removes the override). Not thread-safe.
-void set_decode_gemm_plan(int N, int K, int rw, int splits);
+// The plan for one weight format (0 BF16, 1 FP8, 2 MXFP4, 3 INT4): a registered one, else the rule.
+DecodeGemmPlan decode_gemm_plan_fmt(int N, int K, int sms, int fmt);
+// Register the plan of (N, K, fmt) (fmt -1: every format without its own; rw <= 0 removes it).
+// The autotuner and measurements use it. Not thread-safe; set before building the layer.
+void set_decode_gemm_plan(int N, int K, int rw, int splits, int fmt = -1);
 
 // Bytes of FP32 workspace and number of uint32 counters `decode_gemm` needs.
-size_t decode_gemm_workspace_bytes(int N, int K, int sms);
-int decode_gemm_counters(int N, int K, int sms);
+size_t decode_gemm_workspace_bytes(int N, int K, int sms, int fmt = 0);
+int decode_gemm_counters(int N, int K, int sms, int fmt = 0);
 
 // x: [M][K] BF16 row-major. wp: W packed by `pack_weight` (see the Python side). epilogue 0:
 // y = x W^T; 1: W's rows are interleave_gate_up(gate; up) and y = silu(gate) * up, [M][N / 2].

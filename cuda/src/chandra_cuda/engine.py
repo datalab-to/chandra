@@ -51,7 +51,7 @@ class Decoder:
     def __init__(self, ckpt_dir: str, device: str = "cuda", max_seqs: int = 8, max_ctx: int = 18432,
                  state_dtype: torch.dtype = torch.float32, mtp: bool = False, draft_tokens: int = 3,
                  weights: str = "bf16", lm_head: str = "bf16", kv: str = "bf16", attn_split_keys: int | None = 1024,
-                 mtp_weights: str = "bf16"):
+                 mtp_weights: str = "bf16", autotune: bool = True):
         """weights: the format of the decoder layers' linear weights (bf16; fp8, mxfp4, int4 are
         approximate, class G). lm_head: "bf16", or "exact" (INT8 pass + BF16 re-check, the same picks).
         mtp_weights: the MTP layer's GEMM format (drafts are verified, so any format changes only how
@@ -136,6 +136,12 @@ class Decoder:
                 w_norm=g("mtp.norm.weight"),
             )
         torch.cuda.empty_cache()
+        if autotune:  # each decode GEMM's plan, once per GPU and shape (cached on disk)
+            from . import autotune_plans
+
+            lins = [v for L in self.layers + ([self.mtp] if self.mtp else []) for v in L.values()
+                    if isinstance(v, DecodeLinear)]
+            self.plans = autotune_plans(lins)
 
         # Caches. Sequence s owns pages [s * pps, (s + 1) * pps) and state / ring slot s + 1.
         dev = self.device

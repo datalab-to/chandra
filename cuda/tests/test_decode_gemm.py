@@ -266,3 +266,23 @@ def test_stream_k_plan(fmt, n, k, ctas):
     finally:
         chandra_cuda._core.set_decode_gemm_plan(n, k, 0, 0)
 
+
+def test_autotuned_plan_is_batch_invariant(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHANDRA_CUDA_CACHE", str(tmp_path))
+    torch.manual_seed(15)
+    w = (torch.randn(2560, 4096, device="cuda") * 0.02).to(torch.bfloat16)
+    lin = chandra_cuda.DecodeLinear(w)
+    try:
+        chosen = chandra_cuda.autotune_plans([lin], reps=3)
+        assert (2560, 4096, 0) in chosen and (tmp_path / "decode_gemm_plans.json").exists()
+        x = torch.randn(64, 4096, device="cuda").to(torch.bfloat16)
+        full = lin(x)
+        for m in (1, 17, 40):
+            assert torch.equal(lin(x[:m]), full[:m])
+        ref = x.float() @ w.float().T
+        assert (full.float() - ref).abs().max().item() <= ref.abs().max().item() * 2**-7 + 1e-3
+        again = chandra_cuda.autotune_plans([chandra_cuda.DecodeLinear(w)], reps=3)  # from the cache
+        assert again == chosen
+    finally:
+        chandra_cuda._core.set_decode_gemm_plan(2560, 4096, 0, 0, 0)
+

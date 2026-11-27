@@ -21,8 +21,10 @@
 #include <algorithm>
 
 namespace chandra {
+DecodeGemmPlan decode_gemm_plan_fmt(int N, int K, int sms, int fmt);
 namespace {
 
+constexpr int kFmtBF16 = 0, kFmtFP8 = 1, kFmtFP4 = 2, kFmtINT4 = 3;  // plan registry keys
 constexpr int kWarps = 8;
 constexpr int kThreads = kWarps * 32;
 constexpr int kKC = 128;                   // K per x chunk
@@ -620,7 +622,8 @@ template <bool FP8, bool FP4, bool I4 = false>
 cudaError_t gemm_entry(const void* x, const void* wp, const float* sc, void* y, float* ws, unsigned* counters, int M,
                        int N, int K, int sms, int epilogue, cudaStream_t stream) {
   if (epilogue != 0 && epilogue != 1) return cudaErrorInvalidValue;
-  const DecodeGemmPlan p = decode_gemm_plan(N, K, sms);
+  constexpr int kFmt = FP8 ? kFmtFP8 : I4 ? kFmtINT4 : FP4 ? kFmtFP4 : kFmtBF16;
+  const DecodeGemmPlan p = decode_gemm_plan_fmt(N, K, sms, kFmt);
 #define CHANDRA_GEMM_CASE(NPV)                                                                                  \
   case NPV:                                                                                                    \
     return epilogue ? launch_fmt<NPV, FP8, FP4, true, I4>(p.row_groups, x, wp, sc, y, ws, counters, M, N, K,    \
@@ -640,30 +643,40 @@ cudaError_t gemm_entry(const void* x, const void* wp, const float* sc, void* y, 
 }  // namespace
 
 namespace {
-// Plan overrides for measurements only (set_decode_gemm_plan); empty in normal use.
+// Plans set per (N, K, weight format) (set_decode_gemm_plan: the autotuner, or measurements);
+// fmt -1 matches any format. Without an entry, the rule below.
 struct PlanOverride {
-  int N, K, rw, splits;
+  int N, K, fmt, rw, splits;
 };
-PlanOverride g_overrides[16];
+constexpr int kMaxOverrides = 128;
+PlanOverride g_overrides[kMaxOverrides];
 int g_n_overrides = 0;
 }  // namespace
 
-void set_decode_gemm_plan(int N, int K, int rw, int splits) {
+void set_decode_gemm_plan(int N, int K, int rw, int splits, int fmt) {
   for (int i = 0; i < g_n_overrides; ++i)
-    if (g_overrides[i].N == N && g_overrides[i].K == K) {
+    if (g_overrides[i].N == N && g_overrides[i].K == K && g_overrides[i].fmt == fmt) {
       if (rw <= 0) {  // remove
         g_overrides[i] = g_overrides[--g_n_overrides];
       } else {
-        g_overrides[i] = {N, K, rw, splits};
+        g_overrides[i] = {N, K, fmt, rw, splits};
       }
       return;
     }
-  if (rw > 0 && g_n_overrides < 16) g_overrides[g_n_overrides++] = {N, K, rw, splits};
+  if (rw > 0 && g_n_overrides < kMaxOverrides) g_overrides[g_n_overrides++] = {N, K, fmt, rw, splits};
+}
+
+DecodeGemmPlan decode_gemm_plan_fmt(int N, int K, int sms, int fmt) {
+  for (int i = 0; i < g_n_overrides; ++i)
+    if (g_overrides[i].N == N && g_overrides[i].K == K && g_overrides[i].fmt == fmt)
+      return {g_overrides[i].rw, g_overrides[i].splits};
+  return decode_gemm_plan(N, K, sms);
 }
 
 DecodeGemmPlan decode_gemm_plan(int N, int K, int sms) {
   for (int i = 0; i < g_n_overrides; ++i)
-    if (g_overrides[i].N == N && g_overrides[i].K == K) return {g_overrides[i].rw, g_overrides[i].splits};
+    if (g_overrides[i].N == N && g_overrides[i].K == K && g_overrides[i].fmt == -1)
+      return {g_overrides[i].rw, g_overrides[i].splits};
   // A CTA's x chunk is re-read from L2 by every CTA, so x traffic per weight byte is
   // (padded tokens) / (rows per CTA): take the widest row tile (128 rows). GEMMs with
   // fewer tiles than SMs split K across CTAs, using the largest split (dividing K's
@@ -698,14 +711,14 @@ static int max_contributors(const DecodeGemmPlan& p, int N, int K) {
   return mx;
 }
 
-size_t decode_gemm_workspace_bytes(int N, int K, int sms) {
-  const DecodeGemmPlan p = decode_gemm_plan(N, K, sms);
+size_t decode_gemm_workspace_bytes(int N, int K, int sms, int fmt) {
+  const DecodeGemmPlan p = decode_gemm_plan_fmt(N, K, sms, fmt);
   const int mc = max_contributors(p, N, K);
   return mc > 1 ? static_cast<size_t>(mc) * N * 64 * sizeof(float) : 0;
 }
 
-int decode_gemm_counters(int N, int K, int sms) {
-  const DecodeGemmPlan p = decode_gemm_plan(N, K, sms);
+int decode_gemm_counters(int N, int K, int sms, int fmt) {
+  const DecodeGemmPlan p = decode_gemm_plan_fmt(N, K, sms, fmt);
   return N / (16 * p.row_groups);
 }
 
