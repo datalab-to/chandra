@@ -222,3 +222,15 @@ def test_spec_graph_matches_plain(ckpt, run):
     for n in range(len(seqs)):
         assert out[n][:32] == ref[n][:32], n
 
+
+
+def test_exact_lm_head_in_graphs(ckpt, run):
+    """The exact INT8 LM head, captured in the graph MTP loop, gives the BF16 head's tokens."""
+    _, seqs, t0, ref = run
+    dec = Decoder(ckpt, max_seqs=3, max_ctx=512, mtp=True, draft_tokens=3, lm_head="exact")
+    hidden, first = dec._forward(t0, seqs, 1, commit=False)
+    for s in seqs:
+        dec.length[s] += 1
+    out, steps = dec.spec_graph(seqs).generate(first, hidden, max_new=24)
+    for n in range(len(seqs)):
+        assert out[n][:24] == ref[n][:24], n
